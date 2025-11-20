@@ -1,11 +1,17 @@
 At a high level you’re building:
 
+**Progress log**
+- 2025-11-20 (PinkPond): Started bead ultrasearch-c00.1.1 – pin toolchain/config; added rust-toolchain.toml and .cargo/config.toml per best-practices. No code changes yet.
+
 * an **NTFS + USN–driven catalog** for filenames and metadata (Everything‑style),
 * a **Tantivy‑based full‑text engine** for contents,
 * a **minimal resident service + bursty worker**,
 * and a **GPUI desktop client** that feels instant but keeps memory under control.
 
 Below is an implementation plan that walks every subsystem, which crate does what, and how to shape it for low memory + high performance using current Rust tooling.
+
+### Progress log
+- 2025-11-20 (RedSnow): Onboarded, reviewed docs/Beads. Began c00.1.x scaffolding: added workspace Cargo + crate stubs under `ultrasearch/`. Waiting on LilacCat’s reservation before touching root `Cargo.toml`/`rust-toolchain.toml`.
 
 ---
 
