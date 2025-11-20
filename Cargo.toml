@@ -1,0 +1,151 @@
+[workspace]
+members = [
+    "crates/core-types",
+    "crates/core-serialization",
+    "crates/ntfs-watcher",
+    "crates/meta-index",
+    "crates/content-index",
+    "crates/content-extractor",
+    "crates/scheduler",
+    "crates/ipc",
+    "crates/semantic-index",
+    "crates/service",
+    "crates/index-worker",
+    "crates/ui",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["Jeffrey Emanuel <jeffrey.emanuel@gmail.com>"]
+repository = "https://github.com/Dicklesworthstone/ultrasearch"
+homepage = "https://github.com/Dicklesworthstone/ultrasearch"
+
+[workspace.dependencies]
+# --- Core ecosystem ---
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+bincode = "1.3"
+rkyv = { version = "0.7", features = ["std", "validation"] }
+
+# --- Concurrency & async ---
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "signal"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# --- NTFS / Windows / system info ---
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_ServiceManagement",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ServiceManagement",
+] }
+sysinfo = { version = "0.30", default-features = false, features = ["system", "process", "disk"] }
+
+# You’ll likely vendor / fork a USN journal crate; placeholder here:
+usn-journal-rs = { git = "https://github.com/example/usn-journal-rs.git", branch = "main" }
+
+# --- Search engine / index ---
+tantivy = { version = "0.22", features = ["mmap", "lz4-compression"] }
+fst = "0.4"
+memmap2 = "0.9"
+
+# --- Content extraction / OCR / HTTP ---
+extractous = { git = "https://github.com/extractous/extractous.git", branch = "main" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Optional OCR & image handling – enable in content-extractor crate
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# --- IPC / serialization ---
+uuid = { version = "1.10", features = ["v4"] }
+
+# --- Logging / tracing ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- Data structures / utilities ---
+smallvec = "1.13"
+ahash = "0.8"
+indexmap = { version = "2.6", features = ["serde"] }
+lru = "0.12"
+slotmap = "1.0"
+bumpalo = "3.16"
+
+# --- CLI / UX for tools ---
+clap = { version = "4.5", features = ["derive", "env"] }
+console = "0.15"
+indicatif = "0.17"
+
+# --- UI stack (Zed’s GPUI) ---
+gpui = { git = "https://github.com/zed-industries/zed.git", package = "gpui" }
+gpui-component = { git = "https://github.com/zed-industries/zed.git", package = "gpui-component" }
+
+# --- Optional vector / semantic index ---
+# You can swap this for another ANN crate or your own HNSW implementation.
+# Placeholder dependency; wire it only in semantic-index crate.
+hnsw_rs = { git = "https://github.com/example/hnsw-rs.git", optional = true }
+
+# --- Testing / dev ---
+proptest = "1.5"
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+too_many_arguments = "allow"
+module_name_repetitions = "allow"
+
+[profile.dev]
+opt-level = 1
+debug = true
+incremental = true
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+panic = "abort"
+incremental = false
+
+[profile.release-service]
+inherits = "release"
+opt-level = "z"
+
+[profile.release-worker]
+inherits = "release"
+opt-level = 3
+
+[patch.crates-io]
+# If you end up forking anything (e.g. a USN crate or Tantivy), add patches here.
+# tantivy = { git = "https://github.com/yourfork/tantivy.git", rev = "..." }
+# usn-journal-rs = { git = "https://github.com/yourfork/usn-journal-rs.git", rev = "..." }
