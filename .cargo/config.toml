@@ -1,0 +1,21 @@
+[build]
+# Prefer fast, modern linkers and explicit CPU tuning where available.
+rustflags = []
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=mold",
+    "-C", "target-cpu=native",
+]
+
+[target.x86_64-pc-windows-msvc]
+# Static CRT for simpler deployment; adjust if dynamic linking is required.
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[net]
+git-fetch-with-cli = true
+
+[alias]
+fmt-check = "fmt --all --check"
+lint = "clippy --all-targets -- -D warnings"
