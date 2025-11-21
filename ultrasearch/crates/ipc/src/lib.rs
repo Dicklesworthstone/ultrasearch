@@ -22,6 +22,7 @@ pub enum FieldKind {
     Created,
     Flags,
     Volume,
+    Kind,
 }
 
 /// How a term should be interpreted.
@@ -71,6 +72,12 @@ pub enum QueryExpr {
     Or(Vec<QueryExpr>),
 }
 
+impl Default for QueryExpr {
+    fn default() -> Self {
+        QueryExpr::And(Vec::new())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SearchMode {
     Auto,        // planner decides
@@ -78,6 +85,8 @@ pub enum SearchMode {
     Content,     // content index
     Hybrid,      // meta + content merge
 }
+
+pub mod framing;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
@@ -87,6 +96,21 @@ pub struct SearchRequest {
     pub mode: SearchMode,
     #[serde(default)]
     pub timeout: Option<Duration>,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+impl Default for SearchRequest {
+    fn default() -> Self {
+        SearchRequest {
+            id: Uuid::nil(),
+            query: QueryExpr::default(),
+            limit: 50,
+            mode: SearchMode::Auto,
+            timeout: None,
+            offset: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +131,7 @@ pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub total: u64,
     pub truncated: bool,
+    pub took_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,11 +163,14 @@ pub struct MetricsSnapshot {
     pub search_latency_ms_p95: Option<f64>,
     pub worker_cpu_pct: Option<f64>,
     pub worker_mem_bytes: Option<u64>,
+    pub queue_depth: Option<u64>,
+    pub active_workers: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn bincode_roundtrip_query() {
@@ -167,11 +195,67 @@ mod tests {
             query: q,
             limit: 20,
             mode: SearchMode::Hybrid,
+            timeout: None,
+            offset: 0,
         };
 
         let bytes = bincode::serialize(&req).expect("serialize");
         let back: SearchRequest = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(back.limit, 20);
         assert_eq!(matches!(back.mode, SearchMode::Hybrid), true);
+        assert_eq!(back.timeout, None);
+        assert_eq!(back.offset, 0);
     }
+
+    #[test]
+    fn search_request_with_timeout_roundtrip() {
+        let req = SearchRequest {
+            id: Uuid::new_v4(),
+            query: QueryExpr::Term(TermExpr {
+                field: None,
+                value: "foo".into(),
+                modifier: TermModifier::Term,
+            }),
+            limit: 5,
+            mode: SearchMode::Auto,
+            timeout: Some(Duration::from_millis(250)),
+            offset: 7,
+        };
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: SearchRequest = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.timeout, Some(Duration::from_millis(250)));
+        assert_eq!(back.offset, 7);
+    }
+
+    #[test]
+    fn volume_status_fields_present() {
+        let v = VolumeStatus {
+            volume: 1,
+            indexed_files: 10,
+            pending_files: 2,
+            last_usn: Some(42),
+            journal_id: Some(7),
+        };
+        let encoded = bincode::serialize(&v).unwrap();
+        let decoded: VolumeStatus = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.last_usn, Some(42));
+        assert_eq!(decoded.journal_id, Some(7));
+    }
+
+    #[test]
+    fn metrics_snapshot_serializes() {
+        let m = MetricsSnapshot {
+            search_latency_ms_p50: Some(12.3),
+            search_latency_ms_p95: Some(45.6),
+            worker_cpu_pct: Some(10.0),
+            worker_mem_bytes: Some(1024),
+            queue_depth: Some(5),
+            active_workers: Some(2),
+        };
+        let bytes = bincode::serialize(&m).unwrap();
+        let back: MetricsSnapshot = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.queue_depth, Some(5));
+        assert_eq!(back.active_workers, Some(2));
+    }
+}
 }

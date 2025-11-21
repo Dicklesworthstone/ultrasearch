@@ -13,3 +13,5 @@ anyhow = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true }
+cargo-features = ["edition2024"]
+cargo-features = ["edition2024"]
