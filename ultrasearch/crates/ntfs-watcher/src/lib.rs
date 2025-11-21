@@ -121,6 +121,37 @@ pub fn tail_usn(
     Ok((Vec::new(), _cursor))
 }
 
+/// Simple in-memory watcher useful for tests and higher-level components.
+pub struct InMemoryWatcher {
+    vols: Vec<VolumeInfo>,
+    mft: Vec<FileMeta>,
+    events: Vec<FileEvent>,
+}
+
+impl InMemoryWatcher {
+    pub fn new(vols: Vec<VolumeInfo>, mft: Vec<FileMeta>, events: Vec<FileEvent>) -> Self {
+        Self { vols, mft, events }
+    }
+}
+
+impl NtfsWatcher for InMemoryWatcher {
+    fn discover_volumes(&self) -> Result<Vec<VolumeInfo>, NtfsError> {
+        Ok(self.vols.clone())
+    }
+
+    fn enumerate_mft(&self, _volume: &VolumeInfo) -> Result<Vec<FileMeta>, NtfsError> {
+        Ok(self.mft.clone())
+    }
+
+    fn tail_usn(
+        &self,
+        _volume: &VolumeInfo,
+        cursor: JournalCursor,
+    ) -> Result<(Vec<FileEvent>, JournalCursor), NtfsError> {
+        Ok((self.events.clone(), cursor))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +169,36 @@ mod tests {
         let cfg = ReaderConfig::default();
         assert_eq!(cfg.chunk_size, 1 << 20);
         assert_eq!(cfg.max_records_per_tick, 10_000);
+    }
+
+    #[test]
+    fn in_memory_watcher_emits_provided_data() {
+        let vols = vec![VolumeInfo {
+            id: 1,
+            guid_path: r"\\?\Volume{abc}\".to_string(),
+            drive_letters: vec!['C'],
+        }];
+        let mft = vec![FileMeta {
+            doc_key: DocKey::from_parts(1, 10),
+            name: "foo.txt".into(),
+            is_dir: false,
+            size: 123,
+        }];
+        let events = vec![FileEvent::Deleted(DocKey::from_parts(1, 10))];
+
+        let watcher = InMemoryWatcher::new(vols.clone(), mft.clone(), events.clone());
+        assert_eq!(watcher.discover_volumes().unwrap(), vols);
+        assert_eq!(watcher.enumerate_mft(&vols[0]).unwrap(), mft);
+        let (evs, cur) = watcher
+            .tail_usn(
+                &vols[0],
+                JournalCursor {
+                    last_usn: 0,
+                    journal_id: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(evs, events);
+        assert_eq!(cur.last_usn, 0);
     }
 }

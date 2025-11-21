@@ -61,6 +61,20 @@ impl ServiceMetrics {
         failures >= self.worker_failure_threshold
     }
 
+    pub fn snapshot_with_queue_state(
+        &self,
+        queue_depth: Option<u64>,
+        active_workers: Option<u32>,
+    ) -> ServiceMetricsSnapshot {
+        ServiceMetricsSnapshot {
+            search_latency_ms_p50: None,
+            search_latency_ms_p95: None,
+            worker_failures: self.worker_failures.get(),
+            queue_depth,
+            active_workers,
+        }
+    }
+
     /// Render a lightweight metrics snapshot for status reporting.
     /// Note: Prometheus crate does not expose quantiles; we return None for p50/p95 for now.
     pub fn snapshot(&self) -> ServiceMetricsSnapshot {
@@ -108,5 +122,13 @@ mod tests {
         let metrics = ServiceMetrics::new(&MetricsSection::default()).unwrap();
         metrics.record_request(0.01);
         assert!(metrics.requests_total.get() >= 1);
+    }
+
+    #[test]
+    fn snapshot_with_queue_state_sets_fields() {
+        let metrics = ServiceMetrics::new(&MetricsSection::default()).unwrap();
+        let snap = metrics.snapshot_with_queue_state(Some(3), Some(2));
+        assert_eq!(snap.queue_depth, Some(3));
+        assert_eq!(snap.active_workers, Some(2));
     }
 }

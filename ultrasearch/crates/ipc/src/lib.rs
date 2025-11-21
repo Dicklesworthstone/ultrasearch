@@ -80,10 +80,10 @@ impl Default for QueryExpr {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SearchMode {
-    Auto,        // planner decides
-    NameOnly,    // metadata index only
-    Content,     // content index
-    Hybrid,      // meta + content merge
+    Auto,     // planner decides
+    NameOnly, // metadata index only
+    Content,  // content index
+    Hybrid,   // meta + content merge
 }
 
 pub mod framing;
@@ -171,6 +171,20 @@ pub struct MetricsSnapshot {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn default_is_empty_and_safe() {
+        let req = SearchRequest::default();
+        assert_eq!(req.id, Uuid::nil());
+        assert_eq!(req.limit, 50);
+        assert!(matches!(req.mode, SearchMode::Auto));
+        assert_eq!(req.offset, 0);
+        assert!(req.timeout.is_none());
+        match req.query {
+            QueryExpr::And(items) => assert!(items.is_empty()),
+            _ => panic!("default query should be And([])"),
+        }
+    }
 
     #[test]
     fn bincode_roundtrip_query() {
@@ -271,5 +285,4 @@ mod tests {
             _ => panic!("default query should be And([])"),
         }
     }
-}
 }

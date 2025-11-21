@@ -51,7 +51,7 @@ pub trait Extractor {
 
 /// Ordered stack of extractors with first-win semantics.
 pub struct ExtractorStack {
-    backends: Vec<Box<dyn Extractor + Send + Sync>>, 
+    backends: Vec<Box<dyn Extractor + Send + Sync>>,
 }
 
 impl ExtractorStack {
@@ -62,6 +62,11 @@ impl ExtractorStack {
     /// Run the first extractor that claims support.
     #[instrument(skip(self, ctx))]
     pub fn extract(&self, key: DocKey, ctx: &ExtractContext) -> Result<ExtractedContent> {
+        if self.backends.is_empty() {
+            let ext = resolve_ext(ctx).unwrap_or_else(|| "unknown".to_string());
+            return Err(anyhow::anyhow!(ExtractError::Unsupported(ext)));
+        }
+
         for backend in &self.backends {
             if backend.supports(ctx) {
                 return backend.extract(ctx, key).map_err(|e| e.into());
@@ -120,14 +125,16 @@ impl Extractor for SimpleTextExtractor {
     fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
         let path = Path::new(ctx.path);
         let meta = fs::metadata(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
-        if meta.len() as usize > ctx.max_bytes {
+        let max_bytes = ctx.max_bytes as u64;
+        if meta.len() > max_bytes {
             return Err(ExtractError::FileTooLarge {
                 bytes: meta.len(),
-                max_bytes: ctx.max_bytes as u64,
+                max_bytes,
             });
         }
 
-        let text_raw = fs::read_to_string(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        let text_raw =
+            fs::read_to_string(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
         let (text, truncated) = enforce_limits_str(&text_raw, ctx);
 
         Ok(ExtractedContent {
@@ -250,6 +257,32 @@ mod tests {
     }
 
     #[test]
+    fn simple_extractor_rejects_large_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"0123456789").unwrap(); // 10 bytes
+
+        let ctx = ExtractContext {
+            path: path.to_str().unwrap(),
+            max_bytes: 5,
+            max_chars: 20,
+            ext_hint: Some("txt"),
+            mime_hint: None,
+        };
+        let simple = SimpleTextExtractor;
+        let err = simple.extract(&ctx, DocKey::from_parts(1, 1)).unwrap_err();
+        match err {
+            ExtractError::FileTooLarge { bytes, max_bytes } => {
+                assert_eq!(bytes, 10);
+                assert_eq!(max_bytes, 5);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn supports_falls_back_to_path_extension() {
         let ctx = ExtractContext {
             path: "/tmp/file.TXT",
@@ -272,5 +305,19 @@ mod tests {
             mime_hint: None,
         };
         assert_eq!(resolve_ext(&ctx).as_deref(), Some("txt"));
+    }
+
+    #[test]
+    fn empty_stack_returns_unsupported() {
+        let ctx = ExtractContext {
+            path: "/tmp/file.unknown",
+            max_bytes: 10,
+            max_chars: 10,
+            ext_hint: None,
+            mime_hint: None,
+        };
+        let stack = ExtractorStack::new(vec![]);
+        let err = stack.extract(DocKey::from_parts(1, 1), &ctx).unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
     }
 }
