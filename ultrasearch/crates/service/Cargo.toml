@@ -21,6 +21,8 @@ meta-index = { path = "../meta-index" }
 content-index = { path = "../content-index" }
 ntfs-watcher = { path = "../ntfs-watcher" }
 prometheus = "0.13"
+uuid = { workspace = true }
+bincode = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

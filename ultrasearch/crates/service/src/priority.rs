@@ -1,5 +1,3 @@
-use tracing::warn;
-
 #[derive(Debug, Clone, Copy)]
 pub enum ProcessPriority {
     Normal,
@@ -11,6 +9,7 @@ pub enum ProcessPriority {
 pub fn set_process_priority(priority: ProcessPriority) {
     #[cfg(target_os = "windows")]
     {
+        use tracing::warn;
         use windows::Win32::System::Threading::{
             BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, IDLE_PRIORITY_CLASS,
             NORMAL_PRIORITY_CLASS, SetPriorityClass,
@@ -28,4 +27,7 @@ pub fn set_process_priority(priority: ProcessPriority) {
             }
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = priority;
 }

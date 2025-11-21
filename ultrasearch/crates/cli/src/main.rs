@@ -1,13 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use console::style;
 use ipc::framing;
-use ipc::{
-    FieldKind, QueryExpr, RangeExpr, RangeOp, RangeValue, SearchMode, SearchRequest,
-    SearchResponse, TermExpr, TermModifier,
-};
+use ipc::{QueryExpr, SearchMode, SearchRequest, SearchResponse, TermExpr, TermModifier};
 use ipc::{StatusRequest, StatusResponse};
-use serde_json::json;
+use serde_json::to_string_pretty;
 use uuid::Uuid;
 
 /// Debug / scripting CLI for UltraSearch IPC.
@@ -73,14 +70,12 @@ fn main() -> Result<()> {
         } => {
             let req = build_search_request(&query, limit, offset, timeout_ms, mode);
             print_request(&req)?;
-            send_stub(req)?.map(|resp| {
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&resp)?);
-                } else {
-                    print_search_response(&resp)?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
+            let resp = send_stub(req)?;
+            if json {
+                println!("{}", to_string_pretty(&resp)?);
+            } else {
+                print_search_response(&resp)?;
+            }
         }
         Commands::Status { json } => {
             let req = build_status_request();
@@ -96,7 +91,7 @@ fn main() -> Result<()> {
                 metrics: None,
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
+                println!("{}", to_string_pretty(&resp)?);
             } else {
                 print_status_response(&resp)?;
             }

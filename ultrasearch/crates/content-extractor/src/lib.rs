@@ -91,14 +91,14 @@ impl Extractor for NoopExtractor {
     }
 
     fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
-        let (text, truncated) = enforce_limits_str("", ctx);
+        let (text, truncated, used) = enforce_limits_str("", ctx);
         Ok(ExtractedContent {
             key,
             text,
             lang: None,
             truncated,
             content_lang: None,
-            bytes_processed: 0,
+            bytes_processed: used,
         })
     }
 }
@@ -133,8 +133,13 @@ impl Extractor for SimpleTextExtractor {
             });
         }
 
-        let text_raw = fs::read_to_string(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
-        let (text, truncated) = enforce_limits_str(&text_raw, ctx);
+        let data = fs::read(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        if is_probably_binary(&data) {
+            return Err(ExtractError::Unsupported("binary".into()));
+        }
+
+        let text_raw = String::from_utf8_lossy(&data);
+        let (text, truncated, used_bytes) = enforce_limits_str(&text_raw, ctx);
 
         Ok(ExtractedContent {
             key,
@@ -142,42 +147,51 @@ impl Extractor for SimpleTextExtractor {
             lang: None,
             truncated,
             content_lang: None,
-            bytes_processed: std::cmp::min(meta.len() as usize, ctx.max_bytes),
+            bytes_processed: used_bytes,
         })
     }
 }
 
 /// Enforce both byte and char limits on an in-memory string.
-pub fn enforce_limits_str(text: &str, ctx: &ExtractContext) -> (String, bool) {
+pub fn enforce_limits_str(text: &str, ctx: &ExtractContext) -> (String, bool, usize) {
     let mut bytes = 0usize;
-    let mut chars = 0usize;
     let mut truncated = false;
     let mut out = String::with_capacity(text.len().min(ctx.max_bytes));
 
-    for ch in text.chars() {
+    for (idx, ch) in text.chars().enumerate() {
         let ch_len = ch.len_utf8();
-        if bytes + ch_len > ctx.max_bytes || chars + 1 > ctx.max_chars {
+        if bytes + ch_len > ctx.max_bytes || idx + 1 > ctx.max_chars {
             truncated = true;
             break;
         }
         out.push(ch);
         bytes += ch_len;
-        chars += 1;
     }
 
-    (out, truncated)
+    (out, truncated, bytes)
 }
 
 fn resolve_ext(ctx: &ExtractContext) -> Option<String> {
-    if let Some(ext) = ctx.ext_hint {
-        if !ext.is_empty() {
-            return Some(ext.to_ascii_lowercase());
-        }
+    if let Some(ext) = ctx.ext_hint.filter(|e| !e.is_empty()) {
+        return Some(ext.to_ascii_lowercase());
     }
     std::path::Path::new(ctx.path)
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
+}
+
+/// Heuristic to detect likely-binary content: look for NULs or >5% control bytes in first 4 KiB.
+fn is_probably_binary(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(4096)];
+    if sample.contains(&0) {
+        return true;
+    }
+    let ctrl = sample
+        .iter()
+        .filter(|&&b| (b < 0x09) || (b > 0x0D && b < 0x20))
+        .count();
+    ctrl * 20 > sample.len()
 }
 
 #[cfg(test)]
@@ -197,6 +211,7 @@ mod tests {
         let out = stack.extract(DocKey::from_parts(1, 42), &ctx).unwrap();
         assert!(out.text.is_empty());
         assert!(!out.truncated);
+        assert_eq!(out.bytes_processed, 0);
     }
 
     #[test]
@@ -209,9 +224,10 @@ mod tests {
             ext_hint: None,
             mime_hint: None,
         };
-        let (trimmed, was_truncated) = enforce_limits_str(s, &ctx);
+        let (trimmed, was_truncated, used) = enforce_limits_str(s, &ctx);
         assert_eq!(trimmed, "abc");
         assert!(was_truncated);
+        assert_eq!(used, 3);
     }
 
     #[test]
@@ -224,9 +240,10 @@ mod tests {
             ext_hint: None,
             mime_hint: None,
         };
-        let (trimmed, truncated) = enforce_limits_str(s, &ctx);
+        let (trimmed, truncated, used) = enforce_limits_str(s, &ctx);
         assert_eq!(trimmed, "é");
         assert!(truncated);
+        assert_eq!(used, 2);
     }
 
     #[test]
@@ -239,9 +256,10 @@ mod tests {
             ext_hint: None,
             mime_hint: None,
         };
-        let (trimmed, truncated) = enforce_limits_str(s, &ctx);
+        let (trimmed, truncated, used) = enforce_limits_str(s, &ctx);
         assert_eq!(trimmed, "01234");
         assert!(truncated);
+        assert_eq!(used, 5);
     }
 
     #[test]

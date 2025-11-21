@@ -2,16 +2,14 @@
 
 use anyhow::Result;
 use core_types::config::load_config;
-
-mod logging;
-mod metrics;
+use service::{init_tracing, metrics::init_metrics_from_config};
 
 fn main() -> Result<()> {
     let cfg = load_config(None)?;
-    logging::init(&cfg.logging, &cfg.app.data_dir, "service")?;
+    init_tracing()?;
 
     if cfg.metrics.enabled {
-        let _metrics = metrics::init_metrics_from_config(&cfg.metrics)?;
+        let _metrics = init_metrics_from_config(&cfg.metrics)?;
         // TODO: wire metrics handle into IPC/server once implemented.
     }
 

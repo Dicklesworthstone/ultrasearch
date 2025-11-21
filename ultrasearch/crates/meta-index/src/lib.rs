@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use core_types::DocKey;
-use tantivy::{schema::document::TantivyDocument, schema::*, Index, IndexWriter};
+use tantivy::{Index, IndexWriter, schema::document::TantivyDocument, schema::*};
 
 #[cfg(test)]
 use tantivy::{IndexSettings, ReloadPolicy};
@@ -80,7 +80,7 @@ pub fn add_batch(
     docs: impl IntoIterator<Item = MetaDoc>,
 ) -> Result<()> {
     for doc in docs {
-        writer.add_document(to_document(&doc, fields));
+        let _ = writer.add_document(to_document(&doc, fields));
     }
     Ok(())
 }
@@ -127,7 +127,7 @@ impl Default for WriterConfig {
 
 /// Create an `IndexWriter` with the provided configuration.
 pub fn create_writer(meta: &MetaIndex, cfg: &WriterConfig) -> Result<IndexWriter> {
-    let mut writer = meta
+    let writer = meta
         .index
         .writer_with_num_threads(cfg.num_threads, cfg.heap_size_bytes)?;
     // For metadata we prefer merges that keep segment counts modest but not enormous; rely on Tantivy defaults for now.

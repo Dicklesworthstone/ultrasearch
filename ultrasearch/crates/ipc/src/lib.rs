@@ -170,7 +170,15 @@ pub struct MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
+    use serde::de::DeserializeOwned;
+
+    fn ser<T: Serialize>(value: &T) -> Vec<u8> {
+        bincode::serialize(value).unwrap()
+    }
+
+    fn de<T: DeserializeOwned>(bytes: &[u8]) -> T {
+        bincode::deserialize(bytes).unwrap()
+    }
 
     #[test]
     fn default_is_empty_and_safe() {
@@ -213,10 +221,10 @@ mod tests {
             offset: 0,
         };
 
-        let bytes = bincode::serialize(&req).expect("serialize");
-        let back: SearchRequest = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = ser(&req);
+        let back: SearchRequest = de(&bytes);
         assert_eq!(back.limit, 20);
-        assert_eq!(matches!(back.mode, SearchMode::Hybrid), true);
+        assert!(matches!(back.mode, SearchMode::Hybrid));
         assert_eq!(back.timeout, None);
         assert_eq!(back.offset, 0);
     }
@@ -235,8 +243,8 @@ mod tests {
             timeout: Some(Duration::from_millis(250)),
             offset: 7,
         };
-        let bytes = bincode::serialize(&req).unwrap();
-        let back: SearchRequest = bincode::deserialize(&bytes).unwrap();
+        let bytes = ser(&req);
+        let back: SearchRequest = de(&bytes);
         assert_eq!(back.timeout, Some(Duration::from_millis(250)));
         assert_eq!(back.offset, 7);
     }
@@ -250,8 +258,8 @@ mod tests {
             last_usn: Some(42),
             journal_id: Some(7),
         };
-        let encoded = bincode::serialize(&v).unwrap();
-        let decoded: VolumeStatus = bincode::deserialize(&encoded).unwrap();
+        let encoded = ser(&v);
+        let decoded: VolumeStatus = de(&encoded);
         assert_eq!(decoded.last_usn, Some(42));
         assert_eq!(decoded.journal_id, Some(7));
     }
@@ -266,8 +274,8 @@ mod tests {
             queue_depth: Some(5),
             active_workers: Some(2),
         };
-        let bytes = bincode::serialize(&m).unwrap();
-        let back: MetricsSnapshot = bincode::deserialize(&bytes).unwrap();
+        let bytes = ser(&m);
+        let back: MetricsSnapshot = de(&bytes);
         assert_eq!(back.queue_depth, Some(5));
         assert_eq!(back.active_workers, Some(2));
     }

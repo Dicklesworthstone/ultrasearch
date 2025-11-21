@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 use core_types::DocKey;
 use tantivy::{
-    schema::document::TantivyDocument, schema::*, Index, IndexSettings, IndexWriter, ReloadPolicy,
+    Index, IndexSettings, IndexWriter, ReloadPolicy, schema::document::TantivyDocument, schema::*,
 };
 
 /// Field handles for the content index schema.
@@ -162,7 +162,7 @@ mod tests {
             fields.content_lang,
             fields.content,
         ] {
-            assert!(schema.get_field_entry(f).name().len() > 0);
+            assert!(!schema.get_field_entry(f).name().is_empty());
         }
     }
 

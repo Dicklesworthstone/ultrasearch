@@ -11,7 +11,7 @@
 
 use core_types::DocKey;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 #[cfg(target_os = "windows")]
 use tracing::warn;
 
