@@ -56,6 +56,14 @@ lasso = "*"
 clap = { version = "*", features = ["derive", "env"] }
 console = "*"
 indicatif = "*"
+gpui = { git = "https://github.com/zed-industries/zed.git", package = "gpui" }
+gpui-component = { git = "https://github.com/zed-industries/zed.git", package = "gpui-component" }
+futures = "*"
+parking_lot = "*"
+smallvec = "*"
+indexmap = { version = "*", features = ["serde"] }
+bumpalo = "*"
+rayon = "*"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
