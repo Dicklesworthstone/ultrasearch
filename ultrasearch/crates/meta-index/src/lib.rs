@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use core_types::DocKey;
-use tantivy::{schema::*, Index, IndexWriter};
+use tantivy::{Index, IndexSettings, IndexWriter, schema::document::TantivyDocument, schema::*};
 
 /// Fields used in the metadata index.
 #[derive(Debug, Clone)]
@@ -96,10 +96,11 @@ pub struct MetaIndex {
 /// directory manually.
 pub fn open_or_create_index(path: &Path) -> Result<MetaIndex> {
     let (schema, fields) = build_schema();
+    let settings = IndexSettings::default();
     let index = if path.join("meta.json").exists() {
         Index::open_in_dir(path)?
     } else {
-        Index::create_in_dir(path, schema)?
+        Index::create_in_dir(path, schema, settings)?
     };
     Ok(MetaIndex { index, fields })
 }
@@ -124,24 +125,22 @@ impl Default for WriterConfig {
 
 /// Create an `IndexWriter` with the provided configuration.
 pub fn create_writer(meta: &MetaIndex, cfg: &WriterConfig) -> Result<IndexWriter> {
-    let mut writer = meta.index.writer_with_num_threads(cfg.num_threads, cfg.heap_size_bytes)?;
+    let mut writer = meta
+        .index
+        .writer_with_num_threads(cfg.num_threads, cfg.heap_size_bytes)?;
     // For metadata we prefer merges that keep segment counts modest but not enormous; rely on Tantivy defaults for now.
     Ok(writer)
 }
 
 /// Open a read-only handle with minimal caching suitable for the long-lived service.
 pub fn open_reader(meta: &MetaIndex) -> Result<tantivy::IndexReader> {
-    let reader = meta
-        .index
-        .reader_builder()
-        .reload_policy(tantivy::ReloadPolicy::OnCommit)
-        .try_into()?;
+    let reader = meta.index.reader_builder().try_into()?;
     Ok(reader)
 }
 
 /// Convert a `MetaDoc` into a Tantivy `Document`.
-pub fn to_document(doc: &MetaDoc, fields: &MetaFields) -> tantivy::Document {
-    let mut d = tantivy::Document::new();
+pub fn to_document(doc: &MetaDoc, fields: &MetaFields) -> TantivyDocument {
+    let mut d = TantivyDocument::default();
     d.add_u64(fields.doc_key, doc.key.0);
     d.add_u64(fields.volume, doc.volume as u64);
     d.add_text(fields.name, &doc.name);
