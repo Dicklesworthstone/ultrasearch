@@ -128,6 +128,10 @@ impl MetadataCache {
         self.path_cache.put(key, path_arc.clone());
         Some(path_arc)
     }
+
+    pub fn resolve_name(&self, item: &CachedItem) -> &str {
+        self.interner.resolve(&item.name)
+    }
     
     pub fn clear(&mut self) {
         self.slots.clear();

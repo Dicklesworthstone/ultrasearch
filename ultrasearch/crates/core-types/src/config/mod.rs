@@ -409,12 +409,27 @@ pub fn reload_config(path: Option<&Path>) -> Result<AppConfig> {
         // Load into a temporary to validate
         let mut file_cfg: AppConfig = toml::from_str(&raw)?;
         apply_placeholders(&mut file_cfg);
+        file_cfg.validate()?;
         
         *lock = file_cfg.clone();
         Ok(file_cfg)
     } else {
         // If no file, return what we have (defaults or previous)
         Ok(lock.clone())
+    }
+}
+
+impl AppConfig {
+    /// Validate configuration constraints.
+    pub fn validate(&self) -> Result<()> {
+        if self.features.delta_index && !self.features.multi_tier_index {
+            return Err(anyhow::anyhow!("Feature 'delta_index' requires 'multi_tier_index' to be enabled"));
+        }
+        // Semantic search requires model to be specified (default has one, but if user clears it?)
+        if self.features.semantic_search && self.semantic.model.is_empty() {
+             return Err(anyhow::anyhow!("Feature 'semantic_search' requires a valid model configuration"));
+        }
+        Ok(())
     }
 }
 
@@ -445,6 +460,22 @@ mod tests {
         base.extract = override_cfg.extract;
         base.semantic = override_cfg.semantic;
         base
+    }
+
+    #[test]
+    fn validation_rejects_delta_without_multitier() {
+        let mut cfg = AppConfig::default();
+        cfg.features.delta_index = true;
+        cfg.features.multi_tier_index = false;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validation_accepts_valid_combo() {
+        let mut cfg = AppConfig::default();
+        cfg.features.delta_index = true;
+        cfg.features.multi_tier_index = true;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

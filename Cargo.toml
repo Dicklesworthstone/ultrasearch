@@ -20,16 +20,13 @@ anyhow = "*"
 thiserror = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
-serde_yaml = "*"
 toml = "*"
 bincode = "*"
 rkyv = { version = "*", features = ["std", "validation"] }
 dotenvy = "*"
 once_cell = "*"
 tokio = { version = "*", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "signal", "sync"] }
-rayon = "*"
 crossbeam-channel = "*"
-parking_lot = "*"
 bitflags = { version = "*", features = ["serde"] }
 windows = { version = "0.52", features = [
     "Win32_Foundation",
@@ -44,44 +41,21 @@ windows = { version = "0.52", features = [
     "Win32_System_Com",
     "Win32_UI_WindowsAndMessaging",
 ] }
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_System_SystemInformation",
-    "Win32_System_Console",
-    "Win32_System_Threading",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Ioctl",
-    "Win32_System_IO",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_UI_WindowsAndMessaging",
-] }
-windows-future = "0.2.1"
 sysinfo = "*"
 tantivy = { version = "*", features = ["mmap", "lz4-compression"] }
 fst = "*"
 memmap2 = "*"
 extractous = { version = "*" }
-reqwest = { version = "*", default-features = false, features = ["rustls-tls", "stream"] }
-image = { version = "*", default-features = false, features = ["png", "jpeg"] }
 uuid = { version = "*", features = ["v4", "serde"] }
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt"] }
-smallvec = "*"
 ahash = "*"
-indexmap = { version = "*", features = ["serde"] }
 lru = "*"
 slotmap = "*"
 lasso = "*"
-bumpalo = "*"
 clap = { version = "*", features = ["derive", "env"] }
 console = "*"
 indicatif = "*"
-gpui = { git = "https://github.com/zed-industries/zed.git", package = "gpui" }
-gpui-component = { git = "https://github.com/zed-industries/zed.git", package = "gpui-component" }
-proptest = "*"
-criterion = { version = "*", default-features = false, features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

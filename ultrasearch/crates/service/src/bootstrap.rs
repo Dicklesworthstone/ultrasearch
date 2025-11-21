@@ -26,6 +26,12 @@ use crate::{
 pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
     let _guard = init_tracing_with_config(&cfg.logging)?;
 
+    // Initialize Tokio runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _rt_guard = rt.enter();
+
     // Install status provider so IPC/status can respond.
     init_basic_status_provider();
 
@@ -64,6 +70,15 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
         set_search_handler(Box::new(handler));
     } else {
         tracing::warn!("meta-index search handler not initialized; falling back to stub");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Start IPC server
+        // We use the runtime we just created.
+        if let Err(e) = rt.block_on(crate::ipc::start_pipe_server(None)) {
+             tracing::error!("failed to start IPC server: {}", e);
+        }
     }
 
     tracing::info!("UltraSearch service started. Waiting for shutdown signal...");

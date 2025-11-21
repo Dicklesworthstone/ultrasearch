@@ -4,7 +4,6 @@ use std::path::Path;
 
 use anyhow::Result;
 use core_types::DocKey;
-use fst::automaton::{Automaton, Str};
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use memmap2::Mmap;
 
@@ -31,32 +30,51 @@ impl FstIndex {
     ///
     /// `prefix` should be normalized (lowercased) if the index was built with normalized names.
     pub fn search<'a>(&'a self, prefix: &str) -> impl Iterator<Item = DocKey> + 'a {
-        // Create an automaton that matches any key starting with `prefix`.
-        // We convert to String to own the bytes, ensuring 'prefix lifetime doesn't leak into the iterator.
-        let matcher = Str::new(prefix.to_string()).starts_with();
-        let stream = self.map.search(matcher).into_stream();
+        let start = prefix.as_bytes().to_vec();
+        let mut builder = self.map.range().ge(start);
 
-        StreamIter {
-            stream,
-            _marker: std::marker::PhantomData,
+        // Calculate end bound for prefix range
+        let mut end = prefix.as_bytes().to_vec();
+        let mut has_end = false;
+        while let Some(last) = end.last_mut() {
+            if *last < 255 {
+                *last += 1;
+                has_end = true;
+                break;
+            }
+            end.pop();
         }
-        .filter_map(move |(k, _)| {
+
+        if has_end {
+            builder = builder.lt(end);
+        }
+
+        let mut stream = builder.into_stream();
+        let mut hits = Vec::new();
+
+        while let Some((k, _)) = stream.next() {
+            // Double check prefix (range should handle it, but being safe against edge cases)
+            if !k.starts_with(prefix.as_bytes()) {
+                continue;
+            }
+
             // Key format: name_bytes + \0 + 8 bytes DocKey (BE).
-            // Minimal length is 1 + 8 = 9.
             if k.len() < 9 {
-                return None;
+                continue;
             }
 
             let (rest, dk_bytes) = k.split_at(k.len() - 8);
-            // The byte before DocKey must be \0
             if rest.last() != Some(&0) {
-                return None;
+                continue;
             }
 
-            // Parse u64
-            let val = u64::from_be_bytes(dk_bytes.try_into().ok()?);
-            Some(DocKey(val))
-        })
+            if let Ok(bytes) = dk_bytes.try_into() {
+                let val = u64::from_be_bytes(bytes);
+                hits.push(DocKey(val));
+            }
+        }
+
+        hits.into_iter()
     }
 }
 
@@ -105,21 +123,6 @@ impl FstBuilder {
     }
 }
 
-struct StreamIter<'a, S> {
-    stream: S,
-    _marker: std::marker::PhantomData<&'a ()>,
-}
-
-impl<'a, S> Iterator for StreamIter<'a, S>
-where
-    S: Streamer<'a, Item = (&'a [u8], u64)>,
-{
-    type Item = (Vec<u8>, u64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.stream.next().map(move |(k, v)| (k.to_vec(), v))
-    }
-}
 
 #[cfg(test)]
 mod tests {

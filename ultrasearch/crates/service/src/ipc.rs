@@ -6,7 +6,6 @@ use std::time::Instant;
 use anyhow::Result;
 use ipc::{
     framing, MetricsSnapshot, SearchRequest, SearchResponse, StatusRequest, StatusResponse,
-    VolumeStatus,
 };
 use service::metrics::{global_metrics_snapshot, record_ipc_request};
 use service::search_handler::search;
@@ -22,21 +21,34 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 
 /// Start a Tokio named-pipe server that spawns a task per connection.
 pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>> {
-    let name = pipe_name.unwrap_or(DEFAULT_PIPE_NAME);
-    let server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(name)?;
-
+    let name = pipe_name.unwrap_or(DEFAULT_PIPE_NAME).to_string();
+    
     let handle = tokio::spawn(async move {
+        let mut first = true;
         loop {
-            let mut conn = server
-                .connect()
-                .await
-                .expect("named pipe connect failed");
+            let server_res = ServerOptions::new()
+                .first_pipe_instance(first)
+                .create(&name);
+            
+            let mut server = match server_res {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to create named pipe instance: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            
+            first = false;
+
+            if let Err(e) = server.connect().await {
+                tracing::error!("named pipe connect failed: {}", e);
+                continue;
+            }
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(&mut conn).await {
-                    tracing::warn!("pipe connection error: {e:?}");
+                if let Err(e) = handle_connection(server).await {
+                    tracing::warn!("pipe connection error: {{:?}}", e);
                 }
             });
         }
@@ -45,32 +57,34 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
     Ok(handle)
 }
 
-async fn handle_connection(conn: &mut NamedPipeServer) -> Result<()> {
+async fn handle_connection(mut conn: NamedPipeServer) -> Result<()>
+{
     loop {
         // decode frame
         let mut len_prefix = [0u8; 4];
+        // If read returns 0, client disconnected (or EOF).
         if conn.read_exact(&mut len_prefix).await.is_err() {
             break;
         }
         let frame_len = u32::from_le_bytes(len_prefix) as usize;
         if frame_len == 0 || frame_len > MAX_MESSAGE_BYTES {
-            tracing::warn!("invalid frame size {}", frame_len);
+            tracing::warn!("invalid frame size {{}}", frame_len);
             break;
         }
         let mut buf = vec![0u8; frame_len];
         conn.read_exact(&mut buf).await?;
 
-        let payload = match framing::decode_frame(&buf) {
-            Ok((payload, _rem)) => payload,
-            Err(e) => {
-                tracing::warn!("failed to decode frame: {e}");
-                continue;
-            }
-        };
-
-        let response = dispatch(&payload);
+        // framing::decode_frame expects [header + body].
+        // We have read them separately.
+        // We can reconstruct or just parse the body if we trust it.
+        // Since we are the server, we trust our read logic.
+        // Dispatch expects the RAW payload (no frame).
+        // But wait, `buf` IS the payload.
+        // framing::decode_frame also checks length. 
+        
+        let response = dispatch(&buf);
         let framed = framing::encode_frame(&response).unwrap_or_default();
-        conn.write_all(&(framed.len() as u32).to_le_bytes()).await?;
+        // framed includes length prefix.
         conn.write_all(&framed).await?;
     }
     Ok(())
