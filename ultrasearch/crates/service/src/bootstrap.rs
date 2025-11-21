@@ -42,30 +42,13 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
 
     run_initial_metadata_ingest(cfg)?;
 
-    // Background scheduler sampling loop; real queues/workers will hook in later.
-    let sched_cfg = SchedulerConfig {
-        warm_idle: Duration::from_secs(cfg.scheduler.idle_warm_seconds),
-        deep_idle: Duration::from_secs(cfg.scheduler.idle_deep_seconds),
-        cpu_metadata_max: cfg.scheduler.cpu_soft_limit_pct as f32,
-        cpu_content_max: cfg.scheduler.cpu_hard_limit_pct as f32,
-        disk_busy_threshold_bps: cfg.scheduler.disk_busy_bytes_per_s,
-        content_batch_size: cfg.scheduler.content_batch_size as usize,
-        ..SchedulerConfig::default()
-    };
-    let sample_every = Duration::from_secs(cfg.metrics.sample_interval_secs.max(1));
+    // Start scheduler loop
+    // We need to clone cfg for the scheduler (or pass reference if new() takes ref).
+    // SchedulerRuntime::new takes &AppConfig.
+    let scheduler = SchedulerRuntime::new(cfg);
+    rt.spawn(scheduler.run_loop());
 
-    // We'll use a dedicated thread for the scheduler loop for now,
-    // but in a real service, we might want to use the tokio runtime.
-    // For now, we just spawn it.
-    thread::spawn(move || {
-        let mut runtime = SchedulerRuntime::new(sched_cfg);
-        loop {
-            let _ = runtime.tick();
-            thread::sleep(sample_every);
-        }
-    });
-
-    // Try to install unified search handler with corruption recovery.
+    // Try to install unified search handler.
     // We pass both meta and content index paths.
     let meta_path = Path::new(&cfg.paths.meta_index);
     let content_path = Path::new(&cfg.paths.content_index);
