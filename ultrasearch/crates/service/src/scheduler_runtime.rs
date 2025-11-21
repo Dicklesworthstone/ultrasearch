@@ -1,6 +1,8 @@
 use scheduler::{
     SchedulerConfig, idle::IdleTracker, metrics::SystemLoadSampler, should_spawn_content_worker,
 };
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::status_provider::{
@@ -15,11 +17,18 @@ pub struct SchedulerRuntime {
     idle: IdleTracker,
     load: SystemLoadSampler,
     last_content_spawn: Option<Instant>,
-    active_workers: u32,
-    queue_critical: usize,
-    queue_metadata: usize,
-    queue_content: usize,
+    live: &'static SchedulerLiveState,
 }
+
+#[derive(Debug, Default)]
+struct SchedulerLiveState {
+    critical: AtomicUsize,
+    metadata: AtomicUsize,
+    content: AtomicUsize,
+    active_workers: AtomicU32,
+}
+
+static LIVE_STATE: OnceLock<SchedulerLiveState> = OnceLock::new();
 
 impl SchedulerRuntime {
     pub fn new(config: SchedulerConfig) -> Self {
@@ -30,22 +39,8 @@ impl SchedulerRuntime {
             idle,
             load,
             last_content_spawn: None,
-            active_workers: 0,
-            queue_critical: 0,
-            queue_metadata: 0,
-            queue_content: 0,
+            live: LIVE_STATE.get_or_init(SchedulerLiveState::default),
         }
-    }
-
-    /// Update queue sizes from the scheduler/worker system.
-    pub fn set_queue_counts(&mut self, critical: usize, metadata: usize, content: usize) {
-        self.queue_critical = critical;
-        self.queue_metadata = metadata;
-        self.queue_content = content;
-    }
-
-    pub fn set_active_workers(&mut self, active: u32) {
-        self.active_workers = active;
     }
 
     /// Run a single tick: sample idle/load, update status/metrics, and decide
@@ -54,22 +49,21 @@ impl SchedulerRuntime {
     pub fn tick(&mut self) -> Option<usize> {
         let idle_sample = self.idle.sample();
         let load = self.load.sample();
-        let depth = (self.queue_critical + self.queue_metadata + self.queue_content) as u64;
+        let crit = self.live.critical.load(Ordering::Relaxed);
+        let meta = self.live.metadata.load(Ordering::Relaxed);
+        let content = self.live.content.load(Ordering::Relaxed);
+        let workers = self.live.active_workers.load(Ordering::Relaxed);
+        let depth = (crit + meta + content) as u64;
 
         update_status_scheduler_state(format!(
             "idle={:?} cpu={:.1}% mem={:.1}% queues(c/m/t)={}/{}/{}",
-            idle_sample.state,
-            load.cpu_percent,
-            load.mem_used_percent,
-            self.queue_critical,
-            self.queue_metadata,
-            self.queue_content
+            idle_sample.state, load.cpu_percent, load.mem_used_percent, crit, meta, content
         ));
-        update_status_queue_state(Some(depth), Some(self.active_workers));
+        update_status_queue_state(Some(depth), Some(workers));
         update_status_metrics(None);
 
         let spawn = should_spawn_content_worker(
-            self.queue_content,
+            content,
             idle_sample.state,
             load,
             &self.config,
@@ -82,4 +76,18 @@ impl SchedulerRuntime {
 
         None
     }
+}
+
+/// Update helpers for the live scheduler view. Intended to be called by the real
+/// scheduler loop / worker manager.
+pub fn set_live_queue_counts(critical: usize, metadata: usize, content: usize) {
+    let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
+    live.critical.store(critical, Ordering::Relaxed);
+    live.metadata.store(metadata, Ordering::Relaxed);
+    live.content.store(content, Ordering::Relaxed);
+}
+
+pub fn set_live_active_workers(active: u32) {
+    let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
+    live.active_workers.store(active, Ordering::Relaxed);
 }

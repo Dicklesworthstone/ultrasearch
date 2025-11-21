@@ -1,32 +1,21 @@
 //! Entry point for the UltraSearch Windows service (bootstrap only for now).
 
-use std::{path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::Result;
-use clap::Parser;
 use core_types::config::load_or_create_config;
 use scheduler::SchedulerConfig;
 use service::{
     init_tracing_with_config,
-    metrics::{init_metrics_from_config, set_global_metrics, spawn_metrics_http},
+    metrics::{init_metrics_from_config, set_global_metrics},
     scheduler_runtime::SchedulerRuntime,
     search_handler::{MetaIndexSearchHandler, set_search_handler},
     status_provider::init_basic_status_provider,
 };
-use std::path::Path;
-
-#[derive(Parser, Debug)]
-#[command(name = "searchd", about = "UltraSearch service host")]
-struct Args {
-    /// Path to config TOML (created if missing)
-    #[arg(long, default_value = "config/config.toml")]
-    config: PathBuf,
-}
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    let args = Args::parse();
-    let cfg = load_or_create_config(Some(&args.config))?;
+    let cfg = load_or_create_config(None)?;
     let _guard = init_tracing_with_config(&cfg.logging)?;
 
     // Install status provider so IPC/status can respond.
@@ -35,7 +24,6 @@ fn main() -> Result<()> {
     if cfg.metrics.enabled {
         let metrics = Arc::new(init_metrics_from_config(&cfg.metrics)?);
         set_global_metrics(metrics);
-        spawn_metrics_http(&cfg.metrics.bind)?;
     }
 
     // Background scheduler sampling loop; real queues/workers will hook in later.
@@ -52,9 +40,6 @@ fn main() -> Result<()> {
     thread::spawn(move || {
         let mut runtime = SchedulerRuntime::new(sched_cfg);
         loop {
-            // TODO: connect real queue/worker telemetry from scheduler loop once available.
-            set_live_queue_counts(0, 0, 0);
-            set_live_active_workers(0);
             let _ = runtime.tick();
             thread::sleep(sample_every);
         }
@@ -67,10 +52,7 @@ fn main() -> Result<()> {
         tracing::warn!("meta-index search handler not initialized; falling back to stub");
     }
 
-    println!(
-        "UltraSearch service placeholder – scheduler sampling active (config: {}).",
-        args.config.display()
-    );
+    println!("UltraSearch service placeholder – scheduler sampling active.");
 
     Ok(())
 }
