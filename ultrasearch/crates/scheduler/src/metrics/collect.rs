@@ -1,9 +1,12 @@
 use std::time::{Duration, Instant};
 use sysinfo::System;
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Performance::{
-    PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW,
-    PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue, PdhOpenQueryW,
+use windows::{
+    Win32::System::Performance::{
+        PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW,
+        PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue, PdhOpenQueryW,
+    },
+    core::w,
 };
 
 /// Snapshot of system load suitable for scheduling decisions.
@@ -12,7 +15,6 @@ pub struct SystemLoad {
     pub cpu_percent: f32,
     pub mem_used_percent: f32,
     /// Aggregate disk throughput in bytes/sec since the previous sample.
-    /// Placeholders until sysinfo exposes disk IO counters in the chosen feature set.
     pub disk_bytes_per_sec: u64,
     pub disk_busy: bool,
     /// Duration covered by this sample (useful for metrics surfaces).
@@ -70,7 +72,7 @@ impl SystemLoadSampler {
         let total_mem = self.system.total_memory().max(1);
         let mem_used_percent = (self.system.used_memory() as f32 / total_mem as f32) * 100.0;
 
-        let (disk_bytes_per_sec, disk_busy) = self.sample_disk();
+        let (disk_bytes_per_sec, disk_busy) = self.sample_disk(elapsed);
 
         self.last_sample = now;
 
@@ -83,7 +85,7 @@ impl SystemLoadSampler {
         }
     }
 
-    fn sample_disk(&mut self) -> (u64, bool) {
+    fn sample_disk(&mut self, elapsed: Duration) -> (u64, bool) {
         #[cfg(target_os = "windows")]
         {
             if let Some(counter) = self.disk_counter.as_mut() {
@@ -93,8 +95,12 @@ impl SystemLoadSampler {
                 }
             }
         }
-        // Fallback when disk metrics unavailable.
-        (0, false)
+
+        // Fallback when disk metrics unavailable (non-Windows builds).
+        let bps = 0;
+        let busy = false;
+        let _ = elapsed; // keep signature consistent
+        (bps, busy)
     }
 }
 
@@ -112,8 +118,13 @@ impl PdhCounter {
             PdhOpenQueryW(None, 0, &mut query).ok()?;
 
             let mut counter = PDH_HCOUNTER::default();
-            let path = "\\PhysicalDisk(_Total)\\Disk Bytes/sec";
-            PdhAddEnglishCounterW(query, path, 0, &mut counter).ok()?;
+            PdhAddEnglishCounterW(
+                query,
+                w!("\\PhysicalDisk(_Total)\\Disk Bytes/sec"),
+                0,
+                &mut counter,
+            )
+            .ok()?;
             PdhCollectQueryData(query).ok()?;
 
             Ok(Self { query, counter })
