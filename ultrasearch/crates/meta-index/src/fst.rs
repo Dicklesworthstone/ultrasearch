@@ -32,7 +32,8 @@ impl FstIndex {
     /// `prefix` should be normalized (lowercased) if the index was built with normalized names.
     pub fn search<'a>(&'a self, prefix: &str) -> impl Iterator<Item = DocKey> + 'a {
         // Create an automaton that matches any key starting with `prefix`.
-        let matcher = Str::new(prefix).starts_with();
+        // We convert to String to own the bytes, ensuring 'prefix lifetime doesn't leak into the iterator.
+        let matcher = Str::new(prefix.to_string()).starts_with();
         let stream = self.map.search(matcher).into_stream();
 
         StreamIter {
@@ -41,7 +42,7 @@ impl FstIndex {
         }
         .filter_map(move |(k, _)| {
             // Key format: name_bytes + \0 + 8 bytes DocKey (BE).
-            // Minimal length is 1 + 8 = 9 (assuming name is at least empty? Empty name file? maybe).
+            // Minimal length is 1 + 8 = 9.
             if k.len() < 9 {
                 return None;
             }
@@ -109,12 +110,14 @@ struct StreamIter<'a, S> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, S: Streamer<'a>> Iterator for StreamIter<'a, S> {
+impl<'a, S> Iterator for StreamIter<'a, S>
+where
+    S: Streamer<'a, Item = (&'a [u8], u64)>,
+{
     type Item = (Vec<u8>, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Streamer::next returns Option<(&'a [u8], u64)>
-        self.stream.next().map(|(k, v)| (k.to_vec(), v))
+        self.stream.next().map(move |(k, v)| (k.to_vec(), v))
     }
 }
 
