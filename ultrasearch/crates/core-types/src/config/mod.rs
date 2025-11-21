@@ -4,8 +4,9 @@ use std::{
 };
 
 use anyhow::Result;
-use once_cell::sync::OnceCell;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 
 /// Global configuration root loaded from `.env` + `config/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +30,7 @@ pub struct AppConfig {
 }
 
 /// Load config, creating a default config file if none exists at the target path.
-pub fn load_or_create_config(path: Option<&Path>) -> Result<&'static AppConfig> {
+pub fn load_or_create_config(path: Option<&Path>) -> Result<AppConfig> {
     let target: PathBuf = path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("config/config.toml"));
@@ -384,45 +385,37 @@ fn default_semantic_index_dir() -> String {
     "{data_dir}/index/semantic".into()
 }
 
-static CONFIG: OnceCell<AppConfig> = OnceCell::new();
+static CONFIG: Lazy<RwLock<AppConfig>> = Lazy::new(|| RwLock::new(AppConfig::default()));
 
 /// Load configuration from .env and a TOML file (default: `config/config.toml`).
 ///
-/// The first successful call caches the config globally for reuse.
-pub fn load_config(path: Option<&Path>) -> Result<&'static AppConfig> {
-    // Safe to call multiple times; dotenvy ignores missing file.
+/// Returns a clone of the current configuration.
+pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
     let _ = dotenvy::dotenv();
-
-    CONFIG.get_or_try_init(|| {
-        let mut cfg = AppConfig::default();
-        if let Some(path) = path {
-            if path.exists() {
-                let raw = fs::read_to_string(path)?;
-                let file_cfg: AppConfig = toml::from_str(&raw)?;
-                cfg = merge(cfg, file_cfg);
-            }
-        } else if Path::new("config/config.toml").exists() {
-            let raw = fs::read_to_string("config/config.toml")?;
-            let file_cfg: AppConfig = toml::from_str(&raw)?;
-            cfg = merge(cfg, file_cfg);
-        }
-        apply_placeholders(&mut cfg);
-        Ok(cfg)
-    })
+    // On first load, we might want to read from disk if not done yet.
+    reload_config(path)
 }
 
-/// Merge `override_cfg` into `base`, taking any values present in `override_cfg`.
-fn merge(mut base: AppConfig, override_cfg: AppConfig) -> AppConfig {
-    // Simple field replacement; nested structs are fully replaced.
-    base.app = override_cfg.app;
-    base.logging = override_cfg.logging;
-    base.metrics = override_cfg.metrics;
-    base.features = override_cfg.features;
-    base.scheduler = override_cfg.scheduler;
-    base.paths = override_cfg.paths;
-    base.extract = override_cfg.extract;
-    base.semantic = override_cfg.semantic;
-    base
+/// Force reload configuration from disk.
+pub fn reload_config(path: Option<&Path>) -> Result<AppConfig> {
+    let target = path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("config/config.toml"));
+
+    let mut lock = CONFIG.write().map_err(|_| anyhow::anyhow!("config lock poisoned"))?;
+
+    if target.exists() {
+        let raw = fs::read_to_string(&target)?;
+        // Load into a temporary to validate
+        let mut file_cfg: AppConfig = toml::from_str(&raw)?;
+        apply_placeholders(&mut file_cfg);
+        
+        *lock = file_cfg.clone();
+        Ok(file_cfg)
+    } else {
+        // If no file, return what we have (defaults or previous)
+        Ok(lock.clone())
+    }
 }
 
 /// Replace `{data_dir}` placeholder tokens with the configured data_dir.
@@ -439,6 +432,20 @@ fn apply_placeholders(cfg: &mut AppConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Merge `override_cfg` into `base`, taking any values present in `override_cfg`.
+    fn merge(mut base: AppConfig, override_cfg: AppConfig) -> AppConfig {
+        // Simple field replacement; nested structs are fully replaced.
+        base.app = override_cfg.app;
+        base.logging = override_cfg.logging;
+        base.metrics = override_cfg.metrics;
+        base.features = override_cfg.features;
+        base.scheduler = override_cfg.scheduler;
+        base.paths = override_cfg.paths;
+        base.extract = override_cfg.extract;
+        base.semantic = override_cfg.semantic;
+        base
+    }
 
     #[test]
     fn default_placeholders_expand() {
