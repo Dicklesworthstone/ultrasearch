@@ -1,6 +1,7 @@
 At a high level you’re building:
 
 **Progress log**
+- 2025-11-21 (WhiteDog): IPC search installs meta-index handler (name/path) when index path exists; Status IPC uses BasicStatusProvider + metrics and sets served_by; scheduler runtime fills queue depth/active_workers.
 - 2025-11-21 (PurplePond): c00.5.6 job-file schema v1 — index-worker consumes versioned JSON (legacy array still works), writes extracted docs into content index, supports commit_every, Extractous flag/env, preview/JSON output; workspace fmt/check/clippy clean.
 - 2025-11-21 (PurplePond): c00.5.2 worker shim expanded — index-worker supports `--job-file` (JSON array), per-job limits, preview/`--json`, env/flag Extractous toggle; workspace rebuilt after restoring scheduler/service metrics placeholders.
 - 2025-11-21 (PurplePond): c00.4.1 module wiring fixed — added idle/mod.rs + metrics/mod.rs, moved SystemLoad/SystemLoadSampler into metrics, reconciled idle tracker export; workspace check/clippy green.
