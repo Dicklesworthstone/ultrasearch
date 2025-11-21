@@ -45,10 +45,9 @@ mod duration_ms {
         {
             match value {
                 Some(dur) => {
-                    let ms: u64 = dur
-                        .as_millis()
-                        .try_into()
-                        .map_err(|_| serde::ser::Error::custom("duration too large for u64 millis"))?;
+                    let ms: u64 = dur.as_millis().try_into().map_err(|_| {
+                        serde::ser::Error::custom("duration too large for u64 millis")
+                    })?;
                     serializer.serialize_some(&ms)
                 }
                 None => serializer.serialize_none(),

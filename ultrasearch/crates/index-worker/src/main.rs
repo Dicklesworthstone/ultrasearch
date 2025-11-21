@@ -18,6 +18,9 @@ use std::path::PathBuf;
 use std::{env, fs};
 use tracing::{info, warn};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -83,6 +86,13 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // Lower process priority to minimize impact
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS};
+        let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
 
     let mut args = Args::parse();
 

@@ -128,7 +128,6 @@ impl FstBuilder {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

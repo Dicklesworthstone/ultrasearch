@@ -6,7 +6,7 @@ use ahash::RandomState;
 use core_types::{DocKey, FileFlags, FileMeta, Timestamp};
 use lasso::{Rodeo, Spur};
 use lru::LruCache;
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 
 new_key_type! { pub struct CacheKey; }
 
@@ -114,7 +114,9 @@ impl MetadataCache {
             segments.push(name_str);
 
             if let Some(p) = parent {
-                if p == current_key { break; }
+                if p == current_key {
+                    break;
+                }
                 current_key = p;
             } else {
                 break;
@@ -124,7 +126,7 @@ impl MetadataCache {
         segments.reverse();
         let full_path = segments.join(std::path::MAIN_SEPARATOR_STR);
         let path_arc: Arc<str> = full_path.into();
-        
+
         self.path_cache.put(key, path_arc.clone());
         Some(path_arc)
     }
@@ -132,7 +134,7 @@ impl MetadataCache {
     pub fn resolve_name(&self, item: &CachedItem) -> &str {
         self.interner.resolve(&item.name)
     }
-    
+
     pub fn clear(&mut self) {
         self.slots.clear();
         self.lookup.clear();
@@ -148,7 +150,15 @@ mod tests {
 
     fn make_meta(key: DocKey, parent: Option<DocKey>, name: &str) -> FileMeta {
         FileMeta::new(
-            key, 0, parent, name.to_string(), None, 100, 0, 0, FileFlags::empty(),
+            key,
+            0,
+            parent,
+            name.to_string(),
+            None,
+            100,
+            0,
+            0,
+            FileFlags::empty(),
         )
     }
 
@@ -178,7 +188,9 @@ mod tests {
         cache.put(&make_meta(dir_key, Some(root_key), "Users"));
         cache.put(&make_meta(file_key, Some(dir_key), "test.txt"));
 
-        let path = cache.resolve_path(file_key, |_| None).expect("should resolve");
+        let path = cache
+            .resolve_path(file_key, |_| None)
+            .expect("should resolve");
         #[cfg(windows)]
         assert_eq!(&*path, "C:\\Users\\test.txt");
         #[cfg(not(windows))]
@@ -197,19 +209,21 @@ mod tests {
         cache.put(&make_meta(file_key, Some(dir_key), "test.txt"));
 
         // Fallback provided for dir
-        let path = cache.resolve_path(file_key, |k| {
-            if k == dir_key {
-                Some(make_meta(dir_key, Some(root_key), "Users"))
-            } else {
-                None
-            }
-        }).expect("should resolve via fallback");
+        let path = cache
+            .resolve_path(file_key, |k| {
+                if k == dir_key {
+                    Some(make_meta(dir_key, Some(root_key), "Users"))
+                } else {
+                    None
+                }
+            })
+            .expect("should resolve via fallback");
 
         #[cfg(windows)]
         assert_eq!(&*path, "C:\\Users\\test.txt");
         #[cfg(not(windows))]
         assert_eq!(&*path, "C:/Users/test.txt");
-        
+
         // Verify dir is now in cache
         assert!(cache.get(dir_key).is_some());
     }

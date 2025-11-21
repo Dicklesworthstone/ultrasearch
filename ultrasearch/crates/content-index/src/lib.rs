@@ -10,6 +10,8 @@ use core_types::DocKey;
 pub use tantivy::IndexWriter;
 use tantivy::{Index, IndexSettings, ReloadPolicy, schema::document::TantivyDocument, schema::*};
 
+pub mod log_analysis;
+
 /// Field handles for the content index schema.
 #[derive(Debug, Clone)]
 pub struct ContentFields {
@@ -35,6 +37,8 @@ pub fn build_schema() -> (Schema, ContentFields) {
     let size = builder.add_u64_field("size", FAST | STORED);
     let modified = builder.add_i64_field("modified", FAST | STORED);
     let content_lang = builder.add_text_field("content_lang", STRING | STORED);
+
+    // Use default tokenizer for content, but allow overrides via per-field options later if needed.
     let content = builder.add_text_field("content", TEXT);
 
     let fields = ContentFields {
@@ -58,6 +62,10 @@ pub struct ContentIndex {
     pub fields: ContentFields,
 }
 
+fn setup_index(index: &Index) {
+    log_analysis::register_log_analyzers(index.tokenizers());
+}
+
 pub fn open_or_create(path: &Path) -> Result<ContentIndex> {
     let (schema, fields) = build_schema();
     let index = if path.join("meta.json").exists() {
@@ -65,6 +73,7 @@ pub fn open_or_create(path: &Path) -> Result<ContentIndex> {
     } else {
         Index::create_in_dir(path, schema)?
     };
+    setup_index(&index);
     Ok(ContentIndex { index, fields })
 }
 
@@ -73,6 +82,7 @@ pub fn create_in_ram() -> Result<ContentIndex> {
     let (schema, fields) = build_schema();
     let dir = tantivy::directory::RamDirectory::create();
     let index = Index::create(dir, schema, IndexSettings::default())?;
+    setup_index(&index);
     Ok(ContentIndex { index, fields })
 }
 

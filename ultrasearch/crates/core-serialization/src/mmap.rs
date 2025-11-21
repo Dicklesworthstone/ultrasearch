@@ -14,7 +14,8 @@ pub struct MmapArea {
 impl MmapArea {
     /// Open a file and map it into memory as read-only.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe {
             Mmap::map(&file).with_context(|| format!("failed to mmap {}", path.display()))?
         };

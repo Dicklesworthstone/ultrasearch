@@ -63,6 +63,8 @@ pub enum NtfsError {
     Discovery(String),
     #[error("usn journal error: {0}")]
     Journal(String),
+    #[error("usn gap detected")]
+    GapDetected,
     #[error("mft enumeration failed: {0}")]
     Mft(String),
     #[error("operation not supported on this platform")]

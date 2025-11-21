@@ -65,15 +65,46 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
         }
     });
 
-    // Try to install unified search handler.
+    // Try to install unified search handler with corruption recovery.
     // We pass both meta and content index paths.
     let meta_path = Path::new(&cfg.paths.meta_index);
     let content_path = Path::new(&cfg.paths.content_index);
-    
-    if let Ok(handler) = crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path) {
-        set_search_handler(Box::new(handler));
-    } else {
-        tracing::warn!("unified search handler not initialized; falling back to stub");
+
+    let mut attempts = 0;
+    loop {
+        match crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path) {
+            Ok(handler) => {
+                set_search_handler(Box::new(handler));
+                break;
+            }
+            Err(e) => {
+                // Check if error string contains "corruption" or "corrupted" or similar tantivy errors.
+                // Tantivy errors are opaque via anyhow, so string check is a heuristic.
+                let msg = e.to_string().to_lowercase();
+                let is_corruption = msg.contains("corrupt") || msg.contains("format") || msg.contains("lock"); 
+                
+                if is_corruption && attempts < 1 {
+                    tracing::warn!("Index corruption detected ({}), attempting recovery...", msg);
+                    // Rename broken index if it exists
+                    if meta_path.exists() {
+                        let broken = meta_path.with_extension("broken");
+                        let _ = std::fs::rename(meta_path, &broken);
+                        tracing::info!("Renamed corrupt meta index to {:?}", broken);
+                    }
+                    // Content index might be fine, but let's be safe and rename it too if opening failed generally?
+                    // UnifiedSearchHandler tries both. If meta fails, we fail.
+                    // If content fails, we log warning but return handler (in try_new implementation).
+                    // So if try_new returns Err, it's likely meta-index issue or critical content issue.
+                    // Let's wipe both if we can't determine source easily, or just meta.
+                    // For simplicity in this resilience task, we wipe meta.
+                    attempts += 1;
+                    continue;
+                }
+                
+                tracing::warn!("unified search handler not initialized: {}", e);
+                break;
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -81,7 +112,7 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
         // Start IPC server
         // We use the runtime we just created.
         if let Err(e) = rt.block_on(crate::ipc::start_pipe_server(None)) {
-             tracing::error!("failed to start IPC server: {}", e);
+            tracing::error!("failed to start IPC server: {}", e);
         }
     }
 

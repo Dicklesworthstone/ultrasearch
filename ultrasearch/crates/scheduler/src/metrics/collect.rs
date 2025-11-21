@@ -33,7 +33,7 @@ impl SystemLoadSampler {
     /// Create a sampler with a busy threshold expressed in bytes/sec.
     pub fn new(disk_busy_threshold_bps: u64) -> Self {
         let mut system = System::new();
-        system.refresh_cpu();
+        system.refresh_cpu_all();
         system.refresh_memory();
         #[cfg(target_os = "windows")]
         let disk_counter = PdhCounter::new_total_disk_bytes().ok();
@@ -57,7 +57,7 @@ impl SystemLoadSampler {
 
     /// Refresh system metrics and compute load figures.
     pub fn sample(&mut self) -> SystemLoad {
-        self.system.refresh_cpu();
+        self.system.refresh_cpu_all();
         self.system.refresh_memory();
 
         let now = Instant::now();
@@ -68,7 +68,7 @@ impl SystemLoadSampler {
             elapsed
         };
 
-        let cpu_percent = self.system.global_cpu_info().cpu_usage();
+        let cpu_percent = self.system.global_cpu_usage();
         let total_mem = self.system.total_memory().max(1);
         let mem_used_percent = (self.system.used_memory() as f32 / total_mem as f32) * 100.0;
 

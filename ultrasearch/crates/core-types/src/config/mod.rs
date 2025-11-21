@@ -407,7 +407,9 @@ pub fn reload_config(path: Option<&Path>) -> Result<AppConfig> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("config/config.toml"));
 
-    let mut lock = CONFIG.write().map_err(|_| anyhow::anyhow!("config lock poisoned"))?;
+    let mut lock = CONFIG
+        .write()
+        .map_err(|_| anyhow::anyhow!("config lock poisoned"))?;
 
     if target.exists() {
         let raw = fs::read_to_string(&target)?;
@@ -415,7 +417,7 @@ pub fn reload_config(path: Option<&Path>) -> Result<AppConfig> {
         let mut file_cfg: AppConfig = toml::from_str(&raw)?;
         apply_placeholders(&mut file_cfg);
         file_cfg.validate()?;
-        
+
         *lock = file_cfg.clone();
         Ok(file_cfg)
     } else {
@@ -428,11 +430,15 @@ impl AppConfig {
     /// Validate configuration constraints.
     pub fn validate(&self) -> Result<()> {
         if self.features.delta_index && !self.features.multi_tier_index {
-            return Err(anyhow::anyhow!("Feature 'delta_index' requires 'multi_tier_index' to be enabled"));
+            return Err(anyhow::anyhow!(
+                "Feature 'delta_index' requires 'multi_tier_index' to be enabled"
+            ));
         }
         // Semantic search requires model to be specified (default has one, but if user clears it?)
         if self.features.semantic_search && self.semantic.model.is_empty() {
-             return Err(anyhow::anyhow!("Feature 'semantic_search' requires a valid model configuration"));
+            return Err(anyhow::anyhow!(
+                "Feature 'semantic_search' requires a valid model configuration"
+            ));
         }
         Ok(())
     }

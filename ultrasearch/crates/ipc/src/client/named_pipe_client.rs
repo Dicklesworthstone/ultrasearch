@@ -93,7 +93,7 @@ impl PipeClient {
                 let mut len_buf = [0u8; 4];
                 conn.read_exact(&mut len_buf).await?;
                 let resp_len = u32::from_le_bytes(len_buf) as usize;
-                
+
                 if resp_len == 0 || resp_len > MAX_MESSAGE_BYTES {
                     bail!("invalid response length {}", resp_len);
                 }
@@ -101,7 +101,7 @@ impl PipeClient {
                 // Read response body
                 let mut buf = vec![0u8; resp_len];
                 conn.read_exact(&mut buf).await?;
-                
+
                 // Deserialize directly from the body buffer
                 // (framing::decode_frame expects [header + body], but we already consumed header.
                 // Since we trust the stream logic here, we can skip using decode_frame logic for the buffer check

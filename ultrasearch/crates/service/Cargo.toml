@@ -25,6 +25,9 @@ prometheus = "0.13"
 uuid = { workspace = true }
 bincode = { workspace = true }
 tantivy = { workspace = true }
+mimalloc = "0.1.48"
+serde_json = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

@@ -17,6 +17,7 @@ use tantivy::{IndexSettings, ReloadPolicy};
 pub mod cache;
 pub mod fst;
 pub mod state;
+pub mod tiers;
 
 /// Fields used in the metadata index.
 #[derive(Debug, Clone)]

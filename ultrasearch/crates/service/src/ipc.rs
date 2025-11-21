@@ -4,9 +4,7 @@ use std::env;
 use std::time::Instant;
 
 use anyhow::Result;
-use ipc::{
-    framing, MetricsSnapshot, SearchRequest, SearchResponse, StatusRequest, StatusResponse,
-};
+use ipc::{MetricsSnapshot, SearchRequest, SearchResponse, StatusRequest, StatusResponse, framing};
 use service::metrics::{global_metrics_snapshot, record_ipc_request};
 use service::search_handler::search;
 use service::status::make_status_response;
@@ -22,14 +20,14 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 /// Start a Tokio named-pipe server that spawns a task per connection.
 pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>> {
     let name = pipe_name.unwrap_or(DEFAULT_PIPE_NAME).to_string();
-    
+
     let handle = tokio::spawn(async move {
         let mut first = true;
         loop {
             let server_res = ServerOptions::new()
                 .first_pipe_instance(first)
                 .create(&name);
-            
+
             let mut server = match server_res {
                 Ok(s) => s,
                 Err(e) => {
@@ -38,7 +36,7 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
                     continue;
                 }
             };
-            
+
             first = false;
 
             if let Err(e) = server.connect().await {
@@ -57,8 +55,7 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
     Ok(handle)
 }
 
-async fn handle_connection(mut conn: NamedPipeServer) -> Result<()>
-{
+async fn handle_connection(mut conn: NamedPipeServer) -> Result<()> {
     loop {
         // decode frame
         let mut len_prefix = [0u8; 4];
@@ -80,8 +77,8 @@ async fn handle_connection(mut conn: NamedPipeServer) -> Result<()>
         // Since we are the server, we trust our read logic.
         // Dispatch expects the RAW payload (no frame).
         // But wait, `buf` IS the payload.
-        // framing::decode_frame also checks length. 
-        
+        // framing::decode_frame also checks length.
+
         let response = dispatch(&buf);
         let framed = framing::encode_frame(&response).unwrap_or_default();
         // framed includes length prefix.

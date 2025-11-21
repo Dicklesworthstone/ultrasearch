@@ -76,10 +76,10 @@ async fn main() -> Result<()> {
             if !json {
                 println!("{}", style("Sending request...").cyan());
             }
-            
+
             #[cfg(windows)]
             let resp = PipeClient::default().search(req).await?;
-            
+
             #[cfg(not(windows))]
             let resp = stub_search(req).await?;
 
@@ -91,10 +91,10 @@ async fn main() -> Result<()> {
         }
         Commands::Status { json } => {
             let req = StatusRequest { id: Uuid::new_v4() };
-            
+
             #[cfg(windows)]
             let resp = PipeClient::default().status(req).await?;
-            
+
             #[cfg(not(windows))]
             let resp = stub_status(req).await?;
 
@@ -139,15 +139,24 @@ fn build_search_request(
 fn print_status_response(resp: &StatusResponse) -> Result<()> {
     println!("{}", style("Service Status:").green());
     println!("  Scheduler: {}", resp.scheduler_state);
-    println!("  Served By: {}", resp.served_by.as_deref().unwrap_or("unknown"));
-    
+    println!(
+        "  Served By: {}",
+        resp.served_by.as_deref().unwrap_or("unknown")
+    );
+
     if let Some(metrics) = &resp.metrics {
         println!("{}", style("Metrics:").yellow());
         println!("    Queue Depth: {}", metrics.queue_depth.unwrap_or(0));
-        println!("    Active Workers: {}", metrics.active_workers.unwrap_or(0));
+        println!(
+            "    Active Workers: {}",
+            metrics.active_workers.unwrap_or(0)
+        );
     }
 
-    println!("{}", style(format!("Volumes: {}", resp.volumes.len())).yellow());
+    println!(
+        "{}",
+        style(format!("Volumes: {}", resp.volumes.len())).yellow()
+    );
     for v in &resp.volumes {
         println!(
             "    Vol {:02}: Indexed {} | Pending {}",
@@ -185,7 +194,10 @@ fn print_search_response(resp: &SearchResponse) -> Result<()> {
 
 #[cfg(not(windows))]
 async fn stub_search(req: SearchRequest) -> Result<SearchResponse> {
-    println!("{}", style("Warning: Running on non-Windows (stub mode)").red());
+    println!(
+        "{}",
+        style("Warning: Running on non-Windows (stub mode)").red()
+    );
     Ok(SearchResponse {
         id: req.id,
         hits: Vec::new(),
@@ -198,7 +210,10 @@ async fn stub_search(req: SearchRequest) -> Result<SearchResponse> {
 
 #[cfg(not(windows))]
 async fn stub_status(req: StatusRequest) -> Result<StatusResponse> {
-    println!("{}", style("Warning: Running on non-Windows (stub mode)").red());
+    println!(
+        "{}",
+        style("Warning: Running on non-Windows (stub mode)").red()
+    );
     Ok(StatusResponse {
         id: req.id,
         volumes: vec![],

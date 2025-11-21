@@ -10,6 +10,9 @@ use std::fs;
 use std::path::Path;
 use tracing::instrument;
 
+pub mod component_manager;
+pub mod plugins;
+
 /// Unified extraction output.
 #[derive(Debug, Clone)]
 pub struct ExtractedContent {

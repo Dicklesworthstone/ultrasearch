@@ -1,5 +1,5 @@
-use ipc::{SearchHit, StatusResponse};
 use crate::ipc::client::IpcClient;
+use ipc::{SearchHit, StatusResponse};
 
 #[derive(Clone)]
 pub struct SearchAppModel {

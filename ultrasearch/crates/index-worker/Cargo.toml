@@ -19,3 +19,7 @@ ipc = { path = "../ipc" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tantivy = { workspace = true }
+mimalloc = "0.1.48"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

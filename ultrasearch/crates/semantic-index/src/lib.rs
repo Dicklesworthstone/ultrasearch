@@ -1,5 +1,8 @@
 //! Semantic / vector search scaffolding (stub).
 
+pub mod ann;
+pub mod embedding;
+
 use core_types::DocKey;
 
 #[derive(Debug)]

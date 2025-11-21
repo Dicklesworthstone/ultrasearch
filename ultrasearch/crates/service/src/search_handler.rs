@@ -66,6 +66,101 @@ impl UnifiedSearchHandler {
         })
     }
 
+    fn build_meta_query(&self, expr: &QueryExpr) -> Result<Box<dyn Query>> {
+        self.build_query(expr, &self.meta.fields, &self.meta.index)
+    }
+
+    fn build_query(
+        &self,
+        expr: &QueryExpr,
+        fields: &MetaFields,
+        index: &tantivy::Index,
+    ) -> Result<Box<dyn Query>> {
+        Ok(match expr {
+            QueryExpr::Term(t) => self.term_query(t, fields, index)?,
+            QueryExpr::Range(_) => Box::new(BooleanQuery::new(vec![])),
+            QueryExpr::Not(inner) => Box::new(BooleanQuery::new(vec![(
+                Occur::MustNot,
+                self.build_query(inner, fields, index)?,
+            )])),
+            QueryExpr::And(items) => Box::new(BooleanQuery::new(
+                items
+                    .iter()
+                    .map(|q| Ok((Occur::Must, self.build_query(q, fields, index)?)))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            QueryExpr::Or(items) => Box::new(BooleanQuery::new(
+                items
+                    .iter()
+                    .map(|q| Ok((Occur::Should, self.build_query(q, fields, index)?)))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+        })
+    }
+
+    fn term_query(
+        &self,
+        term: &TermExpr,
+        fields: &MetaFields,
+        index: &tantivy::Index,
+    ) -> Result<Box<dyn Query>> {
+        let value = term.value.trim();
+        if value.is_empty() {
+            return Ok(Box::new(BooleanQuery::new(vec![])));
+        }
+
+        let target_fields: Vec<FieldKind> = match term.field {
+            Some(f) => vec![f],
+            None => vec![FieldKind::Name, FieldKind::Path],
+        };
+
+        let mut clauses = Vec::new();
+        for field in target_fields {
+            match field {
+                FieldKind::Ext => {
+                    let t = Term::from_field_text(fields.ext, value);
+                    clauses.push((
+                        Occur::Should,
+                        Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                    ));
+                }
+                FieldKind::Name | FieldKind::Path => match term.modifier {
+                    TermModifier::Prefix => {
+                        let pf = if matches!(field, FieldKind::Name) {
+                            fields.name
+                        } else {
+                            fields.path
+                        };
+                        // Fallback for PrefixQuery removal
+                        let t = Term::from_field_text(pf, value);
+                        clauses.push((
+                            Occur::Should,
+                            Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs))
+                                as Box<dyn Query>,
+                        ));
+                    }
+                    _ => {
+                        let mut parser = QueryParser::for_index(
+                            index,
+                            vec![if matches!(field, FieldKind::Name) {
+                                fields.name
+                            } else {
+                                fields.path
+                            }],
+                        );
+                        parser.set_conjunction_by_default();
+                        if let Ok(q) = parser.parse_query(value) {
+                            clauses.push((Occur::Should, q));
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+
+        Ok(Box::new(BooleanQuery::new(clauses)))
+    }
+
     fn build_content_query(&self, expr: &QueryExpr) -> Result<Box<dyn Query>> {
         if let Some((idx, _)) = &self.content {
             // For content query, default fields might include content + name/path
@@ -74,7 +169,7 @@ impl UnifiedSearchHandler {
             // For simplicity, we reuse build_query but we need to map MetaFields-like structure or make build_query generic.
             // Since MetaFields and ContentFields are different structs, we can't pass them easily unless we have a trait or adapter.
             // But term_query matches on FieldKind. We can just reimplement term_query for ContentFields.
-            
+
             Ok(match expr {
                 QueryExpr::Term(t) => self.term_query_content(t, &idx.fields, &idx.index)?,
                 QueryExpr::Range(_) => Box::new(BooleanQuery::new(vec![])),
@@ -83,10 +178,16 @@ impl UnifiedSearchHandler {
                     self.build_content_query(inner)?,
                 )])),
                 QueryExpr::And(items) => Box::new(BooleanQuery::new(
-                    items.iter().map(|q| Ok((Occur::Must, self.build_content_query(q)?))).collect::<Result<Vec<_>>>()?,
+                    items
+                        .iter()
+                        .map(|q| Ok((Occur::Must, self.build_content_query(q)?)))
+                        .collect::<Result<Vec<_>>>()?,
                 )),
                 QueryExpr::Or(items) => Box::new(BooleanQuery::new(
-                    items.iter().map(|q| Ok((Occur::Should, self.build_content_query(q)?))).collect::<Result<Vec<_>>>()?,
+                    items
+                        .iter()
+                        .map(|q| Ok((Occur::Should, self.build_content_query(q)?)))
+                        .collect::<Result<Vec<_>>>()?,
                 )),
             })
         } else {
@@ -128,7 +229,8 @@ impl UnifiedSearchHandler {
                         let t = Term::from_field_text(tf, value);
                         clauses.push((
                             Occur::Should,
-                            Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                            Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs))
+                                as Box<dyn Query>,
                         ));
                     }
                     _ => {
@@ -167,10 +269,14 @@ impl UnifiedSearchHandler {
             }
         };
 
-        let out = hits.into_iter().skip(offset).filter_map(|(score, addr)| {
-            let retrieved = searcher.doc::<TantivyDocument>(addr).ok()?;
-            to_hit(&retrieved, &self.meta.fields, score)
-        }).collect();
+        let out = hits
+            .into_iter()
+            .skip(offset)
+            .filter_map(|(score, addr)| {
+                let retrieved = searcher.doc::<TantivyDocument>(addr).ok()?;
+                to_hit(&retrieved, &self.meta.fields, score)
+            })
+            .collect();
 
         SearchResponse {
             id: req.id,
@@ -184,7 +290,7 @@ impl UnifiedSearchHandler {
 
     fn search_content(&self, req: &SearchRequest) -> SearchResponse {
         let Some((content_idx, reader)) = &self.content else {
-             return StubSearchHandler.search(req.clone());
+            return StubSearchHandler.search(req.clone());
         };
 
         let start = Instant::now();
@@ -209,11 +315,15 @@ impl UnifiedSearchHandler {
             }
         };
 
-        let out = hits.into_iter().skip(offset).filter_map(|(score, addr)| {
-            let retrieved = searcher.doc::<TantivyDocument>(addr).ok()?;
-            // We need to_hit equivalent for content fields
-            to_hit_content(&retrieved, &content_idx.fields, score)
-        }).collect();
+        let out = hits
+            .into_iter()
+            .skip(offset)
+            .filter_map(|(score, addr)| {
+                let retrieved = searcher.doc::<TantivyDocument>(addr).ok()?;
+                // We need to_hit equivalent for content fields
+                to_hit_content(&retrieved, &content_idx.fields, score)
+            })
+            .collect();
 
         SearchResponse {
             id: req.id,
@@ -230,34 +340,36 @@ impl UnifiedSearchHandler {
         // 1. Meta search
         // 2. Content search
         // 3. Merge by DocKey
-        
+
         let start = Instant::now();
         let limit = req.limit.max(1) as usize;
-        
+
         // Fetch more to allow merging
-        let fetch_limit = limit * 2; 
-        
+        let fetch_limit = limit * 2;
+
         // Create sub-requests
         let mut meta_req = req.clone();
         meta_req.limit = fetch_limit as u32;
         meta_req.offset = 0; // We handle paging after merge? Or simple approach: no deep paging in hybrid for now.
-        
+
         let meta_resp = self.search_meta(&meta_req);
-        
-        let mut hits_map: std::collections::HashMap<core_types::DocKey, SearchHit> = std::collections::HashMap::new();
-        
+
+        let mut hits_map: std::collections::HashMap<core_types::DocKey, SearchHit> =
+            std::collections::HashMap::new();
+
         for hit in meta_resp.hits {
             hits_map.insert(hit.key, hit);
         }
-        
+
         if self.content.is_some() {
             let mut content_req = req.clone();
             content_req.limit = fetch_limit as u32;
             content_req.offset = 0;
             let content_resp = self.search_content(&content_req);
-            
+
             for hit in content_resp.hits {
-                hits_map.entry(hit.key)
+                hits_map
+                    .entry(hit.key)
                     .and_modify(|e| {
                         e.score = e.score.max(hit.score); // Max score strategy? Or sum? Max is safer for boolean queries.
                         if e.snippet.is_none() {
@@ -267,10 +379,14 @@ impl UnifiedSearchHandler {
                     .or_insert(hit);
             }
         }
-        
+
         let mut merged: Vec<SearchHit> = hits_map.into_values().collect();
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        
+        merged.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let offset = req.offset as usize;
         let total = merged.len();
         let hits = merged.into_iter().skip(offset).take(limit).collect();
@@ -297,14 +413,18 @@ impl SearchHandler for UnifiedSearchHandler {
 }
 
 // Helper to map content doc to SearchHit
-fn to_hit_content<D: Document>(doc: &D, fields: &content_index::ContentFields, score: Score) -> Option<SearchHit> {
+fn to_hit_content<D: Document>(
+    doc: &D,
+    fields: &content_index::ContentFields,
+    score: Score,
+) -> Option<SearchHit> {
     let mut key = None;
     let mut name = None;
     let mut path = None;
     let mut ext = None;
     let mut size = None;
     let mut modified = None;
-    let mut snippet = None; // TODO: snippet generation
+    let snippet = None; // TODO: snippet generation
 
     for (field, value) in doc.iter_fields_and_values() {
         match field {

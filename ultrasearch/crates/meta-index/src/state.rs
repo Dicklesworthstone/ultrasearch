@@ -1,5 +1,5 @@
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use core_serialization::{from_rkyv_bytes, to_rkyv_bytes};
@@ -26,12 +26,12 @@ impl VolumeState {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let bytes = to_rkyv_bytes(self).context("serialize state")?;
-        
+
         // Atomic write: write to tmp, rename.
         let tmp_path = path.with_extension("tmp");
         fs::write(&tmp_path, &bytes).context("write tmp state file")?;
         fs::rename(&tmp_path, path).context("rename state file")?;
-        
+
         Ok(())
     }
 }
