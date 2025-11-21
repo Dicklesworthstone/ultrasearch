@@ -6,6 +6,8 @@ use ipc::MetricsSnapshot;
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder, opts};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tracing::warn;
 
 /// Shared metrics handle for the service.
 pub struct ServiceMetrics {
@@ -59,10 +61,23 @@ impl ServiceMetrics {
         self.request_latency.observe(latency_secs);
     }
 
+    /// Record a successful request with a Duration.
+    pub fn record_request_duration(&self, duration: Duration) {
+        self.record_request(duration.as_secs_f64());
+    }
+
     /// Record a worker failure; returns true if the threshold has been met/exceeded.
     pub fn record_worker_failure(&self) -> bool {
         self.worker_failures.inc();
-        self.worker_failures.get() >= self.worker_failure_threshold
+        let tripped = self.worker_failures.get() >= self.worker_failure_threshold;
+        if tripped {
+            warn!(
+                count = self.worker_failures.get(),
+                threshold = self.worker_failure_threshold,
+                "worker failure threshold reached"
+            );
+        }
+        tripped
     }
 
     /// Reset the worker failure counter (used after a healthy run).
@@ -118,24 +133,41 @@ pub fn set_global_metrics(metrics: Arc<ServiceMetrics>) {
     let _ = GLOBAL_METRICS.set(metrics);
 }
 
+pub fn with_global_metrics<R>(func: impl FnOnce(&ServiceMetrics) -> R) -> Option<R> {
+    GLOBAL_METRICS.get().map(|m| func(m))
+}
+
 /// Render an IPC-facing metrics snapshot using the global handle, optionally annotating queue depth/active workers.
 pub fn global_metrics_snapshot(
     queue_depth: Option<u64>,
     active_workers: Option<u32>,
 ) -> Option<MetricsSnapshot> {
-    if let Some(m) = GLOBAL_METRICS.get() {
+    with_global_metrics(|m| {
         let snap = m.snapshot_with_queue_state(queue_depth, active_workers);
-        Some(MetricsSnapshot {
+        MetricsSnapshot {
             search_latency_ms_p50: snap.search_latency_ms_p50,
             search_latency_ms_p95: snap.search_latency_ms_p95,
             worker_cpu_pct: None,
             worker_mem_bytes: None,
             queue_depth: snap.queue_depth,
             active_workers: snap.active_workers,
-        })
-    } else {
-        None
-    }
+        }
+    })
+}
+
+/// Record a single IPC request duration against the global metrics handle (no-op if uninitialized).
+pub fn record_ipc_request(duration: Duration) {
+    let _ = with_global_metrics(|m| m.record_request_duration(duration));
+}
+
+/// Record a worker failure and return true if the failure threshold was met; no-op if metrics unset.
+pub fn record_worker_failure_global() -> Option<bool> {
+    with_global_metrics(|m| m.record_worker_failure())
+}
+
+/// Scrape all metrics from the global handle in Prometheus text format.
+pub fn global_scrape_metrics() -> Option<Vec<u8>> {
+    with_global_metrics(|m| scrape_metrics(m).unwrap_or_default())
 }
 
 #[cfg(test)]
