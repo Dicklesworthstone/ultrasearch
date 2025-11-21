@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub semantic: SemanticSection,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -184,6 +185,7 @@ pub struct FeaturesSection {
     pub auto_tuning: bool,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for FeaturesSection {
     fn default() -> Self {
         Self {
@@ -246,7 +248,7 @@ fn default_max_records_per_tick() -> u64 {
     10_000
 }
 fn default_usn_chunk_bytes() -> u64 {
-    1 * 1024 * 1024
+    1_048_576
 }
 fn default_cpu_soft() -> u64 {
     50
@@ -422,8 +424,14 @@ mod tests {
         cfg.app.data_dir = "X:/UltraSearch".into();
         apply_placeholders(&mut cfg);
         assert_eq!(cfg.logging.file, "X:/UltraSearch/log/searchd.log");
-        assert!(cfg.paths.meta_index.starts_with("X:/UltraSearch/index/meta"));
-        assert!(cfg.semantic.index_dir.starts_with("X:/UltraSearch/index/semantic"));
+        assert!(cfg
+            .paths
+            .meta_index
+            .starts_with("X:/UltraSearch/index/meta"));
+        assert!(cfg
+            .semantic
+            .index_dir
+            .starts_with("X:/UltraSearch/index/semantic"));
     }
 
     #[test]

@@ -257,6 +257,26 @@ mod tests {
     }
 
     #[test]
+    fn simple_extractor_bytes_processed_matches_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.txt");
+        std::fs::write(&path, b"abc").unwrap();
+
+        let ctx = ExtractContext {
+            path: path.to_str().unwrap(),
+            max_bytes: 10,
+            max_chars: 10,
+            ext_hint: Some("txt"),
+            mime_hint: None,
+        };
+        let simple = SimpleTextExtractor;
+        let out = simple.extract(&ctx, DocKey::from_parts(1, 1)).unwrap();
+        assert_eq!(out.bytes_processed, 3);
+        assert!(!out.truncated);
+        assert_eq!(out.text, "abc");
+    }
+
+    #[test]
     fn simple_extractor_rejects_large_file() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();

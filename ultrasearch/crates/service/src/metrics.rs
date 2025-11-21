@@ -131,4 +131,17 @@ mod tests {
         assert_eq!(snap.queue_depth, Some(3));
         assert_eq!(snap.active_workers, Some(2));
     }
+
+    #[test]
+    fn reset_worker_failures_resets_counter() {
+        let metrics = ServiceMetrics::new(&MetricsSection {
+            worker_failure_threshold: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        metrics.record_worker_failure();
+        assert!(metrics.worker_failures.get() > 0);
+        metrics.reset_worker_failures();
+        assert_eq!(metrics.worker_failures.get(), 0);
+    }
 }
