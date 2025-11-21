@@ -163,6 +163,31 @@ mod tests {
     use tantivy::directory::RamDirectory;
 
     #[test]
+    fn to_document_sets_fields() {
+        let (_schema, fields) = build_schema();
+        let doc = MetaDoc {
+            key: DocKey::from_parts(9, 42),
+            volume: 9,
+            name: "sample.txt".into(),
+            path: Some(r"C:\sample.txt".into()),
+            ext: Some("txt".into()),
+            size: 1234,
+            created: 100,
+            modified: 200,
+            flags: 0b1010,
+        };
+
+        let tdoc = to_document(&doc, &fields);
+        let get = |field| tdoc.get_first(field).unwrap();
+        assert_eq!(get(fields.doc_key).as_u64().unwrap(), doc.key.0);
+        assert_eq!(get(fields.volume).as_u64().unwrap(), doc.volume as u64);
+        assert_eq!(get(fields.size).as_u64().unwrap(), doc.size);
+        assert_eq!(get(fields.created).as_i64().unwrap(), doc.created);
+        assert_eq!(get(fields.modified).as_i64().unwrap(), doc.modified);
+        assert_eq!(get(fields.flags).as_u64().unwrap(), doc.flags);
+    }
+
+    #[test]
     fn add_and_read_round_trip() -> Result<()> {
         let dir = RamDirectory::create();
         let (schema, fields) = build_schema();
