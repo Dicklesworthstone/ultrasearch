@@ -51,6 +51,16 @@ pub fn from_bincode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     bincode::deserialize(bytes).context("bincode deserialize")
 }
 
+/// Deserialize with a defensive maximum payload length (in bytes).
+///
+/// This helps avoid allocating or parsing untrusted oversized buffers.
+pub fn from_bincode_with_limit<T: DeserializeOwned>(bytes: &[u8], max_len: usize) -> Result<T> {
+    if bytes.len() > max_len {
+        anyhow::bail!("bincode payload too large: {} > {}", bytes.len(), max_len);
+    }
+    from_bincode(bytes)
+}
+
 /// Serialize a type that implements `rkyv::Serialize` into an aligned byte buffer.
 pub fn to_rkyv_bytes<T>(value: &T) -> Result<AlignedVec>
 where
@@ -98,6 +108,17 @@ mod tests {
         let bytes = to_bincode(&dk).unwrap();
         let round: DocKeyWire = from_bincode(&bytes).unwrap();
         assert_eq!(round, dk);
+    }
+
+    #[test]
+    fn bincode_with_limit_errors_on_oversize() {
+        let dk = DocKeyWire {
+            volume: 2,
+            file: 99,
+        };
+        let bytes = to_bincode(&dk).unwrap();
+        assert!(from_bincode_with_limit::<DocKeyWire>(&bytes, bytes.len() - 1).is_err());
+        assert!(from_bincode_with_limit::<DocKeyWire>(&bytes, bytes.len()).is_ok());
     }
 
     #[derive(Archive, RSerialize, RDeserialize, Debug, PartialEq, Eq)]
