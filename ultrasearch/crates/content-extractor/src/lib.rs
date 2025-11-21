@@ -11,6 +11,7 @@ use std::path::Path;
 use tracing::instrument;
 
 pub mod component_manager;
+pub mod ifilter;
 pub mod ocr;
 pub mod plugins;
 
