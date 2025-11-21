@@ -128,37 +128,6 @@ impl Extractor for NoopExtractor {
     }
 }
 
-#[cfg(feature = "extractous-backend")]
-pub struct ExtractousExtractor;
-
-#[cfg(feature = "extractous-backend")]
-impl ExtractousExtractor {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[cfg(feature = "extractous-backend")]
-impl Extractor for ExtractousExtractor {
-    fn name(&self) -> &'static str {
-        "extractous"
-    }
-
-    fn supports(&self, ctx: &ExtractContext) -> bool {
-        ctx.ext_hint
-            .map(|ext| matches!(ext, "pdf" | "docx" | "pptx" | "xlsx"))
-            .unwrap_or(false)
-    }
-
-    fn extract(&self, ctx: &ExtractContext, _key: DocKey) -> Result<ExtractedContent, ExtractError> {
-        Err(ExtractError::Unsupported(format!(
-            "extractous backend not yet implemented for {}",
-            ctx.path
-        )))
-        .map_err(Into::into)
-    }
-}
-
 /// Plain-text extractor for lightweight formats (txt/log/rs/toml/json/md).
 pub struct SimpleTextExtractor;
 
@@ -489,24 +458,32 @@ mod tests {
 
     #[cfg(feature = "extractous_backend")]
     #[test]
-    fn extractous_respects_size_limit_and_extracts_text() {
+    fn extractous_rejects_large_file() {
+        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("simple.pdf");
-        std::fs::write(&path, b"just text").unwrap();
+        let path = dir.path().join("big.docx");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&[0u8; 128]).unwrap();
 
         let ctx = ExtractContext {
             path: path.to_str().unwrap(),
-            max_bytes: 32,
-            max_chars: 32,
-            ext_hint: Some("pdf"),
+            max_bytes: 64,
+            max_chars: 1024,
+            ext_hint: Some("docx"),
             mime_hint: None,
         };
 
         let extractor = ExtractousExtractor::new();
         assert!(extractor.supports(&ctx));
-
-        let out = extractor.extract(&ctx, DocKey::from_parts(1, 2)).unwrap();
-        assert!(!out.truncated);
-        assert_eq!(out.bytes_processed, out.text.len());
+        let err = extractor
+            .extract(&ctx, DocKey::from_parts(9, 9))
+            .unwrap_err();
+        match err {
+            ExtractError::FileTooLarge { bytes, max_bytes } => {
+                assert_eq!(bytes, 128);
+                assert_eq!(max_bytes, 64);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
