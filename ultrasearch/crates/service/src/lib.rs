@@ -8,6 +8,10 @@ pub mod scheduler_runtime;
 pub mod search_handler;
 pub mod status;
 pub mod status_provider;
+pub mod bootstrap;
+
+#[cfg(windows)]
+pub mod windows;
 
 pub use logging::{init_tracing, init_tracing_with_config};
 pub use meta_ingest::{ingest_file_meta_batch, ingest_with_paths};

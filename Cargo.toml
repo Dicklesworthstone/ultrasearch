@@ -26,7 +26,7 @@ bincode = "*"
 rkyv = { version = "*", features = ["std", "validation"] }
 dotenvy = "*"
 once_cell = "*"
-tokio = { version = "*", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "signal"] }
+tokio = { version = "*", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "signal", "sync"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
