@@ -89,6 +89,7 @@ fn main() -> Result<()> {
                 last_index_commit_ts: None,
                 scheduler_state: "unknown".into(),
                 metrics: None,
+                served_by: Some("cli-stub".into()),
             };
             if json {
                 println!("{}", to_string_pretty(&resp)?);
