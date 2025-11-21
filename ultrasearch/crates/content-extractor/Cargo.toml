@@ -6,12 +6,16 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "Content extraction pipeline for UltraSearch"
 
+[features]
+default = ["extractous_backend"]
+extractous_backend = ["extractous"]
+
 [dependencies]
 core-types = { path = "../core-types" }
 anyhow = { workspace = true }
-extractous = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+extractous = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "*"
