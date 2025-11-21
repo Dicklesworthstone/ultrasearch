@@ -1,19 +1,7 @@
 At a high level you’re building:
 
 **Progress log**
-No manual plan notes (auto-generated)
-- 2025-11-21 (PurpleStone): Fixed workspace build on nightly: removed windows-sys workspace usage, added thiserror/tempfile deps, updated Tantivy integration for 0.25, simplified scheduler disk sampling for sysinfo 0.30, cleaned clippy/cargo fmt across crates; cargo clippy --all-targets now passes.
-  - Resolved blocker: removed unused `usn-journal-rs` dependency from ntfs-watcher/workspace and kept `windows = 0.58`, `sysinfo = 0.30.13`; cargo check/clippy/fmt are green.
-  - c00.5 hygiene: added binary guard + byte-accurate counting in `content-extractor::SimpleTextExtractor`; tests updated; clippy clean.
-- 2025-11-21 (RedSnow): Unblocked cargo check on Linux by (1) adding serde support to core-types FileFlags, (2) removing unused `windows-sys` dep from ntfs-watcher, (3) temporarily pinning workspace `windows` crate to 0.52 to avoid the new `windows-future` breakage, and (4) fixing cli stub handler. `cargo check --all-targets` now passes (warnings only); waiting to coordinate manifests/windows version with PurpleStone’s c00.1.x pass.
-- 2025-11-21 (RedSnow): Started bead ultrasearch-c00.4.2; extended `SystemLoadSampler` with tracked CPU/mem plus disk bytes/sec field (currently stubbed to 0 on this host because sysinfo disks API unavailable under current features). Added basic test; build remains green.
-- 2025-11-21 (PinkSnow): Updated policy docs to nightly + latest crates; assigned epics across agents; working c00.1.2 (workspace manifests/windows-sys/usn-journal-rs) under nightly; reached out via Agent Mail.
-- 2025-11-21 (PinkSnow): Workspace/clippy clean on nightly with bincode 2 + windows/windows-sys 0.52; IPC/CLI/service moved to new bincode API; metrics dead-code suppressed. cargo check + cargo clippy --all-targets clean.
-- 2025-11-21 (PinkSnow): Started c00.6.2 — refactored service pipe handler to use shared framing + bincode2, returning well-formed Status/Search stub responses. More IPC wiring to follow.
-- 2025-11-21 (PinkSnow): c00.2.2 progress — config sections now Serialize; added `load_or_create_config` to write default config/config.toml when missing; pinned windows/windows-sys to 0.52 and windows-future to 0.2.1 to keep nightly builds stable.
-- 2025-11-21 (RedSnow): Completed c00.4.2 cleanup: sysinfo 0.30.13 disk metrics wired (bytes/sec + busy), repo stabilized with `windows` 0.52 and `bincode` 1.3.3, IPC/CLI adjusted to bincode v1 APIs, service main uses shared init_tracing; warnings cleared (meta-index add_batch result, priority noop). cargo check --all-targets is green.
-- 2025-11-21 (RedSnow): Service IPC dispatch now uses bincode serialize/deserialize via `make_status_response`; tests updated; cargo check still green.
-- 2025-11-21 (RedSnow): Service IPC dispatch now uses bincode serialize/deserialize (no bincode::serde), tests updated accordingly.
+- 2025-11-21 (LilacCat): c00.1.2 manifests aligned to nightly policy — workspace edition 2024, `windows` dep wildcard, workspace `hnsw_rs` removed (scoped only to semantic-index); lockfile removed; cargo fmt/check/clippy pass on nightly. 
 
 * an **NTFS + USN–driven catalog** for filenames and metadata (Everything‑style),
 * a **Tantivy‑based full‑text engine** for contents,
