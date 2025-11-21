@@ -433,6 +433,7 @@ dependencies = [
  "indicatif",
  "ipc",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 

@@ -137,6 +137,7 @@ impl MetadataCache {
         self.slots.clear();
         self.lookup.clear();
         self.path_cache.clear();
+        self.interner = Rodeo::new();
     }
 }
 

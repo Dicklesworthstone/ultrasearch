@@ -29,7 +29,8 @@ impl FstIndex {
     /// Search for keys starting with the given prefix.
     ///
     /// `prefix` should be normalized (lowercased) if the index was built with normalized names.
-    pub fn search<'a>(&'a self, prefix: &str) -> impl Iterator<Item = DocKey> + 'a {
+    /// `limit` caps the number of results returned to prevent excessive memory usage.
+    pub fn search<'a>(&'a self, prefix: &str, limit: usize) -> impl Iterator<Item = DocKey> + 'a {
         let start = prefix.as_bytes().to_vec();
         let mut builder = self.map.range().ge(start);
 
@@ -53,6 +54,10 @@ impl FstIndex {
         let mut hits = Vec::new();
 
         while let Some((k, _)) = stream.next() {
+            if hits.len() >= limit {
+                break;
+            }
+
             // Double check prefix (range should handle it, but being safe against edge cases)
             if !k.starts_with(prefix.as_bytes()) {
                 continue;
@@ -147,7 +152,7 @@ mod tests {
         let index = FstIndex::open(&path)?;
 
         // Exact match "foo" -> should return 1 and 3
-        let mut hits: Vec<u64> = index.search("foo").map(|k| k.0).collect();
+        let mut hits: Vec<u64> = index.search("foo", 10).map(|k| k.0).collect();
         hits.sort();
         // search("foo") is prefix search. It matches "foo\0..." (1, 3) and "foobar\0..." (2).
         // Wait, "foobar" encoded is "foobar\0..."
@@ -158,16 +163,20 @@ mod tests {
         assert_eq!(hits, vec![1, 2, 3]);
 
         // Prefix "foob" -> 2
-        let hits: Vec<u64> = index.search("foob").map(|k| k.0).collect();
+        let hits: Vec<u64> = index.search("foob", 10).map(|k| k.0).collect();
         assert_eq!(hits, vec![2]);
 
         // Prefix "ba" -> 4
-        let hits: Vec<u64> = index.search("ba").map(|k| k.0).collect();
+        let hits: Vec<u64> = index.search("ba", 10).map(|k| k.0).collect();
         assert_eq!(hits, vec![4]);
 
         // No match
-        let hits: Vec<u64> = index.search("z").map(|k| k.0).collect();
+        let hits: Vec<u64> = index.search("z", 10).map(|k| k.0).collect();
         assert!(hits.is_empty());
+
+        // Limit check
+        let hits: Vec<u64> = index.search("foo", 1).map(|k| k.0).collect();
+        assert_eq!(hits.len(), 1);
 
         Ok(())
     }

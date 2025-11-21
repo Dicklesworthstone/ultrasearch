@@ -87,7 +87,12 @@ fn default_product_uid() -> String {
 }
 
 fn default_data_dir() -> String {
-    "%PROGRAMDATA%/UltraSearch".into()
+    if cfg!(windows) {
+        "%PROGRAMDATA%/UltraSearch".into()
+    } else {
+        // Fallback for Linux/macOS (XDG-ish)
+        "$HOME/.local/share/ultrasearch".into()
+    }
 }
 
 /// Logging configuration.
@@ -433,8 +438,13 @@ impl AppConfig {
     }
 }
 
-/// Replace `{data_dir}` placeholder tokens with the configured data_dir.
+/// Replace `{data_dir}` placeholder tokens with the configured data_dir,
+/// and expand environment variables (e.g. `%PROGRAMDATA%` or `$HOME`).
 fn apply_placeholders(cfg: &mut AppConfig) {
+    // 1. Expand env vars in the data_dir itself first.
+    cfg.app.data_dir = expand_env_vars(&cfg.app.data_dir);
+
+    // 2. Replace {data_dir} in other paths.
     let dd = cfg.app.data_dir.clone();
     cfg.logging.file = cfg.logging.file.replace("{data_dir}", &dd);
     cfg.paths.meta_index = cfg.paths.meta_index.replace("{data_dir}", &dd);
@@ -442,6 +452,45 @@ fn apply_placeholders(cfg: &mut AppConfig) {
     cfg.paths.state_dir = cfg.paths.state_dir.replace("{data_dir}", &dd);
     cfg.paths.jobs_dir = cfg.paths.jobs_dir.replace("{data_dir}", &dd);
     cfg.semantic.index_dir = cfg.semantic.index_dir.replace("{data_dir}", &dd);
+
+    // 3. Expand env vars in all paths (in case user hardcoded %TEMP% in logging.file, etc.)
+    cfg.logging.file = expand_env_vars(&cfg.logging.file);
+    cfg.paths.meta_index = expand_env_vars(&cfg.paths.meta_index);
+    cfg.paths.content_index = expand_env_vars(&cfg.paths.content_index);
+    cfg.paths.state_dir = expand_env_vars(&cfg.paths.state_dir);
+    cfg.paths.jobs_dir = expand_env_vars(&cfg.paths.jobs_dir);
+    cfg.semantic.index_dir = expand_env_vars(&cfg.semantic.index_dir);
+}
+
+/// Simple environment variable expansion.
+/// Supports $VAR on all platforms and %VAR% on Windows.
+fn expand_env_vars(input: &str) -> String {
+    let mut result = input.to_string();
+
+    // 1. Unix-style $VAR
+    // We use a simple loop to find $VAR patterns.
+    // Note: This is a basic implementation. For robust shell expansion, a crate like `shellexpand` is better,
+    // but we want to minimize deps.
+    if result.contains('$') {
+        for (key, value) in std::env::vars() {
+            let token = format!("${}", key);
+            if result.contains(&token) {
+                result = result.replace(&token, &value);
+            }
+        }
+    }
+
+    // 2. Windows-style %VAR%
+    if cfg!(windows) && result.contains('%') {
+        for (key, value) in std::env::vars() {
+            let token = format!("%{}%", key);
+            if result.contains(&token) {
+                result = result.replace(&token, &value);
+            }
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
