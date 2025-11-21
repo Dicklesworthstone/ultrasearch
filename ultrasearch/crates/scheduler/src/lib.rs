@@ -8,6 +8,7 @@ pub mod policy;
 
 pub use idle::{IdleSample, IdleState, IdleTracker};
 pub use metrics::{SystemLoad, SystemLoadSampler};
+pub use policy::adaptive::AdaptivePolicy;
 
 use core_types::DocKey;
 use std::collections::VecDeque;

@@ -4,8 +4,8 @@ use crate::status_provider::{
 };
 use core_types::config::AppConfig;
 use scheduler::{
-    Job, JobCategory, JobQueues, SchedulerConfig, idle::IdleTracker, metrics::SystemLoadSampler,
-    select_jobs,
+    AdaptivePolicy, Job, JobCategory, JobQueues, SchedulerConfig, idle::IdleTracker,
+    metrics::SystemLoadSampler, select_jobs,
 };
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -14,6 +14,7 @@ use std::time::Duration;
 /// Runtime wrapper that drives the scheduling loop.
 pub struct SchedulerRuntime {
     config: SchedulerConfig,
+    policy: AdaptivePolicy,
     idle: IdleTracker,
     load: SystemLoadSampler,
     queues: JobQueues,
@@ -43,12 +44,14 @@ impl SchedulerRuntime {
             ..SchedulerConfig::default()
         };
 
+        let policy = AdaptivePolicy::new(config.clone());
         let idle = IdleTracker::new(config.warm_idle, config.deep_idle);
         let load = SystemLoadSampler::new(config.disk_busy_threshold_bps);
         let dispatcher = JobDispatcher::new(app_config);
 
         Self {
             config,
+            policy,
             idle,
             load,
             queues: JobQueues::default(),
@@ -90,12 +93,15 @@ impl SchedulerRuntime {
         update_status_queue_state(Some((c + m + t) as u64), None);
         update_status_metrics(None);
 
-        // Select jobs
+        // Tune config
+        let tuned = self.policy.tune(&load, c + m + t);
+
+        // Select jobs using tuned config
         let selected = select_jobs(
             &mut self.queues,
             idle_sample.state,
             load,
-            self.config.content_budget, // Use content budget for all for now?
+            tuned.content_budget, 
         );
 
         if !selected.is_empty() {
