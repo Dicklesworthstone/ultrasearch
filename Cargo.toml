@@ -43,7 +43,7 @@ windows = { version = "*", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 # windows-sys intentionally omitted; using `windows` crate only.
-sysinfo = { version = "0.30", default-features = true, features = ["disk", "process", "system"] }
+sysinfo = { version = "0.30", default-features = true }
 tantivy = { version = "*", features = ["mmap", "lz4-compression"] }
 fst = "*"
 memmap2 = "*"

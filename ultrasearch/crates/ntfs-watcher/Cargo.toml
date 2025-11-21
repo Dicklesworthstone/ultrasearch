@@ -11,6 +11,5 @@ core-types = { path = "../core-types" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 windows = { workspace = true }
-windows-sys = { workspace = true }
 sysinfo = { workspace = true }
-usn-journal-rs = { workspace = true }
+usn-journal-rs = "*"
