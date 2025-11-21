@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use core_types::DocKey;
+use core_types::{DocKey, FileMeta as CoreFileMeta};
 use tantivy::{Index, IndexWriter, schema::document::TantivyDocument, schema::*};
 
 #[cfg(test)]
@@ -71,6 +71,22 @@ pub struct MetaDoc {
     pub flags: u64,
 }
 
+impl From<&CoreFileMeta> for MetaDoc {
+    fn from(f: &CoreFileMeta) -> Self {
+        MetaDoc {
+            key: f.key,
+            volume: f.volume,
+            name: f.name.clone(),
+            path: f.path.clone(),
+            ext: f.ext.clone(),
+            size: f.size,
+            created: f.created,
+            modified: f.modified,
+            flags: f.flags.bits() as u64,
+        }
+    }
+}
+
 /// Add a batch of documents to the index writer.
 ///
 /// Caller is responsible for committing/merging outside.
@@ -83,6 +99,15 @@ pub fn add_batch(
         writer.add_document(to_document(&doc, fields))?;
     }
     Ok(())
+}
+
+/// Add a batch of `core_types::FileMeta` records.
+pub fn add_file_meta_batch(
+    writer: &mut IndexWriter,
+    fields: &MetaFields,
+    metas: impl IntoIterator<Item = CoreFileMeta>,
+) -> Result<()> {
+    add_batch(writer, fields, metas.into_iter().map(|m| MetaDoc::from(&m)))
 }
 
 /// Convenience handle bundling an index with its field set.
