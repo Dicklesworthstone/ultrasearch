@@ -183,10 +183,7 @@ mod tests {
         let mut vals = tantivy_doc.get_all(fields.doc_key);
         let first = vals.next().expect("doc_key set");
         let owned: OwnedValue = first.into();
-        match owned {
-            OwnedValue::U64(v) => assert_eq!(v, doc.key.0),
-            other => panic!("unexpected value {:?}", other),
-        }
+        assert!(matches!(owned, OwnedValue::U64(v) if v == doc.key.0));
         assert!(vals.next().is_none());
     }
 
