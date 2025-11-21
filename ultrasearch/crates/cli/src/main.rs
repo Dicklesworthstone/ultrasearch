@@ -190,5 +190,6 @@ fn send_stub(req: SearchRequest) -> Result<SearchResponse> {
         total: 0,
         truncated: false,
         took_ms: 0,
+        served_by: Some("stub-cli".into()),
     })
 }

@@ -86,6 +86,8 @@ pub enum SearchMode {
     Hybrid,   // meta + content merge
 }
 
+#[cfg(windows)]
+pub mod client;
 pub mod framing;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +134,8 @@ pub struct SearchResponse {
     pub total: u64,
     pub truncated: bool,
     pub took_ms: u32,
+    #[serde(default)]
+    pub served_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
