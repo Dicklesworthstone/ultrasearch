@@ -21,7 +21,7 @@ serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 serde_yaml = "*"
 toml = "*"
-bincode = "1.3.3"
+bincode = "*"
 rkyv = { version = "*", features = ["std", "validation"] }
 dotenvy = "*"
 once_cell = "*"
@@ -30,7 +30,7 @@ rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
 bitflags = { version = "*", features = ["serde"] }
-windows = { version = "0.58", features = [
+windows = { version = "*", features = [
     "Win32_Foundation",
     "Win32_System_SystemInformation",
     "Win32_System_Console",
@@ -43,8 +43,20 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# windows-sys intentionally omitted; using `windows` crate only.
-sysinfo = "0.30"
+windows-sys = { version = "*", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_WindowsAndMessaging",
+] }
+sysinfo = "*"
 tantivy = { version = "*", features = ["mmap", "lz4-compression"] }
 fst = "*"
 memmap2 = "*"

@@ -8,7 +8,7 @@ description = "Core identifiers and shared types for UltraSearch"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-bitflags = "2.4"
+bitflags = { workspace = true }
 anyhow = { workspace = true }
 once_cell = "1.19"
 dotenvy = "0.15"
