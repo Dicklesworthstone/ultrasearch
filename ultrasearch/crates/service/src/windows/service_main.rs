@@ -72,7 +72,7 @@ where
     // In a real service, environment variables might be tricky, so loading from file is best.
     let cfg = core_types::config::load_or_create_config(None)?;
     
-    let result = crate::bootstrap::run_app(cfg, shutdown_rx);
+    let result = crate::bootstrap::run_app(&cfg, shutdown_rx);
 
     // Report exit status.
     let exit_code = match result {

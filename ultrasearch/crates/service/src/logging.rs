@@ -29,7 +29,18 @@ pub fn init_tracing_with_config(
         fs::create_dir_all(dir).context("create log directory")?;
     }
 
-    let file_appender = tracing_appender::rolling::daily(dir, file);
+    let file_appender = match cfg.roll.as_str() {
+        "hourly" => tracing_appender::rolling::hourly(dir, file),
+        "daily" => tracing_appender::rolling::daily(dir, file),
+        "minutely" => tracing_appender::rolling::minutely(dir, file),
+        other => {
+            // "size" or unknown fallback to daily for now.
+            // TODO: Implement size-based rotation and cleanup (retain).
+            tracing::warn!("Log rotation '{}' not fully supported; falling back to daily.", other);
+            tracing_appender::rolling::daily(dir, file)
+        }
+    };
+
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     // File layer always JSON.
@@ -40,10 +51,17 @@ pub fn init_tracing_with_config(
         .with_thread_ids(true)
         .with_line_number(true);
 
-    if cfg.format.as_str() == "json" {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(file_layer)
+    // Try to init. If it fails (already set), we just return the guard?
+    // Wait, if we don't init, the guard might be useless if the subscriber isn't using it.
+    // But if it's already set, we can't change it.
+    // We'll log a warning if we can't init.
+    
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer);
+
+    let result = if cfg.format.as_str() == "json" {
+        registry
             .with(
                 fmt::layer()
                     .json()
@@ -51,18 +69,20 @@ pub fn init_tracing_with_config(
                     .with_thread_ids(true)
                     .with_line_number(true),
             )
-            .try_init()?;
+            .try_init()
     } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(file_layer)
+        registry
             .with(
                 fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
                     .with_line_number(true),
             )
-            .try_init()?;
+            .try_init()
+    };
+
+    if let Err(e) = result {
+        eprintln!("Tracing init failed (global subscriber already set?): {}", e);
     }
 
     Ok(guard)

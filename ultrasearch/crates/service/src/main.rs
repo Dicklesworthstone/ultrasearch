@@ -51,5 +51,5 @@ fn main() -> Result<()> {
         }
     });
 
-    bootstrap::run_app(cfg, rx)
+    bootstrap::run_app(&cfg, rx)
 }
