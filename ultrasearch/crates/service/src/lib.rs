@@ -24,7 +24,7 @@ pub use metrics::{
     ServiceMetrics, ServiceMetricsSnapshot, init_metrics_from_config, scrape_metrics,
 };
 pub use priority::{ProcessPriority, set_process_priority};
-pub use scheduler_runtime::SchedulerRuntime;
+pub use scheduler_runtime::{SchedulerRuntime, set_live_active_workers, set_live_queue_counts};
 pub use search_handler::{
     SearchHandler, StubSearchHandler, UnifiedSearchHandler, search, set_search_handler,
 };

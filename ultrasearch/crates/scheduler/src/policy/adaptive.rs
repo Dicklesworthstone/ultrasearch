@@ -1,80 +1,92 @@
-use crate::{SchedulerConfig, SystemLoad};
+use crate::{SchedulerConfig, metrics::SystemLoad};
+use std::time::Duration;
 
-/// Tuning logic for the scheduler.
+const CPU_SMOOTHING: f32 = 0.2;
+const BATCH_SIZE_MIN: usize = 10;
+const BATCH_SIZE_MAX: usize = 2000;
+const CPU_THRESHOLD_MIN: f32 = 15.0;
+const CPU_THRESHOLD_MAX: f32 = 60.0;
+
+/// Dynamically adjusts scheduler config based on recent system load.
 pub struct AdaptivePolicy {
-    base_config: SchedulerConfig,
+    config: SchedulerConfig,
+    smoothed_cpu: f32,
+    last_adjustment: std::time::Instant,
 }
 
 impl AdaptivePolicy {
-    pub fn new(base_config: SchedulerConfig) -> Self {
-        Self { base_config }
+    pub fn new(config: SchedulerConfig) -> Self {
+        Self {
+            smoothed_cpu: 0.0,
+            last_adjustment: std::time::Instant::now(),
+            config,
+        }
     }
 
-    /// Return a tuned config based on current load.
-    pub fn tune(&self, load: &SystemLoad, queue_depth: usize) -> SchedulerConfig {
-        let mut cfg = self.base_config.clone();
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
 
-        // If queue is huge, relax CPU limits slightly to make progress
-        if queue_depth > 1000 {
-            // Backlog pressure: increase limits if system not melting.
-            if load.cpu_percent < 80.0 {
-                cfg.cpu_metadata_max = 85.0;
-                cfg.cpu_content_max = 60.0;
-                cfg.content_batch_size = (cfg.content_batch_size as f32 * 1.5) as usize;
-            }
-        } else if queue_depth < 100 {
-            // Low pressure: save power.
-            cfg.cpu_metadata_max = 40.0;
-            cfg.cpu_content_max = 20.0;
+    /// Update internal state and adjust config if needed.
+    pub fn update(&mut self, load: &SystemLoad) {
+        // Smooth CPU load to avoid jerky reactions
+        self.smoothed_cpu =
+            self.smoothed_cpu * (1.0 - CPU_SMOOTHING) + load.cpu_percent * CPU_SMOOTHING;
+
+        // Adjust every few seconds, not on every tick
+        if self.last_adjustment.elapsed() < Duration::from_secs(5) {
+            return;
         }
 
-        // If disk is busy, throttle batch size heavily.
-        if load.disk_busy {
-            cfg.content_batch_size = 10;
-        }
+        // --- Batch Size Policy ---
+        // If CPU is low, increase batch size. If high, decrease it.
+        let batch_size = if self.smoothed_cpu < 20.0 {
+            (self.config.content_batch_size + 50).min(BATCH_SIZE_MAX)
+        } else if self.smoothed_cpu > 50.0 {
+            (self.config.content_batch_size as i32 - 100).max(BATCH_SIZE_MIN as i32) as usize
+        } else {
+            self.config.content_batch_size
+        };
+        self.config.content_batch_size = batch_size;
 
-        cfg
+        // --- CPU Threshold Policy ---
+        // If CPU has been low for a while, we can be more aggressive (higher threshold).
+        let cpu_threshold = if self.smoothed_cpu < 10.0 {
+            (self.config.cpu_content_max + 5.0).min(CPU_THRESHOLD_MAX)
+        } else if self.smoothed_cpu > 40.0 {
+            (self.config.cpu_content_max - 5.0).max(CPU_THRESHOLD_MIN)
+        } else {
+            self.config.cpu_content_max
+        };
+        self.config.cpu_content_max = cpu_threshold;
+
+        self.last_adjustment = std::time::Instant::now();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SystemLoad;
-    use std::time::Duration;
 
-    #[test]
-    fn policy_tunes_up_on_backlog() {
-        let base = SchedulerConfig::default();
-        let policy = AdaptivePolicy::new(base.clone());
-        
-        let load = SystemLoad {
-            cpu_percent: 50.0,
+    fn cpu_load(cpu: f32) -> SystemLoad {
+        SystemLoad {
+            cpu_percent: cpu,
             mem_used_percent: 50.0,
-            disk_busy: false,
             disk_bytes_per_sec: 0,
+            disk_busy: false,
             sample_duration: Duration::from_secs(1),
-        };
-
-        let tuned = policy.tune(&load, 2000);
-        assert!(tuned.cpu_metadata_max > base.cpu_metadata_max);
-        assert!(tuned.content_batch_size > base.content_batch_size);
+        }
     }
 
     #[test]
-    fn policy_throttles_on_disk_busy() {
-        let base = SchedulerConfig::default();
-        let policy = AdaptivePolicy::new(base);
-        
-        let load = SystemLoad {
-            cpu_percent: 10.0,
-            mem_used_percent: 10.0,
-            disk_busy: true,
-            disk_bytes_per_sec: 1000,
-            sample_duration: Duration::from_secs(1),
-        };
+    fn batch_size_decreases_under_high_load() {
+        let mut policy = AdaptivePolicy::new(SchedulerConfig::default());
+        let initial_batch = policy.config().content_batch_size;
 
-        let tuned = policy.tune(&load, 500);
-        assert_eq!(tuned.content_batch_size, 10);
+        policy.smoothed_cpu = 60.0; // pre-condition high load
+        policy.last_adjustment -= Duration::from_secs(10); // allow update
+        policy.update(&cpu_load(60.0));
+
+        assert!(policy.config().content_batch_size < initial_batch);
     }
 }
