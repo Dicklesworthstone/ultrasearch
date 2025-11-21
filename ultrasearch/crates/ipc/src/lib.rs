@@ -10,6 +10,54 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Serialize Durations as milliseconds to keep the wire format stable even if serde defaults change.
+mod duration_ms {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(dur: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let ms: u64 = dur
+            .as_millis()
+            .try_into()
+            .map_err(|_| serde::ser::Error::custom("duration too large for u64 millis"))?;
+        serializer.serialize_u64(ms)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let ms = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(ms))
+    }
+
+    pub mod option {
+        use super::*;
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match value {
+                Some(dur) => super::serialize(dur, serializer),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let opt = Option::<u64>::deserialize(deserializer)?;
+            Ok(opt.map(Duration::from_millis))
+        }
+    }
+}
+
 /// Fields that can be targeted explicitly in the query language.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FieldKind {
@@ -93,13 +141,20 @@ pub mod framing;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub id: Uuid,
-    pub query: QueryExpr,
-    pub limit: u32,
-    pub mode: SearchMode,
     #[serde(default)]
+    pub query: QueryExpr,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub mode: SearchMode,
+    #[serde(default, with = "duration_ms::option")]
     pub timeout: Option<Duration>,
     #[serde(default)]
     pub offset: u32,
+}
+
+fn default_limit() -> u32 {
+    50
 }
 
 impl Default for SearchRequest {
