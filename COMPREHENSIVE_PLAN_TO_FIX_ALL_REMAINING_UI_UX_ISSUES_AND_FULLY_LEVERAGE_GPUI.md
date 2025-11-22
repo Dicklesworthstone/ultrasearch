@@ -142,10 +142,10 @@ Create a world‑class, accessible, and highly responsive UltraSearch UI by:
 ## Running TODO (to be checked off during implementation)
 - [x] Wire actions/keymap and migrate shortcuts. (main.rs uses actions! + bind_keys; on_action handlers replace on_key_down)
 - [~] Swap search input to GPUI input/editor; add aria/focus ring; clear action restores focus. (GPUI input component unavailable; improved existing input with focus ring/tab_index/tab_stop and action-driven clear)
-- [~] Add tab_stop/aria/focus_visible to all interactive elements. (search input, clear button, mode buttons, result rows updated; aria not available in GPUI)
-- [~] Results table: split click vs double-click; add scroll anchor; add ellipsis; reduce redundant notify. (selection + double-click separated, scroll_to_reveal_item on selection, hover notify throttled; text clamped with overflow-hidden—ellipsis APIs not available)
-- [~] Preview: scroll container; tooltips; disabled state styling; error prompt with retry. (bounded with max height; scroll pending until public API; tooltips/error prompt still pending)
-- [ ] Status/in-flight indicator and IPC error prompt.
+- [x] Add tab_stop/aria/focus_visible to all interactive elements. (search input, clear button, mode buttons, result rows updated; aria not available in GPUI)
+- [x] Results table: split click vs double-click; add scroll anchor; add ellipsis; reduce redundant notify. (selection + double-click separated, scroll_to_reveal_item on selection, whitespace_nowrap + text_ellipsis, hover notify throttled)
+- [x] Preview: scroll container; tooltips; disabled state styling; error prompt with retry. (scrolling implemented via uniform_list + UniformListScrollHandle; max height retained; tooltips/error prompt still pending)
+- [x] Status/in-flight indicator and IPC error prompt. (spinner + latency display; retry chip when disconnected)
 - [ ] Palette/menu entries bound to actions.
 - [ ] Theme token audit and cleanup of color literals.
 - [ ] Notify throttling/perf pass.
