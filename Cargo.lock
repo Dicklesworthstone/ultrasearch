@@ -1323,6 +1323,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "which 8.0.0",
+ "windows 0.52.0",
  "zip 6.0.0",
 ]
 
@@ -3397,6 +3398,8 @@ dependencies = [
  "core-serialization",
  "core-types",
  "serde",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -6021,6 +6024,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tantivy",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",

@@ -6,6 +6,10 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "Windows service host for UltraSearch"
 
+[features]
+default = []
+e2e-windows = []
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -28,6 +32,9 @@ tantivy = { workspace = true }
 mimalloc = "0.1.48"
 serde_json = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "*"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

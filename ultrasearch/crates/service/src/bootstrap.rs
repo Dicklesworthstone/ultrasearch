@@ -10,6 +10,16 @@ use ipc::VolumeStatus;
 use ntfs_watcher::{NtfsError, discover_volumes, enumerate_mft};
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapOptions {
+    /// If provided, seed the meta index with these file entries instead of discovering NTFS volumes.
+    pub initial_metas: Option<Vec<core_types::FileMeta>>,
+    /// Skip initial ingest entirely (used for tests that want a blank service).
+    pub skip_initial_ingest: bool,
+    /// Override IPC pipe name (default is \\\\.\\pipe\\ultrasearch).
+    pub pipe_name: Option<String>,
+}
+
 use crate::{
     init_tracing_with_config,
     meta_ingest::ingest_with_paths,
@@ -21,7 +31,15 @@ use crate::{
     },
 };
 
-pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
+pub fn run_app(cfg: &AppConfig, shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
+    run_app_with_options(cfg, shutdown_rx, BootstrapOptions::default())
+}
+
+pub fn run_app_with_options(
+    cfg: &AppConfig,
+    mut shutdown_rx: mpsc::Receiver<()>,
+    opts: BootstrapOptions,
+) -> Result<()> {
     let _guard = init_tracing_with_config(&cfg.logging)?;
 
     // Initialize Tokio runtime
@@ -38,7 +56,13 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
         set_global_metrics(metrics);
     }
 
-    run_initial_metadata_ingest(cfg)?;
+    match opts.initial_metas {
+        Some(metas) => ingest_seed_metadata(cfg, metas)?,
+        None if opts.skip_initial_ingest => {
+            tracing::info!("skip_initial_ingest=true; leaving indices empty");
+        }
+        None => run_initial_metadata_ingest(cfg)?,
+    }
 
     // Start scheduler loop
     // We need to clone cfg for the scheduler (or pass reference if new() takes ref).
@@ -96,7 +120,7 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
     {
         // Start IPC server
         // We use the runtime we just created.
-        if let Err(e) = rt.block_on(crate::ipc::start_pipe_server(None)) {
+        if let Err(e) = rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref())) {
             tracing::error!("failed to start IPC server: {}", e);
         }
     }
@@ -112,6 +136,36 @@ pub fn run_app(cfg: &AppConfig, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(
     let _ = shutdown_rx.blocking_recv();
 
     tracing::info!("Shutdown signal received. Exiting.");
+    Ok(())
+}
+
+fn ingest_seed_metadata(cfg: &AppConfig, metas: Vec<core_types::FileMeta>) -> Result<()> {
+    if metas.is_empty() {
+        tracing::info!("seed metadata list empty; skipping ingest");
+        return Ok(());
+    }
+
+    ingest_with_paths(&cfg.paths, metas.clone(), None)?;
+
+    let mut by_vol: std::collections::HashMap<core_types::VolumeId, u64> =
+        std::collections::HashMap::new();
+    for meta in &metas {
+        *by_vol.entry(meta.volume).or_insert(0) += 1;
+    }
+
+    let mut status = Vec::with_capacity(by_vol.len());
+    for (vol, count) in by_vol {
+        status.push(VolumeStatus {
+            volume: vol,
+            indexed_files: count,
+            pending_files: 0,
+            last_usn: None,
+            journal_id: None,
+        });
+    }
+
+    update_status_last_commit(Some(unix_timestamp_secs()));
+    update_status_volumes(status);
     Ok(())
 }
 
