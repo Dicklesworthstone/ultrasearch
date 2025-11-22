@@ -20,6 +20,9 @@ fn row_odd() -> Hsla {
 fn row_selected() -> Hsla {
     hsla(210.0, 0.274, 0.243, 1.0)
 }
+fn row_hover() -> Hsla {
+    hsla(0.0, 0.0, 0.165, 1.0)
+}
 fn text_primary() -> Hsla {
     hsla(0.0, 0.0, 0.894, 1.0)
 }
@@ -36,6 +39,7 @@ fn border_color() -> Hsla {
 pub struct ResultsView {
     model: Entity<SearchAppModel>,
     list_state: ListState,
+    hover_index: Option<usize>,
 }
 
 impl ResultsView {
@@ -49,7 +53,11 @@ impl ResultsView {
         })
         .detach();
 
-        Self { model, list_state }
+        Self {
+            model,
+            list_state,
+            hover_index: None,
+        }
     }
 
     fn handle_click(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -152,6 +160,7 @@ impl ResultsView {
         index: usize,
         hit: &SearchHit,
         is_selected: bool,
+        is_hover: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_even = index.is_multiple_of(2);
@@ -176,17 +185,30 @@ impl ResultsView {
             .items_center()
             .px_4()
             .gap_3()
-            .when(is_selected, |this| this.bg(row_selected()))
-            .when(!is_selected, |this| {
-                this.bg(if is_even { row_even() } else { row_odd() })
+            .bg(if is_selected {
+                row_selected()
+            } else if is_hover {
+                row_hover()
+            } else if is_even {
+                row_even()
+            } else {
+                row_odd()
             })
             .border_b_1()
             .border_color(border_color())
             .cursor_pointer()
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                this.hover_index = Some(index);
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.handle_click(index, cx);
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if event.click_count >= 2 {
+                        this.handle_double_click(index, cx);
+                    } else {
+                        this.handle_click(index, cx);
+                    }
                 }),
             )
             // File icon
@@ -311,6 +333,7 @@ impl Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.clone();
         let has_results = !model.read(cx).results.is_empty();
+        let hover_index = self.hover_index;
 
         div()
             .size_full()
@@ -331,7 +354,8 @@ impl Render for ResultsView {
                                 }
                             };
 
-                            this.render_row(ix, &hit, is_selected, cx)
+                            let is_hover = hover_index == Some(ix);
+                            this.render_row(ix, &hit, is_selected, is_hover, cx)
                         }),
                     )
                     .size_full(),

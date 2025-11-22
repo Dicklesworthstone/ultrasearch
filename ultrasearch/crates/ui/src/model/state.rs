@@ -51,6 +51,7 @@ pub struct SearchAppModel {
     pub selected_index: Option<usize>,
     pub client: IpcClient,
     pub search_debounce: Option<Task<()>>,
+    pub status_task: Option<Task<()>>,
     pub last_search: Option<Instant>,
 }
 
@@ -65,6 +66,7 @@ impl SearchAppModel {
             selected_index: None,
             client,
             search_debounce: None,
+            status_task: None,
             last_search: None,
         };
 
@@ -73,8 +75,11 @@ impl SearchAppModel {
     }
 
     pub fn start_status_polling(&mut self, cx: &mut Context<SearchAppModel>) {
+        if let Some(task) = self.status_task.take() {
+            drop(task);
+        }
         let client = self.client.clone();
-        cx.spawn(move |this: WeakEntity<SearchAppModel>, cx: &mut AsyncApp| {
+        let task = cx.spawn(move |this: WeakEntity<SearchAppModel>, cx: &mut AsyncApp| {
             let async_app = cx.clone();
             async move {
                 loop {
@@ -94,8 +99,8 @@ impl SearchAppModel {
                     }
                 }
             }
-        })
-        .detach();
+        });
+        self.status_task = Some(task);
     }
 
     pub fn set_query(&mut self, query: String, cx: &mut Context<SearchAppModel>) {

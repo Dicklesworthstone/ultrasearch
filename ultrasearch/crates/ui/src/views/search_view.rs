@@ -195,20 +195,19 @@ impl Render for SearchView {
                                 }),
                             )
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if event.is_held {
+                                    return;
+                                }
                                 let mods = &event.keystroke.modifiers;
                                 let control = mods.control || mods.platform;
-                                if !control && !mods.alt {
-                                    if let Some(ch) = &event.keystroke.key_char {
-                                        let mut current = this.input_text.to_string();
-                                        current.push_str(ch);
-                                        this.handle_input(&current, cx);
-                                        cx.stop_propagation();
-                                        return;
-                                    }
-                                }
-
                                 match event.keystroke.key.as_str() {
                                     "backspace" => {
+                                        let mut current = this.input_text.to_string();
+                                        current.pop();
+                                        this.handle_input(&current, cx);
+                                        cx.stop_propagation();
+                                    }
+                                    "delete" => {
                                         let mut current = this.input_text.to_string();
                                         current.pop();
                                         this.handle_input(&current, cx);
@@ -220,8 +219,17 @@ impl Render for SearchView {
                                         });
                                         cx.stop_propagation();
                                     }
-                                    _ => {}
-                                }
+                                    _ => {
+                                        if !control && !mods.alt {
+                                            if let Some(ch) = &event.keystroke.key_char {
+                                                let mut current = this.input_text.to_string();
+                                                current.push_str(ch);
+                                                this.handle_input(&current, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        }
+                                    }
+                                };
                             })),
                     )
                     .when(has_query, |this| {
