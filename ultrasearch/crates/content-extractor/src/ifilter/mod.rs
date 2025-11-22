@@ -3,10 +3,14 @@
 use crate::{ExtractContext, ExtractError, ExtractedContent, Extractor, enforce_limits_str};
 use anyhow::Result;
 use core_types::DocKey;
+use std::ffi::c_void;
 use std::path::Path;
-use windows::Win32::Storage::IndexServer::{FILTER_TEXT, IFilter, LoadIFilter};
-use windows::Win32::System::Com::{CoInitialize, CoUninitialize, IPersistFile};
-use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::S_OK;
+use windows::Win32::Storage::IndexServer::{
+    CHUNK_TEXT, FILTER_E_END_OF_CHUNKS, FILTER_E_NO_MORE_TEXT, IFilter, LoadIFilter, STAT_CHUNK,
+};
+use windows::Win32::System::Com::{CoInitialize, CoUninitialize};
+use windows::core::{HSTRING, Interface, PCWSTR, PWSTR};
 
 // TODO: Properly manage COM initialization. CoInitialize is thread-local.
 // A robust solution might use a dedicated STA thread pool for IFilters.
@@ -17,6 +21,12 @@ pub struct IFilterExtractor;
 impl IFilterExtractor {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for IFilterExtractor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -39,8 +49,9 @@ impl Extractor for IFilterExtractor {
         let path_hstring = HSTRING::from(path.as_os_str());
 
         unsafe {
-            // Attempt init; ignore error (e.g. already init)
-            let _ = CoInitialize(None);
+            // Attempt init; track whether we should uninitialize.
+            let coinit_hr = CoInitialize(None);
+            let should_uninit = coinit_hr.is_ok();
             // Defer uninit? In a thread pool, we might init once per thread.
             // Here we are likely in a rayon thread.
             // Ideally we should use a scope guard or just assume the thread is initialized by the runtime wrapper.
@@ -49,33 +60,50 @@ impl Extractor for IFilterExtractor {
             // Actually, excessive init/uninit is slow.
 
             // Scope guard for CoUninitialize
-            struct CoGuard;
+            struct CoGuard(bool);
             impl Drop for CoGuard {
                 fn drop(&mut self) {
-                    unsafe {
-                        CoUninitialize();
+                    if self.0 {
+                        unsafe {
+                            CoUninitialize();
+                        }
                     }
                 }
             }
-            let _guard = CoGuard;
+            let _guard = CoGuard(should_uninit);
 
-            let mut filter: Option<IFilter> = None;
-            // LoadIFilter takes path, returns IFilter interface.
-            // The signature in windows crate might differ slightly.
-            // LoadIFilter(path, null, &mut filter as *mut _ as *mut _)
-            // Actually, LoadIFilter returns Result<IFilter> wrapper in windows crate?
-            // Let's check docs or generated code signature.
-            // windows 0.52 function signature:
-            // pub unsafe fn LoadIFilter<P0>(pwcspath: P0, punknownouter: Option<IUnknown>, pvreserved: *mut c_void) -> Result<IFilter>
+            let mut raw_filter: *mut c_void = std::ptr::null_mut();
+            LoadIFilter(
+                PCWSTR(path_hstring.as_ptr()),
+                None,
+                &mut raw_filter as *mut *mut _,
+            )
+            .map_err(|e| ExtractError::Failed(format!("LoadIFilter failed: {e}")))?;
 
-            let filter_res = LoadIFilter(PCWSTR(path_hstring.as_ptr()), None, std::ptr::null_mut());
-
-            match filter_res {
-                Ok(f) => filter = Some(f),
-                Err(e) => return Err(ExtractError::Failed(format!("LoadIFilter failed: {e}"))),
+            if raw_filter.is_null() {
+                return Err(ExtractError::Failed(
+                    "LoadIFilter returned null filter".into(),
+                ));
             }
 
-            let filter = filter.unwrap();
+            // SAFETY: LoadIFilter populated raw_filter on success.
+            let filter: IFilter = IFilter::from_raw(raw_filter.cast());
+
+            // Initialize filter (canonicalize whitespace and paragraphs, index attributes).
+            let init_flags: u32 =
+                (windows::Win32::Storage::IndexServer::IFILTER_INIT_CANON_PARAGRAPHS.0
+                    | windows::Win32::Storage::IndexServer::IFILTER_INIT_CANON_SPACES.0
+                    | windows::Win32::Storage::IndexServer::IFILTER_INIT_APPLY_INDEX_ATTRIBUTES.0
+                    | windows::Win32::Storage::IndexServer::IFILTER_INIT_INDEXING_ONLY.0
+                    | windows::Win32::Storage::IndexServer::IFILTER_INIT_SEARCH_LINKS.0)
+                    as u32;
+            let mut init_flags_out: u32 = 0;
+            let init_hr = filter.Init(init_flags, &[], &mut init_flags_out);
+            if init_hr != S_OK.0 {
+                return Err(ExtractError::Failed(format!(
+                    "IFilter::Init failed with 0x{init_hr:08x}"
+                )));
+            }
 
             // Extract text chunks
             let mut text = String::new();
@@ -91,56 +119,41 @@ impl Extractor for IFilterExtractor {
             // We need a buffer.
 
             loop {
-                let mut stat = windows::Win32::Storage::IndexServer::STAT_CHUNK::default();
-                if let Err(e) = filter.GetChunk(&mut stat) {
-                    // filter exhausted or error?
-                    // "FILTER_E_END_OF_CHUNKS" (0x80041700)
-                    // windows crate maps HRESULTs.
-                    // We check specific error code.
-                    if e.code().0 == -2147215616 {
-                        // FILTER_E_END_OF_CHUNKS
-                        break;
-                    }
-                    // Other error
-                    return Err(ExtractError::Failed(format!("GetChunk failed: {e}")));
+                let mut stat = STAT_CHUNK::default();
+                let hr = filter.GetChunk(&mut stat);
+                if hr == FILTER_E_END_OF_CHUNKS.0 {
+                    break;
+                }
+                if hr != S_OK.0 {
+                    return Err(ExtractError::Failed(format!(
+                        "GetChunk failed with 0x{hr:08x}"
+                    )));
                 }
 
-                if stat.flags & windows::Win32::Storage::IndexServer::CHUNK_TEXT != 0 {
+                if stat.flags.0 & CHUNK_TEXT.0 == CHUNK_TEXT.0 {
                     // Read text
                     loop {
                         let mut buf = [0u16; 4096];
-                        // GetText(buf_len, buf_ptr) -> Result<()>
-                        // Returns chunks.
-                        // In 0.52 it might take slice.
-
-                        // Signature: unsafe fn GetText(&self, pcwcbuffer: *mut u32, awcbuffer: *mut u16) -> Result<()>
-                        // pcwcbuffer is in/out.
-
                         let mut count = buf.len() as u32;
-                        let res = filter.GetText(&mut count, buf.as_mut_ptr());
+                        let hr = filter.GetText(&mut count, PWSTR(buf.as_mut_ptr()));
 
-                        match res {
-                            Ok(_) => {
-                                if count == 0 {
-                                    break;
-                                }
-                                let chunk = String::from_utf16_lossy(&buf[..count as usize]);
-                                let (trimmed, was_trunc, used) = enforce_limits_str(&chunk, ctx);
-                                text.push_str(&trimmed);
-                                bytes_processed += used; // approx
-                                if was_trunc || text.len() >= ctx.max_chars {
-                                    truncated = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                // FILTER_E_NO_MORE_TEXT (0x80041701) -> break chunk loop
-                                if e.code().0 == -2147215615 {
-                                    break;
-                                }
-                                // warning log?
-                                break;
-                            }
+                        if hr == FILTER_E_NO_MORE_TEXT.0 {
+                            break;
+                        }
+                        if hr != S_OK.0 {
+                            break;
+                        }
+                        if count == 0 {
+                            break;
+                        }
+
+                        let chunk = String::from_utf16_lossy(&buf[..count as usize]);
+                        let (trimmed, was_trunc, used) = enforce_limits_str(&chunk, ctx);
+                        text.push_str(&trimmed);
+                        bytes_processed += used; // approximate bytes from the UTF-16 slice
+                        if was_trunc || text.len() >= ctx.max_chars {
+                            truncated = true;
+                            break;
                         }
                     }
                 }

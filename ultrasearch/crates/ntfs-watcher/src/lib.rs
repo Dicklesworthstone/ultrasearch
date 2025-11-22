@@ -94,12 +94,12 @@ pub trait NtfsWatcher {
 pub fn discover_volumes() -> Result<Vec<VolumeInfo>, NtfsError> {
     use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::OsStrExt;
     use tracing::warn;
     use windows::Win32::Storage::FileSystem::{
         GetLogicalDrives, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
     };
-    use windows::core::{PCWSTR, PWSTR};
+    use windows::core::PCWSTR;
 
     let mut map: HashMap<String, Vec<char>> = HashMap::new();
     let mask = unsafe { GetLogicalDrives() };
@@ -120,20 +120,18 @@ pub fn discover_volumes() -> Result<Vec<VolumeInfo>, NtfsError> {
         let mut serial = 0u32;
         let mut max_comp = 0u32;
         let mut flags = 0u32;
-        let ok = unsafe {
+        let vol_info = unsafe {
             GetVolumeInformationW(
                 PCWSTR(root_wide.as_ptr()),
-                PWSTR::null(),
-                0,
-                Some(&mut serial),
-                Some(&mut max_comp),
-                Some(&mut flags),
-                PWSTR(fs_name.as_mut_ptr()),
-                fs_name.len() as u32,
+                None,
+                Some(&mut serial as *mut _),
+                Some(&mut max_comp as *mut _),
+                Some(&mut flags as *mut _),
+                Some(&mut fs_name),
             )
         };
-        if !ok.as_bool() {
-            warn!("GetVolumeInformationW failed for {root}");
+        if let Err(e) = vol_info {
+            warn!("GetVolumeInformationW failed for {root}: {e}");
             continue;
         }
         let fs = String::from_utf16_lossy(&fs_name)
@@ -144,15 +142,10 @@ pub fn discover_volumes() -> Result<Vec<VolumeInfo>, NtfsError> {
         }
 
         let mut guid_buf = [0u16; 64];
-        let ok = unsafe {
-            GetVolumeNameForVolumeMountPointW(
-                PCWSTR(root_wide.as_ptr()),
-                PWSTR(guid_buf.as_mut_ptr()),
-                guid_buf.len() as u32,
-            )
-        };
-        if !ok.as_bool() {
-            warn!("GetVolumeNameForVolumeMountPointW failed for {root}");
+        let ok =
+            unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(root_wide.as_ptr()), &mut guid_buf) };
+        if let Err(e) = ok {
+            warn!("GetVolumeNameForVolumeMountPointW failed for {root}: {e}");
             continue;
         }
         let guid = String::from_utf16_lossy(&guid_buf)
@@ -162,7 +155,11 @@ pub fn discover_volumes() -> Result<Vec<VolumeInfo>, NtfsError> {
         map.entry(guid).or_default().push(letter);
     }
 
-    let mut vols: Vec<VolumeInfo> = map
+    // Ensure stable ordering of volume IDs by sorting GUID path before assigning IDs.
+    let mut entries: Vec<(String, Vec<char>)> = map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let vols: Vec<VolumeInfo> = entries
         .into_iter()
         .enumerate()
         .map(|(idx, (guid_path, mut drive_letters))| {
@@ -174,7 +171,6 @@ pub fn discover_volumes() -> Result<Vec<VolumeInfo>, NtfsError> {
             }
         })
         .collect();
-    vols.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(vols)
 }
 
@@ -191,9 +187,8 @@ pub fn open_volume_handle(
     volume: &VolumeInfo,
 ) -> Result<std::os::windows::io::OwnedHandle, NtfsError> {
     use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
-    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -209,24 +204,20 @@ pub fn open_volume_handle(
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path_w.as_ptr()),
-            FILE_GENERIC_READ,
+            FILE_GENERIC_READ.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
             None,
         )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(NtfsError::Discovery(format!(
-            "CreateFileW failed for {}",
-            volume.guid_path
-        )));
     }
+    .map_err(|e| {
+        NtfsError::Discovery(format!("CreateFileW failed for {}: {e}", volume.guid_path))
+    })?;
 
     let raw: RawHandle = handle.0 as RawHandle;
-    // SAFETY: handle is valid (checked above) and ownership is transferred.
+    // SAFETY: handle is valid (error already handled) and ownership is transferred.
     let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
     Ok(owned)
 }
@@ -237,6 +228,7 @@ pub fn open_volume_handle(
 #[cfg(windows)]
 pub fn enumerate_mft(volume: &VolumeInfo) -> Result<Vec<FileMeta>, NtfsError> {
     use core_types::FileFlags;
+    use std::path::Path;
     use usn_journal_rs::mft::Mft;
     use usn_journal_rs::path::PathResolver;
     use usn_journal_rs::volume::Volume;
@@ -249,31 +241,34 @@ pub fn enumerate_mft(volume: &VolumeInfo) -> Result<Vec<FileMeta>, NtfsError> {
 
     let vol = Volume::from_drive_letter(drive)
         .map_err(|e| NtfsError::Mft(format!("open volume {drive}: {e}")))?;
-    let resolver =
-        PathResolver::new(&vol).map_err(|e| NtfsError::Mft(format!("path resolver init: {e}")))?;
-    let mft = Mft::new(&vol);
+    let mut resolver = PathResolver::new(&vol);
+    let mft = Mft::new(&vol).iter();
 
     let mut out = Vec::new();
     for entry in mft {
         let entry = entry.map_err(|e| NtfsError::Mft(format!("mft read: {e}")))?;
-        let frn = entry.file_reference_number();
-        let parent_frn = entry.parent_file_reference_number();
-        let is_dir = entry.is_directory();
-        let size = entry.file_size();
+        let frn = entry.fid;
+        let parent_frn = entry.parent_fid;
+        let is_dir = entry.is_dir();
 
         let path = resolver
-            .path(&entry)
-            .ok()
+            .resolve_path(&entry)
             .and_then(|p| p.to_str().map(|s| s.to_string()));
         let name = path
             .as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|p| Path::new(p).file_name())
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
 
-        let key = DocKey::from_parts(volume.id, frn as u64);
-        let parent = Some(DocKey::from_parts(volume.id, parent_frn as u64));
+        let size = path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let key = DocKey::from_parts(volume.id, frn);
+        let parent = Some(DocKey::from_parts(volume.id, parent_frn));
         let flags = if is_dir {
             FileFlags::IS_DIR
         } else {

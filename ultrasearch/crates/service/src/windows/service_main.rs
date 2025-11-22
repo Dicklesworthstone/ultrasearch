@@ -16,7 +16,7 @@ use windows_service::{
 const SERVICE_NAME: &str = "UltraSearch";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
-pub fn run_service<F>(app_logic: F) -> Result<()>
+pub fn run_service<F>(_app_logic: F) -> Result<()>
 where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
 {
@@ -113,7 +113,7 @@ fn my_service_main(_arguments: Vec<OsString>) {
 }
 
 /// Called by main.rs when running as a service.
-pub fn launch<F>(app_logic: F) -> Result<()>
+pub fn launch<F>(_app_logic: F) -> Result<()>
 where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + Sync + 'static,
 {

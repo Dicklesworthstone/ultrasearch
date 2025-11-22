@@ -6,10 +6,8 @@ pub struct QueryPlanner;
 impl QueryPlanner {
     /// Optimize the query expression.
     pub fn optimize(expr: QueryExpr) -> QueryExpr {
-        let expr = Self::push_down_not(expr);
-        let expr = Self::flatten(expr);
         // TODO: Analyze `ext:` terms to select specialized fields/analyzers in the future.
-        expr
+        Self::flatten(Self::push_down_not(expr))
     }
 
     /// Distribute NOTs: `Not(And([A, B]))` -> `Or([Not(A), Not(B)])` (De Morgan's).

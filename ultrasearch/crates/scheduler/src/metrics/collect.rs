@@ -3,8 +3,8 @@ use sysinfo::System;
 #[cfg(target_os = "windows")]
 use windows::{
     Win32::System::Performance::{
-        PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW,
-        PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue, PdhOpenQueryW,
+        PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PdhAddEnglishCounterW, PdhCloseQuery,
+        PdhCollectQueryData, PdhGetFormattedCounterValue, PdhOpenQueryW,
     },
     core::w,
 };
@@ -88,11 +88,11 @@ impl SystemLoadSampler {
     fn sample_disk(&mut self, elapsed: Duration) -> (u64, bool) {
         #[cfg(target_os = "windows")]
         {
-            if let Some(counter) = self.disk_counter.as_mut() {
-                if let Ok(bytes_per_sec) = counter.sample_bytes_per_sec() {
-                    let busy = bytes_per_sec >= self.disk_busy_threshold_bps;
-                    return (bytes_per_sec, busy);
-                }
+            if let Some(counter) = self.disk_counter.as_mut()
+                && let Ok(bytes_per_sec) = counter.sample_bytes_per_sec()
+            {
+                let busy = bytes_per_sec >= self.disk_busy_threshold_bps;
+                return (bytes_per_sec, busy);
             }
         }
 
@@ -106,36 +106,63 @@ impl SystemLoadSampler {
 
 #[cfg(target_os = "windows")]
 struct PdhCounter {
-    query: PDH_HQUERY,
-    counter: PDH_HCOUNTER,
+    query: isize,
+    counter: isize,
 }
 
 #[cfg(target_os = "windows")]
 impl PdhCounter {
     fn new_total_disk_bytes() -> windows::core::Result<Self> {
-        unsafe {
-            let mut query = PDH_HQUERY::default();
-            PdhOpenQueryW(None, 0, &mut query).ok()?;
+        fn pdh_ok(status: u32, ctx: &str) -> windows::core::Result<()> {
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(windows::core::Error::new(
+                    windows::core::HRESULT(status as i32),
+                    format!("{ctx} failed (status 0x{status:08x})").into(),
+                ))
+            }
+        }
 
-            let mut counter = PDH_HCOUNTER::default();
-            PdhAddEnglishCounterW(
-                query,
-                w!("\\PhysicalDisk(_Total)\\Disk Bytes/sec"),
-                0,
-                &mut counter,
-            )
-            .ok()?;
-            PdhCollectQueryData(query).ok()?;
+        unsafe {
+            let mut query: isize = 0;
+            pdh_ok(PdhOpenQueryW(None, 0, &mut query), "PdhOpenQueryW")?;
+
+            let mut counter: isize = 0;
+            pdh_ok(
+                PdhAddEnglishCounterW(
+                    query,
+                    w!("\\PhysicalDisk(_Total)\\Disk Bytes/sec"),
+                    0,
+                    &mut counter,
+                ),
+                "PdhAddEnglishCounterW",
+            )?;
+            pdh_ok(PdhCollectQueryData(query), "PdhCollectQueryData(init)")?;
 
             Ok(Self { query, counter })
         }
     }
 
     fn sample_bytes_per_sec(&mut self) -> windows::core::Result<u64> {
+        fn pdh_ok(status: u32, ctx: &str) -> windows::core::Result<()> {
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(windows::core::Error::new(
+                    windows::core::HRESULT(status as i32),
+                    format!("{ctx} failed (status 0x{status:08x})").into(),
+                ))
+            }
+        }
+
         unsafe {
-            PdhCollectQueryData(self.query).ok()?;
+            pdh_ok(PdhCollectQueryData(self.query), "PdhCollectQueryData")?;
             let mut value = PDH_FMT_COUNTERVALUE::default();
-            PdhGetFormattedCounterValue(self.counter, PDH_FMT_DOUBLE, None, &mut value).ok()?;
+            pdh_ok(
+                PdhGetFormattedCounterValue(self.counter, PDH_FMT_DOUBLE, None, &mut value),
+                "PdhGetFormattedCounterValue",
+            )?;
             let v = value.Anonymous.doubleValue;
             Ok(if v.is_sign_negative() { 0 } else { v as u64 })
         }

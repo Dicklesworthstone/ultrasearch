@@ -118,7 +118,8 @@ impl PipeClient {
                 }
                 Err(e) => {
                     warn!("pipe request attempt {} timed out: {e:?}", attempt + 1);
-                    last_err = Some(e.into());
+                    let err: anyhow::Error = e.into();
+                    last_err = Some(err);
                 }
             }
 

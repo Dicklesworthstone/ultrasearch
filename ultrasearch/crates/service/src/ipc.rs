@@ -3,12 +3,14 @@
 use std::env;
 use std::time::Instant;
 
+use crate::metrics::{global_metrics_snapshot, record_ipc_request};
+use crate::search_handler::search;
+use crate::status::make_status_response;
+use crate::status_provider::status_snapshot;
 use anyhow::Result;
-use ipc::{MetricsSnapshot, SearchRequest, SearchResponse, StatusRequest, StatusResponse, framing};
-use service::metrics::{global_metrics_snapshot, record_ipc_request};
-use service::search_handler::search;
-use service::status::make_status_response;
-use service::status_provider::status_snapshot;
+use ipc::{MetricsSnapshot, SearchRequest, StatusRequest, framing};
+#[cfg(test)]
+use ipc::{SearchResponse, StatusResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::task::JoinHandle;
@@ -28,7 +30,7 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
                 .first_pipe_instance(first)
                 .create(&name);
 
-            let mut server = match server_res {
+            let server = match server_res {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to create named pipe instance: {}", e);
@@ -46,7 +48,7 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
 
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(server).await {
-                    tracing::warn!("pipe connection error: {{:?}}", e);
+                    tracing::warn!("pipe connection error: {e:?}");
                 }
             });
         }
@@ -65,7 +67,7 @@ async fn handle_connection(mut conn: NamedPipeServer) -> Result<()> {
         }
         let frame_len = u32::from_le_bytes(len_prefix) as usize;
         if frame_len == 0 || frame_len > MAX_MESSAGE_BYTES {
-            tracing::warn!("invalid frame size {{}}", frame_len);
+            tracing::warn!("invalid frame size {frame_len}");
             break;
         }
         let mut buf = vec![0u8; frame_len];
@@ -92,18 +94,17 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
     if let Ok(req) = bincode::deserialize::<StatusRequest>(payload) {
         let started = Instant::now();
         let snap = status_snapshot();
-        let empty_metrics = snap.metrics.or_else(|| {
-            global_metrics_snapshot(Some(0), Some(0)).or_else(|| {
-                Some(MetricsSnapshot {
+        let empty_metrics =
+            snap.metrics.or(
+                global_metrics_snapshot(Some(0), Some(0)).or(Some(MetricsSnapshot {
                     search_latency_ms_p50: None,
                     search_latency_ms_p95: None,
                     worker_cpu_pct: None,
                     worker_mem_bytes: None,
                     queue_depth: Some(0),
                     active_workers: Some(0),
-                })
-            })
-        });
+                })),
+            );
         let resp = make_status_response(
             req.id,
             snap.volumes,
@@ -132,10 +133,10 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
         return encoded;
     }
     // If payload decodes as a UUID prefix, echo it back.
-    if payload.len() >= 16 {
-        if let Ok(id) = Uuid::from_slice(&payload[..16]) {
-            return id.as_bytes().to_vec();
-        }
+    if payload.len() >= 16
+        && let Ok(id) = Uuid::from_slice(&payload[..16])
+    {
+        return id.as_bytes().to_vec();
     }
     Vec::new()
 }
@@ -149,7 +150,6 @@ fn host_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use service::status::make_status_response;
 
     #[tokio::test]
     async fn echoes_uuid_prefix() {

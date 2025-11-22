@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use console::style;
+#[cfg(not(windows))]
+use ipc::MetricsSnapshot;
 use ipc::{
-    MetricsSnapshot, QueryExpr, SearchMode, SearchRequest, SearchResponse, StatusRequest,
-    StatusResponse, TermExpr, TermModifier,
+    QueryExpr, SearchMode, SearchRequest, SearchResponse, StatusRequest, StatusResponse, TermExpr,
+    TermModifier,
 };
 use uuid::Uuid;
 

@@ -67,3 +67,9 @@ impl IpcClient {
         }
     }
 }
+
+impl Default for IpcClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -25,3 +25,9 @@ impl SearchAppModel {
         // No async spawn here in simple mode
     }
 }
+
+impl Default for SearchAppModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}

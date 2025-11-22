@@ -90,9 +90,8 @@ pub fn classify_idle(idle_for: Duration, warm_idle: Duration, deep_idle: Duratio
 #[cfg(target_os = "windows")]
 fn idle_elapsed_ms() -> Option<u64> {
     use tracing::warn;
-    use windows::Win32::Foundation::LASTINPUTINFO;
     use windows::Win32::System::SystemInformation::GetTickCount64;
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetLastInputInfo;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
     // SAFETY: GetLastInputInfo expects a properly initialized struct.
     unsafe {
@@ -102,7 +101,7 @@ fn idle_elapsed_ms() -> Option<u64> {
         };
 
         if GetLastInputInfo(&mut info).as_bool() {
-            let now = GetTickCount64() as u64;
+            let now = GetTickCount64();
             let last = info.dwTime as u64;
             return now.checked_sub(last);
         }

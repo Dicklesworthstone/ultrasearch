@@ -13,3 +13,5 @@ anyhow = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
+tracing = { workspace = true }
