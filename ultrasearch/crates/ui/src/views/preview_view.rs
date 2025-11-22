@@ -1,6 +1,6 @@
 use crate::model::state::SearchAppModel;
 use gpui::prelude::*;
-use gpui::{InteractiveElement, *};
+use gpui::{InteractiveElement, UniformListScrollHandle, *};
 use std::process::Command;
 
 fn preview_bg() -> Hsla {
@@ -30,12 +30,35 @@ fn snippet_border() -> Hsla {
 
 pub struct PreviewView {
     model: Entity<SearchAppModel>,
+    snippet_scroll: UniformListScrollHandle,
+    last_item_id: Option<String>,
 }
 
 impl PreviewView {
     pub fn new(model: Entity<SearchAppModel>, cx: &mut Context<PreviewView>) -> Self {
-        cx.observe(&model, |_, _, cx| cx.notify()).detach();
-        Self { model }
+        cx.observe(&model, |this: &mut PreviewView, model, cx| {
+            let selected_path = model
+                .read(cx)
+                .selected_row()
+                .and_then(|hit| hit.path.clone())
+                .unwrap_or_default();
+            if this
+                .last_item_id
+                .as_ref()
+                .map(|p| p != &selected_path)
+                .unwrap_or(true)
+            {
+                this.snippet_scroll = UniformListScrollHandle::new();
+                this.last_item_id = Some(selected_path);
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            model,
+            snippet_scroll: UniformListScrollHandle::new(),
+            last_item_id: None,
+        }
     }
 
     fn open_in_explorer(&mut self, path: &str) {
@@ -297,10 +320,31 @@ impl Render for PreviewView {
                                 .border_color(snippet_border())
                                 .rounded_lg()
                                 .max_h(px(260.))
-                                .overflow_y_scroll()
-                                .text_size(px(12.))
-                                .text_color(text_secondary())
-                                .child(snippet),
+                                .child({
+                                    let mut lines: Vec<String> =
+                                        snippet.to_string().lines().map(|l| l.to_string()).collect();
+                                    if lines.is_empty() {
+                                        lines.push(String::new());
+                                    }
+                                    let count = lines.len();
+                                    let handle = self.snippet_scroll.clone();
+                                    uniform_list("preview-snippet", count, move |range, _, _| {
+                                        lines[range]
+                                            .iter()
+                                            .map(|line| {
+                                                div()
+                                                    .px_1()
+                                                    .py_0p5()
+                                                    .text_size(px(12.))
+                                                    .text_color(text_secondary())
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(line.clone())
+                                            })
+                                            .collect()
+                                    })
+                                    .track_scroll(handle)
+                                }),
                         ),
                 );
             }

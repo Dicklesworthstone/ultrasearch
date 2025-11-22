@@ -552,7 +552,7 @@ impl Render for SearchView {
                             .child(
                                 div()
                                     .text_color(text_secondary())
-                                    .child(if status.in_flight { "⏳" } else { " " }),
+                                    .child(if status.in_flight { "⏳" } else { "" }),
                             )
                             .child(
                                 div()
@@ -644,7 +644,23 @@ impl Render for SearchView {
                                             }
                                         });
                                     }),
-                                ),
+                                )
+                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                    match event.keystroke.key.as_str() {
+                                        "enter" | "space" => {
+                                            this.model.update(cx, |model, cx| {
+                                                let current = model.query.clone();
+                                                if current.is_empty() {
+                                                    model.start_status_polling(cx);
+                                                } else {
+                                                    model.set_query(current, cx);
+                                                }
+                                            });
+                                            cx.stop_propagation();
+                                        }
+                                        _ => {}
+                                    }
+                                })),
                         )
                     }),
             )
