@@ -1,6 +1,8 @@
 [build]
 # Prefer fast, modern linkers and explicit CPU tuning where available.
 rustflags = []
+# Keep builds gentle on local machine; limit parallel rustc jobs.
+jobs = 2
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
@@ -11,7 +13,11 @@ rustflags = [
 
 [target.x86_64-pc-windows-msvc]
 # Static CRT for simpler deployment; adjust if dynamic linking is required.
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    # Reduce codegen parallelism to minimize CPU spikes (slower builds acceptable).
+    "-C", "codegen-units=1",
+]
 
 [net]
 git-fetch-with-cli = true
