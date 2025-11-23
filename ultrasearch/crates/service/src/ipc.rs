@@ -13,7 +13,7 @@ use ipc::{MetricsSnapshot, SearchRequest, StatusRequest, framing};
 use ipc::{SearchResponse, StatusResponse};
 use std::io::Cursor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -27,14 +27,13 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
     let handle = tokio::spawn(async move {
         let mut first = true;
         loop {
-            let server_res = ServerOptions::new()
-                .first_pipe_instance(first)
-                .create(&name);
-
-            let server = match server_res {
+            // Use raw Win32 API to create pipe with Security Descriptor
+            // SDDL: D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)
+            // SY=System, BA=Admins, AU=Authenticated Users (Read/Write)
+            let server = match unsafe { create_secure_pipe(&name, first) } {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!("failed to create named pipe instance: {}", e);
+                    tracing::error!("failed to create secure named pipe: {}", e);
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
@@ -56,6 +55,85 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
     });
 
     Ok(handle)
+}
+
+unsafe fn create_secure_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree, HLOCAL};
+    use windows::Win32::Security::{
+        SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR,
+        Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    };
+    use windows::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, PIPE_REJECT_REMOTE_CLIENTS,
+        NAMED_PIPE_MODE,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_OVERLAPPED, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, FILE_FLAGS_AND_ATTRIBUTES,
+    };
+    use windows::core::PCWSTR;
+
+    // D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)
+    let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)\0";
+    let sddl_wide: Vec<u16> = sddl.encode_utf16().collect();
+    
+    let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
+    
+    unsafe {
+        let _ = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_wide.as_ptr()),
+            1, // SDDL_REVISION_1
+            &mut sd,
+            None,
+        )?;
+    }
+
+    // Ensure we free the SD
+    struct SdGuard(PSECURITY_DESCRIPTOR);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            // sd.0 is *mut c_void. HLOCAL wraps *mut c_void.
+            unsafe { let _ = LocalFree(HLOCAL(self.0.0)); }
+        }
+    }
+    let _guard = SdGuard(sd);
+
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0 as *mut _,
+        bInheritHandle: windows::Win32::Foundation::FALSE,
+    };
+
+    let mut name_wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    name_wide.push(0);
+
+    let mut open_mode = PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0;
+    if first {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE.0;
+    }
+
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name_wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(open_mode),
+            NAMED_PIPE_MODE(PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0),
+            PIPE_UNLIMITED_INSTANCES,
+            65536,
+            65536,
+            0,
+            Some(&mut sa),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(anyhow::Error::from(windows::core::Error::from_win32()));
+    }
+
+    // Wrap in Tokio
+    let server = unsafe { NamedPipeServer::from_raw_handle(handle.0 as *mut _) }?;
+    Ok(server)
 }
 
 async fn handle_connection(mut conn: NamedPipeServer) -> Result<()> {
