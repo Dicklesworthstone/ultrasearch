@@ -36,9 +36,14 @@ impl JobDispatcher {
         // In release, it's "search-index-worker".
         // We'll look for it in the current exe dir.
 
-        let mut worker_path = std::env::current_exe()
+        let mut worker_path = std::env::var("ULTRASEARCH_WORKER_PATH")
+            .map(PathBuf::from)
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join("search-index-worker")))
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("search-index-worker")))
+            })
             .unwrap_or_else(|| PathBuf::from("search-index-worker"));
 
         // On Windows, add .exe

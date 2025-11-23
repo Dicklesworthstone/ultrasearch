@@ -1,10 +1,10 @@
 #![cfg(target_os = "windows")]
 
 use crate::{
-    framing, ReloadConfigRequest, ReloadConfigResponse, SearchRequest, SearchResponse,
-    StatusRequest, StatusResponse,
+    ReloadConfigRequest, ReloadConfigResponse, SearchRequest, SearchResponse, StatusRequest,
+    StatusResponse, framing,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;

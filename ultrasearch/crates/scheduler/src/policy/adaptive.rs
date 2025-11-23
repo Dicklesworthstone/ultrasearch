@@ -74,6 +74,8 @@ mod tests {
             mem_used_percent: 50.0,
             disk_bytes_per_sec: 0,
             disk_busy: false,
+            game_mode: false,
+            on_battery: false,
             sample_duration: Duration::from_secs(1),
         }
     }

@@ -463,6 +463,17 @@ mod tests {
 
     #[cfg(feature = "extractous_backend")]
     #[test]
+    fn extractous_stack_includes_backend() {
+        // This does not require GraalVM at runtime unless extract() is invoked.
+        let stack = ExtractorStack::with_extractous_enabled(true);
+        assert!(
+            stack.backends.iter().any(|b| b.name() == "extractous"),
+            "extractous backend should be present when feature is enabled"
+        );
+    }
+
+    #[cfg(feature = "extractous_backend")]
+    #[test]
     fn extractous_rejects_large_file() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();

@@ -9,8 +9,8 @@ use crate::status::make_status_response;
 use crate::status_provider::status_snapshot;
 use anyhow::Result;
 use ipc::{
-    framing, MetricsSnapshot, ReloadConfigRequest, ReloadConfigResponse, SearchRequest,
-    StatusRequest,
+    MetricsSnapshot, ReloadConfigRequest, ReloadConfigResponse, SearchRequest, StatusRequest,
+    framing,
 };
 #[cfg(test)]
 use ipc::{SearchResponse, StatusResponse};
@@ -63,29 +63,29 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
 unsafe fn create_secure_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree, HLOCAL};
+    use windows::Win32::Foundation::{HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
     use windows::Win32::Security::{
-        SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR,
-        Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    };
-    use windows::Win32::System::Pipes::{
-        CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT,
-        PIPE_UNLIMITED_INSTANCES, PIPE_REJECT_REMOTE_CLIENTS,
-        NAMED_PIPE_MODE,
+        Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES,
     };
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_OVERLAPPED, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, FILE_FLAGS_AND_ATTRIBUTES,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
+        PIPE_ACCESS_DUPLEX,
+    };
+    use windows::Win32::System::Pipes::{
+        CreateNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::core::PCWSTR;
 
     // D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)
     let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)\0";
     let sddl_wide: Vec<u16> = sddl.encode_utf16().collect();
-    
+
     let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
-    
+
     unsafe {
-        let _ = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(sddl_wide.as_ptr()),
             1, // SDDL_REVISION_1
             &mut sd,
@@ -98,12 +98,14 @@ unsafe fn create_secure_pipe(name: &str, first: bool) -> Result<NamedPipeServer>
     impl Drop for SdGuard {
         fn drop(&mut self) {
             // sd.0 is *mut c_void. HLOCAL wraps *mut c_void.
-            unsafe { let _ = LocalFree(HLOCAL(self.0.0)); }
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.0.0));
+            }
         }
     }
     let _guard = SdGuard(sd);
 
-    let mut sa = SECURITY_ATTRIBUTES {
+    let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.0 as *mut _,
         bInheritHandle: windows::Win32::Foundation::FALSE,
@@ -121,12 +123,17 @@ unsafe fn create_secure_pipe(name: &str, first: bool) -> Result<NamedPipeServer>
         CreateNamedPipeW(
             PCWSTR(name_wide.as_ptr()),
             FILE_FLAGS_AND_ATTRIBUTES(open_mode),
-            NAMED_PIPE_MODE(PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0),
+            NAMED_PIPE_MODE(
+                PIPE_TYPE_BYTE.0
+                    | PIPE_READMODE_BYTE.0
+                    | PIPE_WAIT.0
+                    | PIPE_REJECT_REMOTE_CLIENTS.0,
+            ),
             PIPE_UNLIMITED_INSTANCES,
             65536,
             65536,
             0,
-            Some(&mut sa),
+            Some(&sa),
         )
     };
 

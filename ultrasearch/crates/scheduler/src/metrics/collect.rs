@@ -1,4 +1,6 @@
 use std::time::{Duration, Instant};
+#[cfg(not(target_os = "windows"))]
+use sysinfo::Disks;
 use sysinfo::System;
 #[cfg(target_os = "windows")]
 use windows::{
@@ -31,6 +33,10 @@ pub struct SystemLoadSampler {
     last_sample: Instant,
     #[cfg(target_os = "windows")]
     disk_counter: Option<Box<dyn DiskCounter>>,
+    #[cfg(not(target_os = "windows"))]
+    disks: Disks,
+    #[cfg(not(target_os = "windows"))]
+    prev_disk_bytes: u64,
 }
 
 impl SystemLoadSampler {
@@ -43,6 +49,17 @@ impl SystemLoadSampler {
         let disk_counter = PdhCounter::new_total_disk_bytes()
             .ok()
             .map(|c| Box::new(c) as Box<dyn DiskCounter>);
+        #[cfg(not(target_os = "windows"))]
+        let disks = Disks::new_with_refreshed_list();
+        #[cfg(not(target_os = "windows"))]
+        let prev_disk_bytes = disks
+            .list()
+            .iter()
+            .map(|d| {
+                let usage = d.usage();
+                usage.read_bytes.saturating_add(usage.written_bytes)
+            })
+            .sum();
 
         Self {
             system,
@@ -50,6 +67,10 @@ impl SystemLoadSampler {
             last_sample: Instant::now(),
             #[cfg(target_os = "windows")]
             disk_counter,
+            #[cfg(not(target_os = "windows"))]
+            disks,
+            #[cfg(not(target_os = "windows"))]
+            prev_disk_bytes,
         }
     }
 
@@ -112,7 +133,38 @@ impl SystemLoadSampler {
             }
         }
 
-        // Fallback when disk metrics unavailable (non-Windows builds).
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Use sysinfo disk usage deltas between refreshes.
+            self.disks.refresh();
+
+            let delta_bytes: u64 = self
+                .disks
+                .list()
+                .iter()
+                .map(|d| {
+                    let usage = d.usage();
+                    usage.read_bytes.saturating_add(usage.written_bytes)
+                })
+                .sum::<u64>()
+                .saturating_sub(self.prev_disk_bytes);
+            self.prev_disk_bytes = self
+                .disks
+                .list()
+                .iter()
+                .map(|d| {
+                    let usage = d.usage();
+                    usage.read_bytes.saturating_add(usage.written_bytes)
+                })
+                .sum();
+
+            let secs = elapsed.as_secs_f64().max(0.001);
+            let bytes_per_sec = (delta_bytes as f64 / secs) as u64;
+            let busy = bytes_per_sec >= self.disk_busy_threshold_bps;
+            return (bytes_per_sec, busy);
+        }
+
+        // Fallback when disk metrics unavailable.
         let bps = 0;
         let busy = false;
         let _ = elapsed; // keep signature consistent
@@ -135,7 +187,9 @@ impl SystemLoadSampler {
     fn sample_game_mode(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
-            use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN};
+            use windows::Win32::UI::Shell::{
+                QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
+            };
             if let Ok(state) = unsafe { SHQueryUserNotificationState() } {
                 return state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN;
             }

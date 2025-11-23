@@ -103,6 +103,26 @@ fn main() -> Result<()> {
         args.enable_extractous = matches!(val.as_str(), "1" | "true" | "TRUE");
     }
 
+    #[cfg(not(feature = "extractous_backend"))]
+    if args.enable_extractous {
+        warn!(
+            "--enable-extractous requested, but this binary was built without the `extractous_backend` feature; proceeding with simple-text extractor only"
+        );
+    }
+
+    #[cfg(feature = "extractous_backend")]
+    if args.enable_extractous && !detect_graalvm() {
+        let hint = env::var("ULTRASEARCH_GRAALVM_HINT").unwrap_or_else(|_| {
+            "Set GRAALVM_HOME (or JAVA_HOME) to your GraalVM CE 23.x install and ensure bin is on PATH"
+                .to_string()
+        });
+        warn!(
+            "Extractous requested but GraalVM was not detected. {}. Falling back to simple-text.",
+            hint
+        );
+        args.enable_extractous = false;
+    }
+
     let stack = ExtractorStack::with_extractous_enabled(args.enable_extractous);
 
     // Open index writer once for the run.
@@ -145,6 +165,28 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "extractous_backend")]
+fn detect_graalvm() -> bool {
+    use std::process::Command;
+
+    let java_bin = env::var("GRAALVM_HOME")
+        .or_else(|_| env::var("JAVA_HOME"))
+        .map(|home| {
+            let mut p = std::path::PathBuf::from(home);
+            p.push("bin");
+            p.push(if cfg!(windows) { "java.exe" } else { "java" });
+            p
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("java"));
+
+    if let Ok(out) = Command::new(java_bin).arg("-version").output() {
+        let combined = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase()
+            + &String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        return combined.contains("graalvm");
+    }
+    false
 }
 
 fn load_jobs(job_file: &PathBuf) -> Result<Vec<JobSpec>> {

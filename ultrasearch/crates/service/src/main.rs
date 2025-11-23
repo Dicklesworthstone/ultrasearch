@@ -30,7 +30,7 @@ enum ServiceCommand {
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = Args::parse();
-    
+
     #[cfg(windows)]
     if let Some(cmd) = args.command {
         match cmd {

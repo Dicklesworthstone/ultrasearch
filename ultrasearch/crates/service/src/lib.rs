@@ -63,6 +63,14 @@ mod e2e_windows_tests {
             return Ok(());
         }
 
+        // Resolve worker path if available so content jobs can run end-to-end.
+        let worker_path = std::env::var("CARGO_BIN_EXE_search-index-worker")
+            .or_else(|_| std::env::var("ULTRASEARCH_WORKER_PATH"))
+            .ok();
+        if let Some(ref path) = worker_path {
+            std::env::set_var("ULTRASEARCH_WORKER_PATH", path);
+        }
+
         let temp = tempdir()?;
         let data_dir = temp.path().join("data");
         let _ = std::fs::create_dir_all(&data_dir);
@@ -109,6 +117,7 @@ mod e2e_windows_tests {
             initial_metas: Some(vec![meta]),
             skip_initial_ingest: true,
             pipe_name: Some(pipe_name.clone()),
+            force_content_jobs: worker_path.is_some(),
         };
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -151,6 +160,35 @@ mod e2e_windows_tests {
             resp.total,
             resp.hits.len()
         );
+
+        if worker_path.is_some() {
+            // Poll for content results to confirm worker job execution.
+            let mut content_found = false;
+            for _ in 0..20 {
+                let content_req: SearchRequest = SearchRequest {
+                    id: Uuid::new_v4(),
+                    query: QueryExpr::Term(TermExpr {
+                        field: None,
+                        value: "ultrasearch".into(),
+                        modifier: TermModifier::Term,
+                    }),
+                    limit: 10,
+                    mode: SearchMode::Content,
+                    timeout: Some(Duration::from_secs(2)),
+                    offset: 0,
+                };
+                let resp = client.search(content_req).await?;
+                if resp.total > 0 {
+                    content_found = true;
+                    break;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+            assert!(
+                content_found,
+                "content search should return results once worker runs"
+            );
+        }
 
         // Shutdown
         let _ = shutdown_tx.send(()).await;
@@ -222,6 +260,7 @@ mod e2e_windows_tests {
             initial_metas: Some(vec![meta]),
             skip_initial_ingest: true,
             pipe_name: Some(pipe_name.clone()),
+            force_content_jobs: false,
         };
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -316,6 +355,7 @@ mod e2e_windows_tests {
             initial_metas: Some(vec![meta]),
             skip_initial_ingest: true,
             pipe_name: Some(pipe_name.clone()),
+            force_content_jobs: false,
         };
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);

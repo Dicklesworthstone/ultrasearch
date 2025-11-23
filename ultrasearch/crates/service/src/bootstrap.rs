@@ -17,13 +17,15 @@ pub struct BootstrapOptions {
     pub skip_initial_ingest: bool,
     /// Override IPC pipe name (default is \\\\.\\pipe\\ultrasearch).
     pub pipe_name: Option<String>,
+    /// Force scheduler to run content jobs even if idle/load gates are active (tests).
+    pub force_content_jobs: bool,
 }
 
 use crate::{
     init_tracing_with_config,
     meta_ingest::ingest_with_paths,
     metrics::{init_metrics_from_config, set_global_metrics},
-    scanner::scan_volumes,
+    scanner::{scan_volumes, watch_changes},
     scheduler_runtime::SchedulerRuntime,
     search_handler::set_search_handler,
     status_provider::{
@@ -56,19 +58,42 @@ pub fn run_app_with_options(
         set_global_metrics(metrics);
     }
 
+    let mut pending_jobs = Vec::new();
+
     match opts.initial_metas {
-        Some(metas) => ingest_seed_metadata(cfg, metas)?,
+        Some(metas) => ingest_seed_metadata(cfg, metas, &mut pending_jobs)?,
         None if opts.skip_initial_ingest => {
             tracing::info!("skip_initial_ingest=true; leaving indices empty");
         }
-        None => scan_volumes(cfg)?,
+        None => {
+            let jobs = scan_volumes(cfg)?;
+            pending_jobs.extend(jobs);
+        }
     }
 
     // Start scheduler loop
     // We need to clone cfg for the scheduler (or pass reference if new() takes ref).
     // SchedulerRuntime::new takes &AppConfig.
-    let scheduler = SchedulerRuntime::new(cfg);
+    let mut scheduler = SchedulerRuntime::new(cfg);
+    if opts.force_content_jobs {
+        scheduler.force_allow_content();
+    }
+    if !pending_jobs.is_empty() {
+        tracing::info!(
+            "Seeding {} content jobs into scheduler queue",
+            pending_jobs.len()
+        );
+        scheduler.submit_content_jobs(pending_jobs);
+    }
     rt.spawn(scheduler.run_loop());
+
+    // Start change watcher (USN or noop on unsupported platforms) after scheduler channel exists.
+    let cfg_clone = cfg.clone();
+    rt.spawn(async move {
+        if let Err(e) = watch_changes(cfg_clone).await {
+            tracing::warn!("change watcher exited: {e}");
+        }
+    });
 
     // Try to install unified search handler.
     // We pass both meta and content index paths.
@@ -139,7 +164,11 @@ pub fn run_app_with_options(
     Ok(())
 }
 
-fn ingest_seed_metadata(cfg: &AppConfig, metas: Vec<core_types::FileMeta>) -> Result<()> {
+fn ingest_seed_metadata(
+    cfg: &AppConfig,
+    metas: Vec<core_types::FileMeta>,
+    pending_jobs: &mut Vec<crate::dispatcher::job_dispatch::JobSpec>,
+) -> Result<()> {
     if metas.is_empty() {
         tracing::info!("seed metadata list empty; skipping ingest");
         return Ok(());
@@ -162,6 +191,13 @@ fn ingest_seed_metadata(cfg: &AppConfig, metas: Vec<core_types::FileMeta>) -> Re
             last_usn: None,
             journal_id: None,
         });
+    }
+
+    // Seed content jobs for any provided seed files (if they have paths).
+    for meta in metas {
+        if let Some(job) = crate::scheduler_runtime::content_job_from_meta(&meta, &cfg.extract) {
+            pending_jobs.push(job);
+        }
     }
 
     update_status_last_commit(Some(unix_timestamp_secs()));

@@ -6,6 +6,10 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "Batch indexing worker for UltraSearch"
 
+[features]
+default = []
+extractous_backend = ["content-extractor/extractous_backend"]
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }

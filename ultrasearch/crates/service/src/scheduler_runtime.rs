@@ -3,14 +3,17 @@ use crate::scanner;
 use crate::status_provider::{
     update_status_metrics, update_status_queue_state, update_status_scheduler_state,
 };
-use core_types::config::AppConfig;
+use core_types::FileMeta;
+use core_types::config::{AppConfig, ExtractSection};
 use scheduler::{
     SchedulerConfig, allow_content_jobs, idle::IdleTracker, metrics::SystemLoadSampler,
 };
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::task;
 
 #[derive(Debug, Default)]
@@ -22,6 +25,7 @@ struct SchedulerLiveState {
 }
 
 static LIVE_STATE: OnceLock<SchedulerLiveState> = OnceLock::new();
+static JOB_SENDER: OnceLock<mpsc::UnboundedSender<JobSpec>> = OnceLock::new();
 
 /// Runtime wrapper that drives a simple scheduling loop and dispatches content batches.
 pub struct SchedulerRuntime {
@@ -29,9 +33,11 @@ pub struct SchedulerRuntime {
     idle: IdleTracker,
     load: SystemLoadSampler,
     content_jobs: VecDeque<JobSpec>,
+    job_rx: mpsc::UnboundedReceiver<JobSpec>,
     dispatcher: JobDispatcher,
     live: &'static SchedulerLiveState,
     current_volumes: Vec<String>,
+    force_allow_content: bool,
 }
 
 impl SchedulerRuntime {
@@ -43,19 +49,25 @@ impl SchedulerRuntime {
             cpu_content_max: app_cfg.scheduler.cpu_hard_limit_pct as f32,
             disk_busy_threshold_bps: app_cfg.scheduler.disk_busy_bytes_per_s,
             content_batch_size: app_cfg.scheduler.content_batch_size as usize,
+            power_save_mode: app_cfg.scheduler.power_save_mode,
             ..SchedulerConfig::default()
         };
 
         let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Keep a global sender so producers (scanner/USN) can enqueue work from anywhere.
+        let _ = JOB_SENDER.get_or_init(|| tx.clone());
 
         Self {
             idle: IdleTracker::new(config.warm_idle, config.deep_idle),
             load: SystemLoadSampler::new(config.disk_busy_threshold_bps),
             content_jobs: VecDeque::new(),
+            job_rx: rx,
             dispatcher: JobDispatcher::new(app_cfg),
             config,
             live,
             current_volumes: app_cfg.volumes.clone(),
+            force_allow_content: false,
         }
     }
 
@@ -65,12 +77,15 @@ impl SchedulerRuntime {
             tracing::info!("Volume configuration changed, triggering rescan...");
             self.current_volumes = app_cfg.volumes.clone();
             let cfg_clone = app_cfg.clone();
-            
+
             // Spawn blocking task to rescan
-            task::spawn_blocking(move || {
-                if let Err(e) = scanner::scan_volumes(&cfg_clone) {
-                    tracing::error!("Failed to rescan volumes after config update: {}", e);
+            task::spawn_blocking(move || match scanner::scan_volumes(&cfg_clone) {
+                Ok(new_jobs) => {
+                    for job in new_jobs {
+                        enqueue_content_job(job);
+                    }
                 }
+                Err(e) => tracing::error!("Failed to rescan volumes after config update: {}", e),
             });
         }
 
@@ -80,12 +95,28 @@ impl SchedulerRuntime {
         self.config.cpu_content_max = app_cfg.scheduler.cpu_hard_limit_pct as f32;
         self.config.disk_busy_threshold_bps = app_cfg.scheduler.disk_busy_bytes_per_s;
         self.config.content_batch_size = app_cfg.scheduler.content_batch_size as usize;
+        self.config.power_save_mode = app_cfg.scheduler.power_save_mode;
     }
 
     /// Submit a content indexing job (path + doc ids).
     pub fn submit_content_job(&mut self, job: JobSpec) {
         self.content_jobs.push_back(job);
         self.update_live_counts();
+    }
+
+    /// Submit a batch of content indexing jobs.
+    pub fn submit_content_jobs<I>(&mut self, jobs: I)
+    where
+        I: IntoIterator<Item = JobSpec>,
+    {
+        for job in jobs {
+            self.submit_content_job(job);
+        }
+    }
+
+    /// Force content jobs to run regardless of idle/load (useful for tests).
+    pub fn force_allow_content(&mut self) {
+        self.force_allow_content = true;
     }
 
     fn update_live_counts(&self) {
@@ -110,6 +141,12 @@ impl SchedulerRuntime {
         let app_cfg = core_types::config::get_current_config();
         self.update_config(&app_cfg);
 
+        // Drain any newly submitted content jobs.
+        while let Ok(job) = self.job_rx.try_recv() {
+            self.content_jobs.push_back(job);
+        }
+        self.update_live_counts();
+
         let idle_sample = self.idle.sample();
         let load = self.load.sample();
 
@@ -117,23 +154,15 @@ impl SchedulerRuntime {
         let ct = self.content_jobs.len();
         let workers = self.live.active_workers.load(Ordering::Relaxed);
         update_status_scheduler_state(format!(
-            "idle={:?} cpu={:.1}% mem={:.1}% queues(c/m/t)={}/0/0",
+            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={}",
             idle_sample.state, load.cpu_percent, load.mem_used_percent, ct
         ));
         update_status_queue_state(Some(ct as u64), Some(workers));
         update_status_metrics(None);
 
         // Gate metadata/content on policies; we only have content jobs for now.
-        let allow_content = allow_content_jobs(
-            idle_sample.state,
-            scheduler::metrics::SystemLoad {
-                cpu_percent: load.cpu_percent,
-                mem_used_percent: load.mem_used_percent,
-                disk_busy: load.disk_busy,
-                disk_bytes_per_sec: load.disk_bytes_per_sec,
-                sample_duration: load.sample_duration,
-            },
-        );
+        let allow_content =
+            self.force_allow_content || allow_content_jobs(idle_sample.state, load, &self.config);
 
         if allow_content && !self.content_jobs.is_empty() {
             let batch_size = self
@@ -161,6 +190,18 @@ impl SchedulerRuntime {
     }
 }
 
+/// Enqueue a content indexing job for the scheduler loop.
+/// Returns `false` if the scheduler has not been initialized yet.
+pub fn enqueue_content_job(job: JobSpec) -> bool {
+    match JOB_SENDER.get() {
+        Some(tx) => tx.send(job).is_ok(),
+        None => {
+            tracing::warn!("scheduler not initialized; dropping content job");
+            false
+        }
+    }
+}
+
 /// Utility to let other components set active worker count directly (e.g., worker manager updates).
 pub fn set_live_active_workers(active: u32) {
     let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
@@ -173,4 +214,30 @@ pub fn set_live_queue_counts(critical: usize, metadata: usize, content: usize) {
     live.critical.store(critical, Ordering::Relaxed);
     live.metadata.store(metadata, Ordering::Relaxed);
     live.content.store(content, Ordering::Relaxed);
+}
+
+/// Convert a `FileMeta` into a `JobSpec` if it looks indexable.
+pub fn content_job_from_meta(meta: &FileMeta, extract: &ExtractSection) -> Option<JobSpec> {
+    if meta.flags.is_dir() {
+        return None;
+    }
+    let path_str = meta.path.as_ref()?;
+    let path = PathBuf::from(path_str);
+    let file_id = meta.key.file_id();
+
+    let to_usize = |v: u64| -> usize {
+        if v > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            v as usize
+        }
+    };
+
+    Some(JobSpec {
+        volume_id: meta.volume,
+        file_id,
+        path,
+        max_bytes: Some(to_usize(extract.max_bytes_per_file)),
+        max_chars: Some(to_usize(extract.max_chars_per_file)),
+    })
 }

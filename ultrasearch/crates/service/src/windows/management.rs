@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use windows_service::{
     service::{
-        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType,
-        ServiceState, ServiceType,
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState,
+        ServiceType,
     },
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
@@ -18,8 +18,11 @@ const SERVICE_DESC: &str = "Indexes files and provides fast search capabilities 
 
 pub fn install_service() -> Result<()> {
     let exe_path = env::current_exe().context("failed to get current executable path")?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)
-        .context("failed to connect to service manager")?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .context("failed to connect to service manager")?;
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -35,11 +38,10 @@ pub fn install_service() -> Result<()> {
     };
 
     // We request CHANGE_CONFIG access on the returned handle so we can set the description immediately.
-    let service = manager.create_service(
-        &service_info,
-        ServiceAccess::CHANGE_CONFIG,
-    ).context("failed to create service")?;
-    
+    let service = manager
+        .create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
+        .context("failed to create service")?;
+
     // Set description
     if let Err(e) = service.set_description(SERVICE_DESC) {
         eprintln!("Warning: Failed to set service description: {}", e);
@@ -56,10 +58,9 @@ pub fn uninstall_service() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("failed to connect to service manager")?;
 
-    let service = manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::DELETE,
-    ).context("failed to open service (does it exist?)")?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::DELETE)
+        .context("failed to open service (does it exist?)")?;
 
     service.delete().context("failed to delete service")?;
 
@@ -71,10 +72,12 @@ pub fn start_service() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("failed to connect to service manager")?;
 
-    let service = manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::START | ServiceAccess::QUERY_STATUS,
-    ).context("failed to open service")?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+        )
+        .context("failed to open service")?;
 
     let status = service.query_status()?;
     if status.current_state == ServiceState::Running {
@@ -82,10 +85,12 @@ pub fn start_service() -> Result<()> {
         return Ok(());
     }
 
-    service.start::<&str>(&[]).context("failed to start service")?;
+    service
+        .start::<&str>(&[])
+        .context("failed to start service")?;
 
     println!("Service '{}' starting...", SERVICE_NAME);
-    
+
     // Wait for it to run
     for _ in 0..30 {
         thread::sleep(Duration::from_millis(500));
@@ -95,7 +100,7 @@ pub fn start_service() -> Result<()> {
             return Ok(());
         }
     }
-    
+
     println!("Service start initiated, but did not reach 'Running' state within timeout.");
     Ok(())
 }
@@ -104,20 +109,22 @@ pub fn stop_service() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("failed to connect to service manager")?;
 
-    let service = manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
-    ).context("failed to open service")?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+        )
+        .context("failed to open service")?;
 
     let status = service.query_status()?;
     if status.current_state == ServiceState::Stopped {
-         println!("Service is already stopped.");
-         return Ok(());
+        println!("Service is already stopped.");
+        return Ok(());
     }
 
     service.stop().context("failed to stop service")?;
     println!("Service '{}' stopping...", SERVICE_NAME);
-    
+
     for _ in 0..30 {
         thread::sleep(Duration::from_millis(500));
         let status = service.query_status()?;

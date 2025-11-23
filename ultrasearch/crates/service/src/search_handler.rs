@@ -45,13 +45,19 @@ pub struct UnifiedSearchHandler {
 
 impl UnifiedSearchHandler {
     pub fn try_new(meta_path: &Path, content_path: &Path) -> Result<Self> {
-        tracing::info!("UnifiedSearchHandler: opening meta index at {:?}", meta_path);
+        tracing::info!(
+            "UnifiedSearchHandler: opening meta index at {:?}",
+            meta_path
+        );
         let meta = open_or_create_index(meta_path)?;
         let meta_reader = open_reader(&meta)?;
 
         let content = match open_content(content_path) {
             Ok(idx) => {
-                tracing::info!("UnifiedSearchHandler: opened content index at {:?}", content_path);
+                tracing::info!(
+                    "UnifiedSearchHandler: opened content index at {:?}",
+                    content_path
+                );
                 let reader = content_index::open_reader(&idx)?;
                 Some((idx, reader))
             }
@@ -261,7 +267,7 @@ impl UnifiedSearchHandler {
                 return StubSearchHandler.search(req.clone());
             }
         };
-        
+
         tracing::info!("executing meta query: {:?}", query);
 
         let top_k = limit.saturating_add(offset);
@@ -272,8 +278,12 @@ impl UnifiedSearchHandler {
                 return StubSearchHandler.search(req.clone());
             }
         };
-        
-        tracing::info!("meta search found {} total hits (returned {})", total, hits.len());
+
+        tracing::info!(
+            "meta search found {} total hits (returned {})",
+            total,
+            hits.len()
+        );
 
         let out = hits
             .into_iter()
