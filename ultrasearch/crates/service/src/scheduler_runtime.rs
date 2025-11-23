@@ -162,7 +162,12 @@ impl SchedulerRuntime {
             "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={} enqueued={}",
             idle_sample.state, load.cpu_percent, load.mem_used_percent, ct, dropped, enqueued
         ));
-        update_status_queue_state(Some(ct as u64), Some(workers));
+        update_status_queue_state(
+            Some(ct as u64),
+            Some(workers),
+            Some(self.live.enqueued_content.load(Ordering::Relaxed) as u64),
+            Some(self.live.dropped_content.load(Ordering::Relaxed) as u64),
+        );
         update_status_metrics(None);
 
         // Gate metadata/content on policies; we only have content jobs for now.

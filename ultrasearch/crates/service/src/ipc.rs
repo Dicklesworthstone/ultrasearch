@@ -199,17 +199,20 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
     if let Some(req) = deserialize_exact::<StatusRequest>(payload) {
         let started = Instant::now();
         let snap = status_snapshot();
-        let empty_metrics =
-            snap.metrics.or(
-                global_metrics_snapshot(Some(0), Some(0)).or(Some(MetricsSnapshot {
+        let empty_metrics = snap.metrics.or(
+            global_metrics_snapshot(Some(0), Some(0), Some(0), Some(0)).or(Some(
+                MetricsSnapshot {
                     search_latency_ms_p50: None,
                     search_latency_ms_p95: None,
                     worker_cpu_pct: None,
                     worker_mem_bytes: None,
                     queue_depth: Some(0),
                     active_workers: Some(0),
-                })),
-            );
+                    content_enqueued: Some(0),
+                    content_dropped: Some(0),
+                },
+            )),
+        );
         let resp = make_status_response(
             req.id,
             snap.volumes,

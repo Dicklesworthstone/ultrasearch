@@ -40,7 +40,7 @@ pub fn status_snapshot() -> StatusSnapshot {
     StatusSnapshot {
         volumes: Vec::new(),
         scheduler_state: "initializing".to_string(),
-        metrics: global_metrics_snapshot(Some(0), Some(0)),
+        metrics: global_metrics_snapshot(Some(0), Some(0), Some(0), Some(0)),
         last_index_commit_ts: None,
     }
 }
@@ -64,9 +64,14 @@ pub fn update_status_metrics(metrics: Option<MetricsSnapshot>) {
     }
 }
 
-pub fn update_status_queue_state(queue_depth: Option<u64>, active_workers: Option<u32>) {
+pub fn update_status_queue_state(
+    queue_depth: Option<u64>,
+    active_workers: Option<u32>,
+    content_enqueued: Option<u64>,
+    content_dropped: Option<u64>,
+) {
     if let Some(p) = BASIC_PROVIDER.get() {
-        p.update_queue_state(queue_depth, active_workers);
+        p.update_queue_state(queue_depth, active_workers, content_enqueued, content_dropped);
     }
 }
 
@@ -88,7 +93,7 @@ impl BasicStatusProvider {
             state: RwLock::new(StatusSnapshot {
                 volumes: Vec::new(),
                 scheduler_state: "unknown".into(),
-                metrics: global_metrics_snapshot(Some(0), Some(0)),
+                metrics: global_metrics_snapshot(Some(0), Some(0), Some(0), Some(0)),
                 last_index_commit_ts: None,
             }),
         }
@@ -112,7 +117,13 @@ impl BasicStatusProvider {
         }
     }
 
-    pub fn update_queue_state(&self, queue_depth: Option<u64>, active_workers: Option<u32>) {
+    pub fn update_queue_state(
+        &self,
+        queue_depth: Option<u64>,
+        active_workers: Option<u32>,
+        content_enqueued: Option<u64>,
+        content_dropped: Option<u64>,
+    ) {
         if let Ok(mut guard) = self.state.write() {
             let mut snap = guard.metrics.take().unwrap_or(MetricsSnapshot {
                 search_latency_ms_p50: None,
@@ -121,9 +132,13 @@ impl BasicStatusProvider {
                 worker_mem_bytes: None,
                 queue_depth: None,
                 active_workers: None,
+                content_enqueued: None,
+                content_dropped: None,
             });
             snap.queue_depth = queue_depth;
             snap.active_workers = active_workers;
+            snap.content_enqueued = content_enqueued;
+            snap.content_dropped = content_dropped;
             guard.metrics = Some(snap);
         }
     }
@@ -143,7 +158,7 @@ impl StatusProvider for BasicStatusProvider {
             .unwrap_or_else(|_| StatusSnapshot {
                 volumes: Vec::new(),
                 scheduler_state: "initializing".into(),
-                metrics: global_metrics_snapshot(Some(0), Some(0)),
+                metrics: global_metrics_snapshot(Some(0), Some(0), Some(0), Some(0)),
                 last_index_commit_ts: None,
             })
     }

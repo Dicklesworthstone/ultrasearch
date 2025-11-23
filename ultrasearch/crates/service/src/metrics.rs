@@ -25,6 +25,8 @@ pub struct ServiceMetricsSnapshot {
     pub worker_failures: u64,
     pub queue_depth: Option<u64>,
     pub active_workers: Option<u32>,
+    pub content_enqueued: Option<u64>,
+    pub content_dropped: Option<u64>,
 }
 
 impl ServiceMetrics {
@@ -89,6 +91,8 @@ impl ServiceMetrics {
         &self,
         queue_depth: Option<u64>,
         active_workers: Option<u32>,
+        content_enqueued: Option<u64>,
+        content_dropped: Option<u64>,
     ) -> ServiceMetricsSnapshot {
         ServiceMetricsSnapshot {
             search_latency_ms_p50: None,
@@ -96,6 +100,8 @@ impl ServiceMetrics {
             worker_failures: self.worker_failures.get(),
             queue_depth,
             active_workers,
+            content_enqueued,
+            content_dropped,
         }
     }
 
@@ -108,6 +114,8 @@ impl ServiceMetrics {
             worker_failures: self.worker_failures.get(),
             queue_depth: None,
             active_workers: None,
+            content_enqueued: None,
+            content_dropped: None,
         }
     }
 }
@@ -141,9 +149,12 @@ pub fn with_global_metrics<R>(func: impl FnOnce(&ServiceMetrics) -> R) -> Option
 pub fn global_metrics_snapshot(
     queue_depth: Option<u64>,
     active_workers: Option<u32>,
+    content_enqueued: Option<u64>,
+    content_dropped: Option<u64>,
 ) -> Option<MetricsSnapshot> {
     with_global_metrics(|m| {
-        let snap = m.snapshot_with_queue_state(queue_depth, active_workers);
+        let snap =
+            m.snapshot_with_queue_state(queue_depth, active_workers, content_enqueued, content_dropped);
         MetricsSnapshot {
             search_latency_ms_p50: snap.search_latency_ms_p50,
             search_latency_ms_p95: snap.search_latency_ms_p95,
@@ -151,6 +162,8 @@ pub fn global_metrics_snapshot(
             worker_mem_bytes: None,
             queue_depth: snap.queue_depth,
             active_workers: snap.active_workers,
+            content_enqueued: snap.content_enqueued,
+            content_dropped: snap.content_dropped,
         }
     })
 }
