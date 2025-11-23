@@ -1,8 +1,8 @@
 use crate::actions::CloseShortcuts;
 use crate::theme;
+use chrono::{DateTime, Local};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use chrono::{DateTime, Local};
 
 /// Full-screen overlay that provides a rich help + shortcuts experience.
 pub struct HelpPanel {
@@ -20,7 +20,11 @@ impl HelpPanel {
         let docs_updated = std::fs::metadata(docs_path)
             .and_then(|m| m.modified())
             .ok()
-            .map(|ts| DateTime::<Local>::from(ts).format("%Y-%m-%d %H:%M").to_string());
+            .map(|ts| {
+                DateTime::<Local>::from(ts)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            });
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -172,6 +176,47 @@ impl Render for HelpPanel {
 
         let no_results = sections.is_empty() && !self.filter.trim().is_empty();
 
+        let render_markdown = |text: &str| {
+            let mut nodes: Vec<Div> = Vec::new();
+            for line in text.lines() {
+                if let Some(stripped) = line.strip_prefix("# ") {
+                    nodes.push(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(colors.text_primary)
+                            .child(stripped.trim().to_owned()),
+                    );
+                } else if let Some(stripped) = line.strip_prefix("## ") {
+                    nodes.push(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.text_primary)
+                            .child(stripped.trim().to_owned()),
+                    );
+                } else if let Some(stripped) = line.strip_prefix("- ") {
+                    nodes.push(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(colors.text_primary)
+                            .child("•")
+                            .child(stripped.trim().to_owned()),
+                    );
+                } else {
+                    nodes.push(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(colors.text_secondary)
+                            .child(line.to_owned()),
+                    );
+                }
+            }
+            nodes
+        };
+
         let filter_input = div()
             .track_focus(&self.filter_focus)
             .px_3()
@@ -314,7 +359,7 @@ impl Render for HelpPanel {
                                 div()
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::BOLD)
-                                    .child("Features (from docs/FEATURES.md)"),
+                                    .child("Features (docs/FEATURES.md)"),
                             )
                             .child(
                                 div()
@@ -335,14 +380,14 @@ impl Render for HelpPanel {
                                     .bg(colors.bg)
                                     .border_1()
                                     .border_color(colors.border)
-                                    .text_size(px(12.))
-                                    .text_color(colors.text_primary)
-                                    .whitespace_nowrap()
-                                    .child(
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .children(render_markdown(
                                         self.docs
-                                            .clone()
-                                            .unwrap_or_else(|| "docs/FEATURES.md not found.".into()),
-                                    ),
+                                            .as_deref()
+                                            .unwrap_or("docs/FEATURES.md not found."),
+                                    )),
                             ),
                     )
                     .child(
