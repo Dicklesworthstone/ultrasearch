@@ -2,6 +2,7 @@ use crate::actions::CloseShortcuts;
 use crate::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use chrono::{DateTime, Local};
 
 /// Full-screen overlay that provides a rich help + shortcuts experience.
 pub struct HelpPanel {
@@ -19,8 +20,7 @@ impl HelpPanel {
         let docs_updated = std::fs::metadata(docs_path)
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| format!("Updated on: {}s since epoch", d.as_secs()));
+            .map(|ts| DateTime::<Local>::from(ts).format("%Y-%m-%d %H:%M").to_string());
 
         Self {
             focus_handle: cx.focus_handle(),
