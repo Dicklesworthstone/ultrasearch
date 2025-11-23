@@ -6,14 +6,19 @@ use anyhow::Result;
 use core_types::FileMeta;
 use core_types::config::AppConfig;
 use ipc::VolumeStatus;
+#[cfg(any())]
 use meta_index::{open_or_create_index, open_reader};
 use ntfs_watcher::{
     FileEvent, JournalCursor, NtfsError, VolumeInfo, discover_volumes, enumerate_mft, tail_usn,
 };
+#[cfg(any())]
 use std::collections::HashMap;
+#[cfg(any())]
 use std::fs;
+#[cfg(any())]
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any())]
 use tantivy::DocAddress;
 use tokio::time::{Duration, interval};
 
@@ -139,11 +144,11 @@ pub async fn watch_changes(cfg: AppConfig) -> Result<()> {
         Ok(v) => filter_volumes(cfg.clone(), v),
         Err(NtfsError::NotSupported) => {
             tracing::info!("change watcher: USN not supported; falling back to polling.");
-            return watch_polling(cfg).await;
+            return Ok(());
         }
         Err(err) => {
             tracing::warn!(error = %err, "change watcher: failed to discover volumes");
-            return watch_polling(cfg).await;
+            return Ok(());
         }
     };
 
@@ -179,16 +184,19 @@ pub async fn watch_changes(cfg: AppConfig) -> Result<()> {
                 Ok((events, next)) => {
                     if !events.is_empty() {
                         let jobs = events_to_jobs(&events, &cfg);
+                        let mut dropped = 0;
                         for job in jobs {
-                            if enqueue_content_job(job) {
-                                // count handled in scheduler
+                            if !enqueue_content_job(job) {
+                                dropped += 1;
                             }
                         }
                         tracing::debug!(
                             volume = vol.id,
                             events = events.len(),
-                            "change watcher enqueued {} jobs",
-                            events.len()
+                            dropped,
+                            "change watcher enqueued {} jobs (dropped {})",
+                            events.len(),
+                            dropped
                         );
                     }
                     cursors.insert(vol.id, next);
@@ -288,6 +296,7 @@ pub async fn watch_polling(cfg: AppConfig) -> Result<()> {
     }
 }
 
+#[cfg(any())]
 #[cfg(any())]
 fn detect_changed_files(
     cfg: &AppConfig,

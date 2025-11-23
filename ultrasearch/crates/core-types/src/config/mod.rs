@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub semantic: SemanticSection,
     #[serde(default)]
     pub volumes: Vec<String>,
+    #[serde(default)]
+    pub content_index_volumes: Vec<String>,
 }
 
 /// Load config, creating a default config file if none exists at the target path.
@@ -63,6 +65,7 @@ impl Default for AppConfig {
             extract: ExtractSection::default(),
             semantic: SemanticSection::default(),
             volumes: Vec::new(),
+            content_index_volumes: Vec::new(),
         }
     }
 }
@@ -74,6 +77,8 @@ pub struct AppSection {
     pub product_uid: String,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    #[serde(default)]
+    pub telemetry_opt_in: bool,
 }
 
 impl Default for AppSection {
@@ -81,6 +86,7 @@ impl Default for AppSection {
         Self {
             product_uid: default_product_uid(),
             data_dir: default_data_dir(),
+            telemetry_opt_in: false,
         }
     }
 }
@@ -530,6 +536,8 @@ mod tests {
         base.paths = override_cfg.paths;
         base.extract = override_cfg.extract;
         base.semantic = override_cfg.semantic;
+        base.volumes = override_cfg.volumes;
+        base.content_index_volumes = override_cfg.content_index_volumes;
         base
     }
 

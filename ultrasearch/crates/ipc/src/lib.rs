@@ -280,6 +280,10 @@ pub struct MetricsSnapshot {
     pub worker_mem_bytes: Option<u64>,
     pub queue_depth: Option<u64>,
     pub active_workers: Option<u32>,
+    /// Total content jobs enqueued since startup (best-effort).
+    pub content_enqueued: Option<u64>,
+    /// Total content jobs dropped due to backpressure or missing scheduler (best-effort).
+    pub content_dropped: Option<u64>,
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ struct SchedulerLiveState {
     content: AtomicUsize,
     active_workers: AtomicU32,
     dropped_content: AtomicUsize,
+    enqueued_content: AtomicUsize,
 }
 
 static LIVE_STATE: OnceLock<SchedulerLiveState> = OnceLock::new();
@@ -155,13 +156,11 @@ impl SchedulerRuntime {
         // Update status snapshot counts + active workers.
         let ct = self.content_jobs.len();
         let workers = self.live.active_workers.load(Ordering::Relaxed);
+        let dropped = self.live.dropped_content.load(Ordering::Relaxed);
+        let enqueued = self.live.enqueued_content.load(Ordering::Relaxed);
         update_status_scheduler_state(format!(
-            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={}",
-            idle_sample.state,
-            load.cpu_percent,
-            load.mem_used_percent,
-            ct,
-            self.live.dropped_content.load(Ordering::Relaxed)
+            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={} enqueued={}",
+            idle_sample.state, load.cpu_percent, load.mem_used_percent, ct, dropped, enqueued
         ));
         update_status_queue_state(Some(ct as u64), Some(workers));
         update_status_metrics(None);
@@ -207,6 +206,7 @@ impl SchedulerRuntime {
             return;
         }
         self.content_jobs.push_back(job);
+        self.live.enqueued_content.fetch_add(1, Ordering::Relaxed);
         self.update_live_counts();
     }
 }
@@ -215,9 +215,19 @@ impl SchedulerRuntime {
 /// Returns `false` if the scheduler has not been initialized yet.
 pub fn enqueue_content_job(job: JobSpec) -> bool {
     match JOB_SENDER.get() {
-        Some(tx) => tx.send(job).is_ok(),
+        Some(tx) => {
+            if tx.send(job).is_ok() {
+                true
+            } else {
+                let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
+                live.dropped_content.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
         None => {
             tracing::warn!("scheduler not initialized; dropping content job");
+            let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
+            live.dropped_content.fetch_add(1, Ordering::Relaxed);
             false
         }
     }
