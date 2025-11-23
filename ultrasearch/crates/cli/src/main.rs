@@ -153,6 +153,12 @@ fn print_status_response(resp: &StatusResponse) -> Result<()> {
             "    Active Workers: {}",
             metrics.active_workers.unwrap_or(0)
         );
+        if let Some(enq) = metrics.content_enqueued {
+            println!("    Content Jobs Enqueued: {}", enq);
+        }
+        if let Some(drop) = metrics.content_dropped {
+            println!("    Content Jobs Dropped: {}", drop);
+        }
     }
 
     println!(
@@ -228,6 +234,8 @@ async fn stub_status(req: StatusRequest) -> Result<StatusResponse> {
             worker_mem_bytes: None,
             queue_depth: Some(0),
             active_workers: Some(0),
+            content_enqueued: Some(0),
+            content_dropped: Some(0),
         }),
         served_by: Some("cli-linux-stub".into()),
     })
