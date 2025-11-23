@@ -31,27 +31,26 @@ impl OnboardingView {
         let mut fixed_ntfs_found = 0usize;
         for disk in sys_disks.list() {
             let mount = disk.mount_point().to_string_lossy().to_string();
-            let fs = String::from_utf8_lossy(disk.file_system()).to_string();
-            let is_fixed = matches!(disk.kind(), DiskKind::HDD | DiskKind::SSD | DiskKind::Unknown(-1));
+            let fs = disk.file_system().to_string_lossy().to_string();
+            let is_fixed = matches!(disk.kind(), DiskKind::HDD | DiskKind::SSD);
             let is_ntfs = fs.eq_ignore_ascii_case("ntfs");
             if is_fixed && is_ntfs {
                 fixed_ntfs_found += 1;
                 drives.push(DriveChoice {
                     name: mount.clone(),
-                    label: format!("{mount} • NTFS"),
+                    label: format!("{mount} - NTFS"),
                     selected: true,
                     content_indexing: true,
                 });
             }
         }
 
-        // Fallback: if no fixed NTFS drives detected, show everything we found
         if fixed_ntfs_found == 0 {
             drives.clear();
             for disk in sys_disks.list() {
                 let mount = disk.mount_point().to_string_lossy().to_string();
-                let fs = String::from_utf8_lossy(disk.file_system()).to_string();
-                let label = format!("{mount} • {}", fs.to_uppercase());
+                let fs = disk.file_system().to_string_lossy().to_string();
+                let label = format!("{mount} - {}", fs.to_uppercase());
                 drives.push(DriveChoice {
                     name: mount,
                     label,
@@ -155,14 +154,22 @@ impl OnboardingView {
                             .w(px(20.))
                             .h(px(20.))
                             .rounded_full()
-                            .bg(if active { colors.match_highlight } else { colors.border })
+                            .bg(if active {
+                                colors.match_highlight
+                            } else {
+                                colors.border
+                            })
                             .border_1()
                             .border_color(colors.border)
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(12.))
-                            .text_color(if active { colors.bg } else { colors.text_primary })
+                            .text_color(if active {
+                                colors.bg
+                            } else {
+                                colors.text_primary
+                            })
                             .child(format!("{}", i + 1)),
                     )
                     .child(
@@ -202,7 +209,11 @@ impl OnboardingView {
                 } else {
                     colors.border
                 })
-                .bg(if checked { colors.match_highlight } else { colors.panel_bg })
+                .bg(if checked {
+                    colors.match_highlight
+                } else {
+                    colors.panel_bg
+                })
         };
 
         let toggle = |checked: bool| {
@@ -211,7 +222,11 @@ impl OnboardingView {
                 .w(px(38.))
                 .h(px(20.))
                 .rounded_full()
-                .bg(if checked { colors.match_highlight } else { colors.border })
+                .bg(if checked {
+                    colors.match_highlight
+                } else {
+                    colors.border
+                })
                 .child(
                     div()
                         .absolute()
@@ -247,9 +262,12 @@ impl OnboardingView {
                     .child(
                         div()
                             .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                this.toggle_drive(index, cx);
-                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_drive(index, cx);
+                                }),
+                            )
                             .child(checkbox(drive.selected)),
                     )
                     .child(
@@ -263,7 +281,9 @@ impl OnboardingView {
                                 div()
                                     .text_size(px(11.))
                                     .text_color(colors.text_secondary)
-                                    .child("Fixed NTFS drives recommended for USN + content indexing."),
+                                    .child(
+                                        "Fixed NTFS drives recommended for USN + content indexing.",
+                                    ),
                             ),
                     ),
             )
@@ -281,10 +301,13 @@ impl OnboardingView {
                     .child(
                         div()
                             .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                this.toggle_content(index, cx);
-                            }))
                             .relative()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_content(index, cx);
+                                }),
+                            )
                             .child(toggle(drive.content_indexing)),
                     ),
             )
@@ -295,51 +318,94 @@ impl Render for OnboardingView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::active_colors(cx);
 
+        let drives = self
+            .drives
+            .iter()
+            .enumerate()
+            .map(|(i, d)| self.render_drive_row(i, d, cx))
+            .collect::<Vec<_>>();
+        let selected_count = self.drives.iter().filter(|d| d.selected).count();
+
         let body = match self.step {
             0 => div()
                 .flex()
                 .flex_col()
-                .gap_3()
-                .child(div().text_size(px(26.)).font_weight(FontWeight::BOLD).child("Welcome to UltraSearch"))
-                .child(div().text_size(px(14.)).text_color(colors.text_secondary).child(
-                    "UltraSearch provides instant filename search and deep content indexing, while staying light on resources.",
-                ))
+                .gap_4()
+                .child(
+                    div()
+                        .text_size(px(28.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("Welcome to UltraSearch"),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(colors.text_secondary)
+                        .child(
+                            "UltraSearch blends lightning-fast filename search with deep content indexing, native UI polish, and background-friendly resource use.",
+                        ),
+                )
                 .child(
                     div()
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
-                        .child("We’ll guide you through a quick setup: choose drives, privacy, and start indexing."),
+                        .child("This three-step setup picks your drives, privacy stance, and starts the first index run."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(colors.panel_bg)
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(colors.text_secondary)
+                                        .child("Tip: You can re-open this wizard later from Settings if you change drives."),
+                                ),
+                        ),
                 ),
-            1 => {
-                let drives = self
-                    .drives
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| self.render_drive_row(i, d, cx))
-                    .collect::<Vec<_>>();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).child("Choose what to index"))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(colors.text_secondary)
-                            .child("Left-click toggles drive inclusion; right-click toggles content indexing."),
-                    )
-                    .child(div().flex().flex_col().gap_2().children(drives))
-            }
-            2 => div()
+            1 => div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).child("Privacy & Start"))
+                .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).child("Choose what to index"))
                 .child(
                     div()
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
-                        .child("We only store index data locally. No telemetry is sent unless you opt in."),
+                        .child("Fixed NTFS drives are preferred for USN journaling and content indexing. Toggle drives and content per-volume."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(if drives.is_empty() {
+                            div()
+                                .text_color(colors.text_secondary)
+                                .text_size(px(12.))
+                                .child("No drives detected. Connect a drive or continue to start with an empty set.")
+                        } else {
+                            div().children(drives)
+                        }),
+                ),
+            2 => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).child("Privacy & Start"))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(colors.text_secondary)
+                        .child("Index data stays local. We only send anonymous diagnostics if you opt in."),
                 )
                 .child(
                     div()
@@ -348,8 +414,8 @@ impl Render for OnboardingView {
                         .gap_2()
                         .child(
                             div()
-                                .w(px(18.))
-                                .h(px(18.))
+                                .w(px(20.))
+                                .h(px(20.))
                                 .rounded_md()
                                 .border_1()
                                 .border_color(colors.border)
@@ -358,6 +424,7 @@ impl Render for OnboardingView {
                                 } else {
                                     colors.panel_bg
                                 })
+                                .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                     this.privacy_opt_in = !this.privacy_opt_in;
                                     cx.notify();
@@ -374,9 +441,7 @@ impl Render for OnboardingView {
                     div()
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
-                        .child(
-                            "Click \u{201c}Start indexing\u{201d} to save your choices and begin the first scan.",
-                        ),
+                        .child("Click \"Start indexing\" to save your choices and kick off the first scan immediately."),
                 ),
             _ => div().child("Done"),
         };
@@ -389,6 +454,7 @@ impl Render for OnboardingView {
         };
 
         let can_go_back = self.step > 0;
+        let disable_primary = self.step == 2 && selected_count == 0;
 
         div()
             .track_focus(&self.focus_handle)
@@ -439,14 +505,28 @@ impl Render for OnboardingView {
                                     .px_5()
                                     .py_2()
                                     .rounded_md()
-                                    .bg(colors.match_highlight)
-                                    .text_color(colors.bg)
+                                    .bg(if disable_primary {
+                                        colors.border
+                                    } else {
+                                        colors.match_highlight
+                                    })
+                                    .text_color(if disable_primary {
+                                        colors.text_secondary
+                                    } else {
+                                        colors.bg
+                                    })
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .opacity(if disable_primary { 0.7 } else { 1.0 })
                                     .cursor_pointer()
                                     .child(primary_label)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
+                                            if this.step == 2
+                                                && this.drives.iter().all(|d| !d.selected)
+                                            {
+                                                return;
+                                            }
                                             this.next_step(cx);
                                         }),
                                     ),

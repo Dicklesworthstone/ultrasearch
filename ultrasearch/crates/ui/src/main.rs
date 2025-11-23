@@ -457,9 +457,7 @@ impl Render for UltraSearchWindow {
                 )
             })
             // Shortcut overlay
-            .when(show_shortcuts, |this| {
-                this.child(self.help_panel.clone())
-            })
+            .when(show_shortcuts, |this| this.child(self.help_panel.clone()))
             .when(conflict.is_some(), |this| {
                 let msg = conflict
                     .clone()
@@ -562,6 +560,11 @@ fn main() {
                                 ui::background::UserAction::Show => {
                                     // Activate app (bring to front)
                                     let _ = cx.update(|cx: &mut App| cx.activate(true));
+                                }
+                                ui::background::UserAction::ShowHelp => {
+                                    let _ = cx.update(|cx: &mut App| {
+                                        cx.dispatch_action(&ToggleShortcuts)
+                                    });
                                 }
                                 ui::background::UserAction::Quit => {
                                     // Quit app

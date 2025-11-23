@@ -277,6 +277,7 @@ impl Render for SearchView {
         let model = self.model.read(cx);
         let status = model.status.clone();
         let query = model.query.clone();
+        let ipc_recovered = model.ipc_recent_reconnect;
         let colors = theme::active_colors(cx);
 
         // Keep local text in sync if model was changed externally.
@@ -503,6 +504,25 @@ impl Render for SearchView {
                     ),
             )
             .child(
+                // Inline helper tips
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_size(px(11.))
+                    .text_color(colors.text_secondary)
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child("Name = fastest filenames")
+                            .child("Mixed = filenames + top snippets")
+                            .child("Content = full-text, richest results")
+                            .child(
+                                "Copy path: Ctrl/Cmd+C | Copy file: Ctrl+Shift+C | Properties: Alt+Enter",
+                            ),
+                    ),
+            )
+            .child(
                 // Status bar with elegant information display
                 div()
                     .flex()
@@ -584,6 +604,21 @@ impl Render for SearchView {
                                     }),
                             ),
                     )
+                    .when(ipc_recovered, |this| {
+                        this.child(
+                            div()
+                                .ml_3()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_md()
+                                .bg(hsla(146.0, 0.444, 0.18, 0.9))
+                                .border_1()
+                                .border_color(colors.match_highlight)
+                                .text_color(colors.bg)
+                                .text_size(px(11.))
+                                .child("Reconnected to service"),
+                        )
+                    })
                     .when(!status.connected, |this| {
                         this.child(
                             div()

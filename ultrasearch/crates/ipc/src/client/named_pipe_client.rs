@@ -6,6 +6,8 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::time::{Duration, sleep};
@@ -16,6 +18,18 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 750;
 const DEFAULT_RETRIES: u32 = 5;
 const DEFAULT_BACKOFF_MS: u64 = 100;
+
+static RECONNECT_SUCCESSES: OnceLock<AtomicUsize> = OnceLock::new();
+
+fn reconnect_counter() -> &'static AtomicUsize {
+    RECONNECT_SUCCESSES.get_or_init(|| AtomicUsize::new(0))
+}
+
+/// Expose reconnect success count for telemetry/testing.
+#[allow(dead_code)]
+pub fn reconnect_success_count() -> usize {
+    reconnect_counter().load(Ordering::Relaxed)
+}
 
 /// Named-pipe IPC client for UltraSearch.
 #[derive(Debug, Clone)]
@@ -88,6 +102,7 @@ impl PipeClient {
         let mut last_err: Option<anyhow::Error> = None;
 
         while attempt <= self.retries {
+            let was_retry = attempt > 0;
             let frame = framed.clone();
             let fut = async move {
                 // Return anyhow::Result to simplify error handling.
@@ -122,7 +137,12 @@ impl PipeClient {
             };
 
             match tokio::time::timeout(self.request_timeout, fut).await {
-                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Ok(resp)) => {
+                    if was_retry {
+                        reconnect_counter().fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(resp);
+                }
                 Ok(Err(e)) => {
                     // Common reconnect cases: pipe missing (service down) or busy.
                     if let Some(code) = e

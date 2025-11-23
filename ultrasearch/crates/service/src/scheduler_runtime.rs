@@ -11,7 +11,7 @@ use scheduler::{
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task;
@@ -28,6 +28,7 @@ struct SchedulerLiveState {
 
 static LIVE_STATE: OnceLock<SchedulerLiveState> = OnceLock::new();
 static JOB_SENDER: OnceLock<mpsc::UnboundedSender<JobSpec>> = OnceLock::new();
+static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const MAX_CONTENT_QUEUE: usize = 10_000;
 
@@ -61,6 +62,8 @@ impl SchedulerRuntime {
         let (tx, rx) = mpsc::unbounded_channel();
         // Keep a global sender so producers (scanner/USN) can enqueue work from anywhere.
         let _ = JOB_SENDER.get_or_init(|| tx.clone());
+
+        RUNTIME_ACTIVE.store(true, Ordering::Relaxed);
 
         Self {
             idle: IdleTracker::new(config.warm_idle, config.deep_idle),
@@ -219,6 +222,13 @@ impl SchedulerRuntime {
 /// Enqueue a content indexing job for the scheduler loop.
 /// Returns `false` if the scheduler has not been initialized yet.
 pub fn enqueue_content_job(job: JobSpec) -> bool {
+    if !RUNTIME_ACTIVE.load(Ordering::Relaxed) {
+        tracing::warn!("scheduler not initialized; dropping content job");
+        let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
+        live.dropped_content.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
     match JOB_SENDER.get() {
         Some(tx) => {
             if tx.send(job).is_ok() {
@@ -250,6 +260,12 @@ pub fn set_live_queue_counts(critical: usize, metadata: usize, content: usize) {
     live.critical.store(critical, Ordering::Relaxed);
     live.metadata.store(metadata, Ordering::Relaxed);
     live.content.store(content, Ordering::Relaxed);
+}
+
+impl Drop for SchedulerRuntime {
+    fn drop(&mut self) {
+        RUNTIME_ACTIVE.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Convert a `FileMeta` into a `JobSpec` if it looks indexable.

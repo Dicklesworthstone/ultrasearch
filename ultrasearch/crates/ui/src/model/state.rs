@@ -94,6 +94,7 @@ pub struct SearchAppModel {
     pub hotkey_conflict: Option<String>,
     pub history: VecDeque<String>,
     pub show_shortcuts: bool,
+    pub ipc_recent_reconnect: bool,
     pub client: IpcClient,
     pub search_debounce: Option<Task<()>>,
     pub status_task: Option<Task<()>>,
@@ -117,6 +118,7 @@ impl SearchAppModel {
             hotkey_conflict: None,
             history: VecDeque::new(),
             show_shortcuts: false,
+            ipc_recent_reconnect: false,
             client,
             search_debounce: None,
             status_task: None,
@@ -152,11 +154,28 @@ impl SearchAppModel {
                                 this.update(
                                     app,
                                     |model: &mut SearchAppModel, cx: &mut Context<SearchAppModel>| {
+                                        let was_disconnected = !model.status.connected;
                                         model.status.connected = true;
                                         model.status.indexing_state = resp.scheduler_state.clone();
                                         model.status.volumes = resp.volumes;
                                         model.status.metrics = resp.metrics;
                                         model.status.served_by = resp.served_by;
+                                        if was_disconnected {
+                                            model.ipc_recent_reconnect = true;
+                                            cx.spawn(|weak: WeakEntity<SearchAppModel>, cx: &mut AsyncApp| {
+                                                let app = cx.clone();
+                                                async move {
+                                                    tokio::time::sleep(Duration::from_secs(4)).await;
+                                                    let _ = app.update(|app| {
+                                                        weak.update(app, |m, cx| {
+                                                            m.ipc_recent_reconnect = false;
+                                                            cx.notify();
+                                                        })
+                                                    });
+                                                }
+                                            })
+                                            .detach();
+                                        }
                                         model.update_tray_status();
                                         cx.notify();
                                     },
@@ -199,10 +218,12 @@ impl SearchAppModel {
                 | UpdateStatus::Downloading { .. }
                 | UpdateStatus::ReadyToRestart { .. }
         );
+        let restart_ready = matches!(self.updates.status, UpdateStatus::ReadyToRestart { .. });
         set_tray_status(TrayState {
             indexing,
             offline,
             update_available,
+            restart_ready,
         });
     }
 

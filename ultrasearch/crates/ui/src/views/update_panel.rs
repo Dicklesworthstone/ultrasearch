@@ -165,6 +165,14 @@ impl Render for UpdatePanel {
                     .into_iter()
                     .flatten(),
                 ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.text_secondary)
+                    .child(
+                        "Tip: Enable auto-checks to unlock updates. Download pulls the patch; Restart applies it and reopens UltraSearch.",
+                    ),
             );
 
         if let Some(notes) = notes {

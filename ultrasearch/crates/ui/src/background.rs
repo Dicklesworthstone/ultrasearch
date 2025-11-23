@@ -3,7 +3,7 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
-use muda::{Menu, MenuItem, PredefinedMenuItem};
+use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use once_cell::sync::OnceCell;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -16,6 +16,7 @@ pub struct TrayState {
     pub indexing: bool,
     pub offline: bool,
     pub update_available: bool,
+    pub restart_ready: bool,
 }
 
 static TRAY_STATE_TX: OnceCell<Sender<TrayState>> = OnceCell::new();
@@ -29,6 +30,7 @@ pub fn set_tray_status(state: TrayState) {
 
 pub enum UserAction {
     Show,
+    ShowHelp,
     Quit,
     ToggleQuickSearch,
     HotkeyConflict { powertoys: bool },
@@ -60,16 +62,29 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
             // --- Tray ---
             let menu = Menu::new();
             let show_item = MenuItem::new("Show UltraSearch", true, None);
-            let check_updates_item = MenuItem::new("Check for Updates", true, None);
-            let restart_item = MenuItem::new("Restart to Update", true, None);
-            let quit_item = MenuItem::new("Quit", true, None);
+            let status_indexing = CheckMenuItem::new("🔄 Indexing", true, false, None);
+            let status_offline = CheckMenuItem::new("⚠ Offline", true, false, None);
+            let status_update = CheckMenuItem::new("⬆ Update available", true, false, None);
+            let help_item = MenuItem::new("❓ Help / Shortcuts", true, None);
+            let check_updates_item = MenuItem::new("🔍 Check for Updates", true, None);
+            let restart_item = MenuItem::new("↻ Restart to Update", true, None);
+            let quit_item = MenuItem::new("✕ Quit", true, None);
             let _ = menu.append_items(&[
                 &show_item,
+                &status_indexing,
+                &status_offline,
+                &status_update,
+                &help_item,
                 &check_updates_item,
                 &restart_item,
                 &PredefinedMenuItem::separator(),
                 &quit_item,
             ]);
+            // Status indicators are informational only
+            status_indexing.set_enabled(false);
+            status_offline.set_enabled(false);
+            status_update.set_enabled(false);
+            restart_item.set_enabled(false);
 
             let width = 32u32;
             let height = 32u32;
@@ -87,6 +102,7 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
                 .unwrap();
 
             let show_id = show_item.id().clone();
+            let help_id = help_item.id().clone();
             let check_id = check_updates_item.id().clone();
             let restart_id = restart_item.id().clone();
             let quit_id = quit_item.id().clone();
@@ -98,21 +114,27 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
                 // Tray status updates
                 if let Ok(state) = status_rx.try_recv() {
                     let tooltip = if state.offline {
-                        "UltraSearch — Offline"
+                        "UltraSearch - Offline"
                     } else if state.update_available {
-                        "UltraSearch — Update available"
+                        "UltraSearch - Update available"
                     } else if state.indexing {
                         "UltraSearch — Indexing"
                     } else {
-                        "UltraSearch — Idle"
+                        "UltraSearch - Idle"
                     };
                     let _ = tray_icon.set_tooltip(Some(tooltip));
+                    status_indexing.set_checked(state.indexing);
+                    status_offline.set_checked(state.offline);
+                    status_update.set_checked(state.update_available);
+                    restart_item.set_enabled(state.restart_ready);
                 }
 
                 // Menu
                 if let Ok(event) = menu_rx.try_recv() {
                     if event.id == show_id {
                         let _ = tx_clone.send(UserAction::Show);
+                    } else if event.id == help_id {
+                        let _ = tx_clone.send(UserAction::ShowHelp);
                     } else if event.id == check_id {
                         let _ = tx_clone.send(UserAction::CheckUpdates);
                     } else if event.id == restart_id {
