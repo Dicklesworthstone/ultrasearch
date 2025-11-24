@@ -116,7 +116,7 @@ jobs:
           if (-not $wixRoot) { throw "WiX Toolset not found after install" }
           "WIX=$($wixRoot.FullName)\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install cargo-wix
-        run: cargo install cargo-wix --locked
+        run: cargo install --git https://github.com/volks73/cargo-wix --force
       - name: Build unsigned MSI (ui crate)
         id: build_msi
         continue-on-error: true
