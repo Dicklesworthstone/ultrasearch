@@ -130,10 +130,11 @@ jobs:
       - name: Set MSI built output
         id: set_msi_output
         run: |
-          $built = if ("${{ steps.build_msi.outcome }}" -eq "success") { "true" } else { "false" }
+          $msiPath = Get-ChildItem ultrasearch/crates/ui/target/wix -Filter *.msi -ErrorAction SilentlyContinue
+          $built = if ($msiPath) { "true" } else { "false" }
           "msi_built=$built" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Upload MSI artifact
-        if: steps.build_msi.outcome == 'success'
+        if: steps.set_msi_output.outputs.msi_built == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ultrasearch-msi
