@@ -19,17 +19,22 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Install GraalVM CE 23 and set JAVA_HOME/GRAALVM_HOME
+      - name: Install GraalVM CE 23 (zip) and set JAVA_HOME/GRAALVM_HOME
         run: |
-          choco install graalvm-ce-java23 -y
-          $graal = Get-ChildItem "C:\Program Files\GraalVM" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $graal) { throw "GraalVM not found after install" }
+          $ErrorActionPreference = "Stop"
+          $uri = "https://download.oracle.com/graalvm/23/latest/graalvm-jdk-23_windows-x64_bin.zip"
+          $zip = "$env:TEMP\graalvm.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $zip
+          $dest = "C:\Program Files\GraalVM"
+          if (-Not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+          Expand-Archive -Force -Path $zip -DestinationPath $dest
+          $graal = Get-ChildItem $dest | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $graal) { throw "GraalVM not found after unzip" }
           $env:GRAALVM_HOME = $graal.FullName
           $env:JAVA_HOME = $env:GRAALVM_HOME
-          # Export to subsequent steps
           "GRAALVM_HOME=$env:GRAALVM_HOME" >> $env:GITHUB_ENV
           "JAVA_HOME=$env:JAVA_HOME" >> $env:GITHUB_ENV
-          "PATH=$env:GRAALVM_HOME\bin;$env:PATH" >> $env:GITHUB_PATH
+          "PATH=$env:GRAALVM_HOME\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy,rustfmt
@@ -58,16 +63,22 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Install GraalVM CE 23 and set JAVA_HOME/GRAALVM_HOME
+      - name: Install GraalVM CE 23 (zip) and set JAVA_HOME/GRAALVM_HOME
         run: |
-          choco install graalvm-ce-java23 -y
-          $graal = Get-ChildItem "C:\Program Files\GraalVM" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $graal) { throw "GraalVM not found after install" }
+          $ErrorActionPreference = "Stop"
+          $uri = "https://download.oracle.com/graalvm/23/latest/graalvm-jdk-23_windows-x64_bin.zip"
+          $zip = "$env:TEMP\graalvm.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $zip
+          $dest = "C:\Program Files\GraalVM"
+          if (-Not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+          Expand-Archive -Force -Path $zip -DestinationPath $dest
+          $graal = Get-ChildItem $dest | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $graal) { throw "GraalVM not found after unzip" }
           $env:GRAALVM_HOME = $graal.FullName
           $env:JAVA_HOME = $env:GRAALVM_HOME
           "GRAALVM_HOME=$env:GRAALVM_HOME" >> $env:GITHUB_ENV
           "JAVA_HOME=$env:JAVA_HOME" >> $env:GITHUB_ENV
-          "PATH=$env:GRAALVM_HOME\bin;$env:PATH" >> $env:GITHUB_PATH
+          "PATH=$env:GRAALVM_HOME\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy,rustfmt
@@ -111,16 +122,22 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Install GraalVM CE 23 and set JAVA_HOME/GRAALVM_HOME
+      - name: Install GraalVM CE 23 (zip) and set JAVA_HOME/GRAALVM_HOME
         run: |
-          choco install graalvm-ce-java23 -y
-          $graal = Get-ChildItem "C:\Program Files\GraalVM" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $graal) { throw "GraalVM not found after install" }
+          $ErrorActionPreference = "Stop"
+          $uri = "https://download.oracle.com/graalvm/23/latest/graalvm-jdk-23_windows-x64_bin.zip"
+          $zip = "$env:TEMP\graalvm.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $zip
+          $dest = "C:\Program Files\GraalVM"
+          if (-Not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+          Expand-Archive -Force -Path $zip -DestinationPath $dest
+          $graal = Get-ChildItem $dest | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $graal) { throw "GraalVM not found after unzip" }
           $env:GRAALVM_HOME = $graal.FullName
           $env:JAVA_HOME = $env:GRAALVM_HOME
           "GRAALVM_HOME=$env:GRAALVM_HOME" >> $env:GITHUB_ENV
           "JAVA_HOME=$env:JAVA_HOME" >> $env:GITHUB_ENV
-          "PATH=$env:GRAALVM_HOME\bin;$env:PATH" >> $env:GITHUB_PATH
+          "PATH=$env:GRAALVM_HOME\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy,rustfmt
