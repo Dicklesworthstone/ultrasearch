@@ -120,7 +120,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ultrasearch-release-bin
-          path: ultrasearch/target/release/ui.exe
+          path: target/release/ui.exe
 
   windows-e2e-smoke:
     name: Windows / E2E smoke (service + CLI)
@@ -165,10 +165,10 @@ jobs:
       - name: Build release
         run: cargo build --release
       - name: CLI help smoke
-        run: cargo run -p cli -- --help
+        run: cargo run -p cli --release -- --help
       - name: Start service in background
         run: |
-          $svc = Start-Process -FilePath "ultrasearch/target/release/service.exe" -ArgumentList "--console" -WindowStyle Hidden -PassThru
+          $svc = Start-Process -FilePath "target/release/service.exe" -ArgumentList "--console" -WindowStyle Hidden -PassThru
           $svc.Id | Out-File service.pid
       - name: Wait for IPC and run status
         run: |
@@ -177,7 +177,7 @@ jobs:
           $null = cargo run -p cli -- status --json
           Stop-Process -Id $pid
       - name: UI build presence
-        run: Test-Path ultrasearch/target/release/ui.exe | Out-Null
+        run: Test-Path target/release/ui.exe | Out-Null
 
   release-publish:
     name: Publish release artifacts
