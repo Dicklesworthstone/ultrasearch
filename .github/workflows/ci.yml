@@ -173,9 +173,9 @@ jobs:
       - name: Wait for IPC and run status
         run: |
           Start-Sleep -Seconds 3
-          $pid = Get-Content service.pid
+          $servicePid = Get-Content service.pid
           $null = cargo run -p cli -- status --json
-          Stop-Process -Id $pid
+          Stop-Process -Id $servicePid
       - name: UI build presence
         run: Test-Path target/release/ui.exe | Out-Null
 
