@@ -135,15 +135,19 @@ jobs:
         id: set_msi_output
         run: |
           $msiPath = Get-ChildItem ultrasearch/crates/ui/target/wix -Filter *.msi -Recurse -ErrorAction SilentlyContinue
-          $built = if ($msiPath) { "true" } else { "false" }
-          Write-Host "MSI found: $msiPath"
-          "msi_built=$built" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($msiPath) {
+            Write-Host "MSI found: $($msiPath.FullName)"
+            "msi_built=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host "No MSI found under ultrasearch/crates/ui/target/wix"
+            "msi_built=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
       - name: Upload MSI artifact
-        if: steps.set_msi_output.outputs.msi_built == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ultrasearch-msi
-          path: ultrasearch/crates/ui/target/wix/*.msi
+          path: ultrasearch/crates/ui/target/wix/**/*.msi
       - name: Upload release binary artifact
         uses: actions/upload-artifact@v4
         with:
