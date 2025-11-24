@@ -63,6 +63,8 @@ jobs:
     runs-on: windows-latest
     needs: [windows-tests]
     if: startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      msi_built: ${{ steps.set_msi_output.outputs.msi_built }}
     timeout-minutes: 60
     env:
       CARGO_TARGET_DIR: target
@@ -113,10 +115,18 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
       - name: Build unsigned MSI (ui crate)
+        id: build_msi
+        continue-on-error: true
         run: |
           cd ultrasearch/crates/ui
           cargo wix -p ui
+      - name: Set MSI built output
+        id: set_msi_output
+        run: |
+          $built = if ("${{ steps.build_msi.outcome }}" -eq "success") { "true" } else { "false" }
+          "msi_built=$built" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Upload MSI artifact
+        if: steps.build_msi.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ultrasearch-msi
@@ -184,6 +194,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download MSI
+        if: needs.windows-msi.outputs.msi_built == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ultrasearch-msi
@@ -194,8 +205,14 @@ jobs:
           name: ultrasearch-release-bin
           path: dist
       - name: Publish GitHub Release assets
+        if: needs.windows-msi.outputs.msi_built == 'true'
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            dist/*.msi
             dist/ui.exe
+            dist/*.msi
+      - name: Publish GitHub Release assets (no MSI)
+        if: needs.windows-msi.outputs.msi_built != 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/ui.exe
