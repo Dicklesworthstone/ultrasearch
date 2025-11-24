@@ -127,11 +127,16 @@ jobs:
         run: |
           cd ultrasearch/crates/ui
           cargo wix --manifest-path Cargo.wix.toml -p ui
+      - name: List wix outputs
+        run: |
+          Write-Host "Wix output contents:"
+          Get-ChildItem ultrasearch/crates/ui/target/wix -Recurse -ErrorAction SilentlyContinue
       - name: Set MSI built output
         id: set_msi_output
         run: |
-          $msiPath = Get-ChildItem ultrasearch/crates/ui/target/wix -Filter *.msi -ErrorAction SilentlyContinue
+          $msiPath = Get-ChildItem ultrasearch/crates/ui/target/wix -Filter *.msi -Recurse -ErrorAction SilentlyContinue
           $built = if ($msiPath) { "true" } else { "false" }
+          Write-Host "MSI found: $msiPath"
           "msi_built=$built" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Upload MSI artifact
         if: steps.set_msi_output.outputs.msi_built == 'true'
