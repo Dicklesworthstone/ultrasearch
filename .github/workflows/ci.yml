@@ -16,8 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold clang
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold clang pkg-config libglib2.0-dev
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy,rustfmt
@@ -27,7 +29,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo
           restore-keys: ${{ runner.os }}-cargo-
       - name: Cargo fmt
         run: cargo fmt --check
@@ -41,6 +43,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install macOS build deps
+        run: brew install glib
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy,rustfmt
@@ -50,7 +54,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo
           restore-keys: ${{ runner.os }}-cargo-
       - name: Cargo fmt
         run: cargo fmt --check
@@ -76,7 +80,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo
           restore-keys: ${{ runner.os }}-cargo-
       - name: Cargo fmt
         run: cargo fmt --check
