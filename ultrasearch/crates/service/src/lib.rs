@@ -68,7 +68,12 @@ mod e2e_windows_tests {
             .or_else(|_| std::env::var("ULTRASEARCH_WORKER_PATH"))
             .ok();
         if let Some(ref path) = worker_path {
-            std::env::set_var("ULTRASEARCH_WORKER_PATH", path);
+            // On nightly, `std::env::set_var` is currently marked unsafe for
+            // mutation of the process environment; we only do this in the
+            // test harness to allow the worker binary path to flow through.
+            unsafe {
+                std::env::set_var("ULTRASEARCH_WORKER_PATH", path);
+            }
         }
 
         let temp = tempdir()?;
