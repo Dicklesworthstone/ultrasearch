@@ -124,7 +124,7 @@ jobs:
       - name: Build unsigned MSI (ui crate)
         id: build_msi
         run: |
-          cd $env:GITHUB_WORKSPACE
+          cd $env:GITHUB_WORKSPACE/ultrasearch/crates/ui
           $binPath = Join-Path $env:GITHUB_WORKSPACE "target\release\ui.exe"
           if (-not (Test-Path $binPath)) {
             Write-Host "Release UI binary not found at $binPath"
@@ -132,11 +132,7 @@ jobs:
             Get-ChildItem "$env:GITHUB_WORKSPACE/target/release" -ErrorAction SilentlyContinue
             exit 1
           }
-          $manifestDir = Join-Path (Join-Path $env:GITHUB_WORKSPACE "ultrasearch\crates\ui") "wix_manifest"
-          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
-          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "ultrasearch\crates\ui\Cargo.wix.toml") (Join-Path $manifestDir "Cargo.toml") -Force
-          cd $manifestDir
-          cargo wix --bin-path "$binPath"
+          cargo wix -p ui --bin-path "$binPath"
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
