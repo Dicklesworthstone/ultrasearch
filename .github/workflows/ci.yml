@@ -123,7 +123,6 @@ jobs:
           (Get-Content Cargo.toml) -replace 'workspace\s*=\s*true', 'version = "*"' | Set-Content Cargo.wix.toml
       - name: Build unsigned MSI (ui crate)
         id: build_msi
-        continue-on-error: true
         run: |
           cd $env:GITHUB_WORKSPACE
           $binPath = Join-Path $env:GITHUB_WORKSPACE "target\release\ui.exe"
@@ -131,13 +130,13 @@ jobs:
             Write-Host "Release UI binary not found at $binPath"
             Write-Host "Available files under target/release:"
             Get-ChildItem "$env:GITHUB_WORKSPACE/target/release" -ErrorAction SilentlyContinue
-            throw "ui.exe not built; cargo wix cannot continue"
+            exit 1
           }
           $manifestDir = Join-Path (Join-Path $env:GITHUB_WORKSPACE "ultrasearch\crates\ui") "wix_manifest"
           New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "ultrasearch\crates\ui\Cargo.wix.toml") (Join-Path $manifestDir "Cargo.toml") -Force
           cd $manifestDir
-          cargo wix --bin-path "$binPath" (Join-Path $manifestDir "Cargo.toml")
+          cargo wix --bin-path "$binPath"
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
