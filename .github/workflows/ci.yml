@@ -133,7 +133,11 @@ jobs:
             Get-ChildItem "$env:GITHUB_WORKSPACE/target/release" -ErrorAction SilentlyContinue
             throw "ui.exe not built; cargo wix cannot continue"
           }
-          cargo wix -p ui --bin-path "$binPath"
+          $manifestDir = Join-Path (Join-Path $env:GITHUB_WORKSPACE "ultrasearch\crates\ui") "wix_manifest"
+          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "ultrasearch\crates\ui\Cargo.wix.toml") (Join-Path $manifestDir "Cargo.toml") -Force
+          cd $manifestDir
+          cargo wix --bin-path "$binPath" (Join-Path $manifestDir "Cargo.toml")
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
