@@ -135,11 +135,14 @@ jobs:
             Get-ChildItem "$env:CARGO_TARGET_DIR/release" -ErrorAction SilentlyContinue
             exit 1
           }
-          $tempManifest = Join-Path (Get-Location) "Cargo.wix.build.toml"
-          (Get-Content Cargo.toml) -replace 'workspace\s*=\s*true', 'version = "*"' | Set-Content $tempManifest
+          $tempDir = Join-Path $env:RUNNER_TEMP "wix_build_manifest"
+          New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+          $tempManifest = Join-Path $tempDir "Cargo.toml"
+          (Get-Content Cargo.wix.toml) -replace 'workspace\s*=\s*true', 'version = "*"' | Set-Content $tempManifest
+          cd $tempDir
           Write-Host "Before wix, wix dir listing:"
           Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
-          cargo wix -p ui --manifest-path $tempManifest --no-build --bin-path "$binPath"
+          cargo wix --bin-path "$binPath"
           Write-Host "After wix, wix dir listing:"
           Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
       - name: List wix outputs
