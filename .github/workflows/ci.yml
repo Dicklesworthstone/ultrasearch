@@ -133,7 +133,7 @@ jobs:
             Get-ChildItem "$env:GITHUB_WORKSPACE/target/release" -ErrorAction SilentlyContinue
             throw "ui.exe not built; cargo wix cannot continue"
           }
-          cargo --manifest-path Cargo.wix.toml wix --bin-path "$binPath"
+          cargo wix --bin-path "$binPath"
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
