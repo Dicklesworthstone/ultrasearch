@@ -139,7 +139,7 @@ jobs:
           (Get-Content Cargo.toml) -replace 'workspace\s*=\s*true', 'version = "*"' | Set-Content $tempManifest
           Write-Host "Before wix, wix dir listing:"
           Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
-          cargo wix --manifest-path $tempManifest --no-build --bin-path "$binPath"
+          cargo wix -p ui --manifest-path $tempManifest --no-build --bin-path "$binPath"
           Write-Host "After wix, wix dir listing:"
           Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
       - name: List wix outputs
