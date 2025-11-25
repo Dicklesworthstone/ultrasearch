@@ -124,15 +124,22 @@ jobs:
       - name: Build unsigned MSI (ui crate)
         id: build_msi
         run: |
+          $ErrorActionPreference = "Stop"
+          $env:CARGO_TARGET_DIR = Join-Path $env:GITHUB_WORKSPACE "target"
           cd $env:GITHUB_WORKSPACE/ultrasearch/crates/ui
-          $binPath = Join-Path $env:GITHUB_WORKSPACE "target\release\ui.exe"
+          $binPath = Join-Path $env:CARGO_TARGET_DIR "release\ui.exe"
+          Write-Host "Binary path: $binPath"
           if (-not (Test-Path $binPath)) {
             Write-Host "Release UI binary not found at $binPath"
             Write-Host "Available files under target/release:"
-            Get-ChildItem "$env:GITHUB_WORKSPACE/target/release" -ErrorAction SilentlyContinue
+            Get-ChildItem "$env:CARGO_TARGET_DIR/release" -ErrorAction SilentlyContinue
             exit 1
           }
-          cargo wix -p ui --bin-path "$binPath"
+          Write-Host "Before wix, wix dir listing:"
+          Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
+          cargo wix -p ui --no-build --bin-path "$binPath"
+          Write-Host "After wix, wix dir listing:"
+          Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
@@ -217,7 +224,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download MSI
-        if: needs.windows-msi.outputs.msi_built == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ultrasearch-msi
@@ -228,14 +234,8 @@ jobs:
           name: ultrasearch-release-bin
           path: dist
       - name: Publish GitHub Release assets
-        if: needs.windows-msi.outputs.msi_built == 'true'
         uses: softprops/action-gh-release@v1
         with:
           files: |
             dist/ui.exe
             dist/*.msi
-      - name: Publish GitHub Release assets (no MSI)
-        if: needs.windows-msi.outputs.msi_built != 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: dist/ui.exe
