@@ -125,7 +125,7 @@ jobs:
         id: build_msi
         continue-on-error: true
         run: |
-          cd ultrasearch/crates/ui
+          cd $env:GITHUB_WORKSPACE
           $binPath = Join-Path $env:GITHUB_WORKSPACE "target\release\ui.exe"
           if (-not (Test-Path $binPath)) {
             Write-Host "Release UI binary not found at $binPath"
@@ -133,20 +133,20 @@ jobs:
             Get-ChildItem "$env:GITHUB_WORKSPACE/target/release" -ErrorAction SilentlyContinue
             throw "ui.exe not built; cargo wix cannot continue"
           }
-          cargo wix --bin-path "$binPath" Cargo.wix.toml
+          cargo wix -p ui --bin-path "$binPath"
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
-          Get-ChildItem ultrasearch/crates/ui/target/wix -Recurse -ErrorAction SilentlyContinue
+          Get-ChildItem target/wix -Recurse -ErrorAction SilentlyContinue
       - name: Set MSI built output
         id: set_msi_output
         run: |
-          $msiPath = Get-ChildItem ultrasearch/crates/ui/target/wix -Filter *.msi -Recurse -ErrorAction SilentlyContinue
+          $msiPath = Get-ChildItem target/wix -Filter *.msi -Recurse -ErrorAction SilentlyContinue
           if ($msiPath) {
             Write-Host "MSI found: $($msiPath.FullName)"
             "msi_built=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           } else {
-            Write-Host "No MSI found under ultrasearch/crates/ui/target/wix"
+            Write-Host "No MSI found under target/wix"
             "msi_built=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
       - name: Upload MSI artifact
@@ -154,7 +154,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ultrasearch-msi
-          path: ultrasearch/crates/ui/target/wix/**/*.msi
+          path: target/wix/**/*.msi
       - name: Upload release binary artifact
         uses: actions/upload-artifact@v4
         with:
