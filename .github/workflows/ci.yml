@@ -116,7 +116,7 @@ jobs:
           if (-not $wixRoot) { throw "WiX Toolset not found after install" }
           "WIX=$($wixRoot.FullName)\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install cargo-wix
-        run: cargo install cargo-wix --version 0.5.0 --force
+        run: cargo install --git https://github.com/volks73/cargo-wix --force
       - name: Prepare wix manifest without workspace inheritance
         run: |
           cd ultrasearch/crates/ui
@@ -135,11 +135,14 @@ jobs:
             Get-ChildItem "$env:CARGO_TARGET_DIR/release" -ErrorAction SilentlyContinue
             exit 1
           }
+          Copy-Item Cargo.toml Cargo.original.toml -Force
+          (Get-Content Cargo.original.toml) -replace 'workspace\s*=\s*true', 'version = "*"' | Set-Content Cargo.toml
           Write-Host "Before wix, wix dir listing:"
           Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
           cargo wix -p ui --no-build --bin-path "$binPath"
           Write-Host "After wix, wix dir listing:"
           Get-ChildItem "$env:CARGO_TARGET_DIR/wix" -Recurse -ErrorAction SilentlyContinue
+          Move-Item -Force Cargo.original.toml Cargo.toml
       - name: List wix outputs
         run: |
           Write-Host "Wix output contents:"
