@@ -142,25 +142,25 @@ jobs:
           $tempSrc = Join-Path $tempDir "placeholder.rs"
 
           # Build a minimal single-package manifest so cargo-wix can run without workspace inheritance.
-          $wxsPath = Join-Path $uiDir "wix\\main.wxs"
+          $wxsPath = (Join-Path $uiDir "wix\main.wxs").Replace('\\','/')
           $manifestLines = @(
-            "[package]"
-            "name = \"ui\""
-            "version = \"0.1.0\""
-            "edition = \"2021\""
-            "license = \"MIT OR Apache-2.0\""
-            "description = \"UltraSearch desktop client\""
-            ""
-            "[package.metadata.wix]"
-            "upgrade-guid = \"F5B2C1A2-5BC0-4C5D-93E4-0D6F9A6C9E11\""
-            "path-to-wxs = \"" + $wxsPath.Replace("\\", "/") + "\""
-            "binary-name = \"ui\""
-            "manufacturer = \"Ultrasearch Team\""
-            "homepage = \"https://github.com/Dicklesworthstone/ultrasearch\""
-            ""
-            "[[bin]]"
-            "name = \"ui\""
-            "path = \"placeholder.rs\""
+            '[package]'
+            'name = "ui"'
+            'version = "0.1.0"'
+            'edition = "2021"'
+            'license = "MIT OR Apache-2.0"'
+            'description = "UltraSearch desktop client"'
+            ''
+            '[package.metadata.wix]'
+            'upgrade-guid = "F5B2C1A2-5BC0-4C5D-93E4-0D6F9A6C9E11"'
+            ('path-to-wxs = "' + $wxsPath + '"')
+            'binary-name = "ui"'
+            'manufacturer = "Ultrasearch Team"'
+            'homepage = "https://github.com/Dicklesworthstone/ultrasearch"'
+            ''
+            '[[bin]]'
+            'name = "ui"'
+            'path = "placeholder.rs"'
           )
           Set-Content -Path $tempManifest -Value $manifestLines
           Set-Content -Path $tempSrc -Value "fn main() {}"
