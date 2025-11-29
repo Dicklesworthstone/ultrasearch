@@ -44,9 +44,7 @@ pub fn apply_background_priorities() {
         unsafe {
             if let Err(e) = SetThreadPriority(
                 GetCurrentThread(),
-                windows::Win32::System::Threading::THREAD_PRIORITY(
-                    THREAD_MODE_BACKGROUND_BEGIN.0 as i32,
-                ),
+                windows::Win32::System::Threading::THREAD_PRIORITY(THREAD_MODE_BACKGROUND_BEGIN.0),
             ) {
                 warn!("Failed to set background thread priority: {e:?}");
             }
