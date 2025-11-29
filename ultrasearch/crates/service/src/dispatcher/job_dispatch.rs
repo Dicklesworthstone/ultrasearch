@@ -14,6 +14,8 @@ pub struct JobSpec {
     pub max_bytes: Option<usize>,
     #[serde(default)]
     pub max_chars: Option<usize>,
+    #[serde(default)]
+    pub file_size: u64,
 }
 
 #[derive(Debug, Serialize)]

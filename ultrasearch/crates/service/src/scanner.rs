@@ -79,21 +79,25 @@ pub fn scan_volumes(cfg: &AppConfig) -> Result<Vec<JobSpec>> {
                     continue;
                 }
 
-                let content_jobs = build_content_jobs(&metas, cfg);
+                let (content_jobs, content_bytes) = build_content_jobs(&metas, cfg);
 
                 let count = metas.len() as u64;
+                let total_bytes: u64 = metas.iter().map(|m| m.size).sum();
                 tracing::info!(guid = %volume.guid_path, files = count, "ingesting metadata batch into meta-index");
                 match ingest_with_paths(&cfg.paths, metas, None) {
                     Ok(_) => tracing::info!("Successfully ingested {} files.", count),
                     Err(e) => tracing::error!("Failed to ingest files: {}", e),
                 }
 
+                let pending_files = content_jobs.len() as u64;
                 jobs.extend(content_jobs);
 
                 status.push(VolumeStatus {
                     volume: volume.id,
                     indexed_files: count,
-                    pending_files: 0,
+                    indexed_bytes: total_bytes,
+                    pending_files,
+                    pending_bytes: content_bytes,
                     last_usn: None,
                     journal_id: None,
                 });
@@ -211,11 +215,20 @@ fn unix_timestamp_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn build_content_jobs(metas: &[FileMeta], cfg: &AppConfig) -> Vec<JobSpec> {
-    metas
+fn build_content_jobs(metas: &[FileMeta], cfg: &AppConfig) -> (Vec<JobSpec>, u64) {
+    let mut total_bytes = 0u64;
+    let jobs = metas
         .iter()
-        .filter_map(|meta| content_job_from_meta(meta, &cfg.extract))
-        .collect()
+        .filter_map(|meta| {
+            if let Some(job) = content_job_from_meta(meta, &cfg.extract) {
+                total_bytes = total_bytes.saturating_add(meta.size);
+                Some(job)
+            } else {
+                None
+            }
+        })
+        .collect();
+    (jobs, total_bytes)
 }
 
 fn filter_volumes(cfg: AppConfig, all_volumes: Vec<VolumeInfo>) -> Vec<VolumeInfo> {

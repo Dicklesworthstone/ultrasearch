@@ -220,6 +220,10 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
             snap.scheduler_state,
             empty_metrics,
             snap.last_index_commit_ts,
+            snap.content_jobs_total,
+            snap.content_jobs_remaining,
+            snap.content_bytes_total,
+            snap.content_bytes_remaining,
         );
         let encoded = bincode::serialize(&resp).unwrap_or_default();
         record_ipc_request(started.elapsed());
@@ -248,14 +252,14 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
     if let Some(req) = deserialize_exact::<RescanRequest>(payload) {
         let started = Instant::now();
         let cfg = core_types::config::get_current_config();
-        let res = crate::scanner::scan_volumes(&cfg).and_then(|jobs| {
+        let res = crate::scanner::scan_volumes(&cfg).map(|jobs| {
             let mut submitted = 0usize;
             for job in jobs {
                 if crate::scheduler_runtime::enqueue_content_job(job) {
                     submitted += 1;
                 }
             }
-            Ok::<usize, anyhow::Error>(submitted)
+            submitted
         });
 
         let (success, message) = match res {

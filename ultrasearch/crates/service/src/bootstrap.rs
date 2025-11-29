@@ -180,18 +180,22 @@ fn ingest_seed_metadata(
 
     ingest_with_paths(&cfg.paths, metas.clone(), None)?;
 
-    let mut by_vol: std::collections::HashMap<core_types::VolumeId, u64> =
+    let mut by_vol: std::collections::HashMap<core_types::VolumeId, (u64, u64)> =
         std::collections::HashMap::new();
     for meta in &metas {
-        *by_vol.entry(meta.volume).or_insert(0) += 1;
+        let entry = by_vol.entry(meta.volume).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.saturating_add(meta.size);
     }
 
     let mut status = Vec::with_capacity(by_vol.len());
-    for (vol, count) in by_vol {
+    for (vol, (count, bytes)) in by_vol {
         status.push(VolumeStatus {
             volume: vol,
             indexed_files: count,
+            indexed_bytes: bytes,
             pending_files: 0,
+            pending_bytes: 0,
             last_usn: None,
             journal_id: None,
         });

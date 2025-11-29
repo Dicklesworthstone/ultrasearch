@@ -1,7 +1,8 @@
 use crate::dispatcher::job_dispatch::{JobDispatcher, JobSpec};
 use crate::scanner;
 use crate::status_provider::{
-    update_status_metrics, update_status_queue_state, update_status_scheduler_state,
+    increment_content_plan, update_content_remaining, update_status_metrics,
+    update_status_queue_state, update_status_scheduler_state,
 };
 use core_types::FileMeta;
 use core_types::config::{AppConfig, ExtractSection};
@@ -149,7 +150,7 @@ impl SchedulerRuntime {
 
         // Drain any newly submitted content jobs.
         while let Ok(job) = self.job_rx.try_recv() {
-            self.content_jobs.push_back(job);
+            self.push_job(job);
         }
         self.update_live_counts();
 
@@ -171,6 +172,7 @@ impl SchedulerRuntime {
             Some(self.live.enqueued_content.load(Ordering::Relaxed) as u64),
             Some(self.live.dropped_content.load(Ordering::Relaxed) as u64),
         );
+        update_content_remaining(ct as u64, workers);
         update_status_metrics(None);
 
         // Gate metadata/content on policies; we only have content jobs for now.
@@ -213,8 +215,10 @@ impl SchedulerRuntime {
             );
             return;
         }
+        let size_hint = job.file_size;
         self.content_jobs.push_back(job);
         self.live.enqueued_content.fetch_add(1, Ordering::Relaxed);
+        increment_content_plan(1, size_hint);
         self.update_live_counts();
     }
 }
@@ -291,6 +295,7 @@ pub fn content_job_from_meta(meta: &FileMeta, extract: &ExtractSection) -> Optio
         path,
         max_bytes: Some(to_usize(extract.max_bytes_per_file)),
         max_chars: Some(to_usize(extract.max_chars_per_file)),
+        file_size: meta.size,
     })
 }
 
@@ -315,6 +320,7 @@ mod tests {
             path: PathBuf::from("C:\\dummy"),
             max_bytes: None,
             max_chars: None,
+            file_size: 0,
         }
     }
 

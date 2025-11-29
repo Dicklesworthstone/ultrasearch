@@ -68,6 +68,8 @@ struct JobSpec {
     max_bytes: Option<usize>,
     #[serde(default)]
     max_chars: Option<usize>,
+    #[serde(default)]
+    file_size: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,7 +100,7 @@ fn main() -> Result<()> {
             let _ = SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
             let _ = SetThreadPriority(
                 GetCurrentThread(),
-                THREAD_PRIORITY(THREAD_MODE_BACKGROUND_BEGIN.0 as i32),
+                THREAD_PRIORITY(THREAD_MODE_BACKGROUND_BEGIN.0),
             );
         }
     }
@@ -161,6 +163,7 @@ fn main() -> Result<()> {
             path: path.clone(),
             max_bytes: Some(args.max_bytes),
             max_chars: Some(args.max_chars),
+            file_size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         };
 
         process_job(&stack, &index, &mut writer, single, &args)?;

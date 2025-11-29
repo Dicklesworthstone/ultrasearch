@@ -269,7 +269,9 @@ pub struct RescanResponse {
 pub struct VolumeStatus {
     pub volume: u16,
     pub indexed_files: u64,
+    pub indexed_bytes: u64,
     pub pending_files: u64,
+    pub pending_bytes: u64,
     pub last_usn: Option<u64>,
     pub journal_id: Option<u64>,
 }
@@ -280,6 +282,10 @@ pub struct StatusResponse {
     pub volumes: Vec<VolumeStatus>,
     pub last_index_commit_ts: Option<i64>,
     pub scheduler_state: String,
+    pub content_jobs_total: Option<u64>,
+    pub content_jobs_remaining: Option<u64>,
+    pub content_bytes_total: Option<u64>,
+    pub content_bytes_remaining: Option<u64>,
     pub metrics: Option<MetricsSnapshot>,
     pub served_by: Option<String>,
 }
@@ -382,7 +388,9 @@ mod tests {
         let v = VolumeStatus {
             volume: 1,
             indexed_files: 10,
+            indexed_bytes: 1024,
             pending_files: 2,
+            pending_bytes: 512,
             last_usn: Some(42),
             journal_id: Some(7),
         };
@@ -390,6 +398,8 @@ mod tests {
         let decoded: VolumeStatus = de(&encoded);
         assert_eq!(decoded.last_usn, Some(42));
         assert_eq!(decoded.journal_id, Some(7));
+        assert_eq!(decoded.indexed_bytes, 1024);
+        assert_eq!(decoded.pending_bytes, 512);
     }
 
     #[test]
