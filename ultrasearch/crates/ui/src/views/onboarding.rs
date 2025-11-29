@@ -19,7 +19,6 @@ struct DriveChoice {
 pub struct OnboardingView {
     step: usize,
     drives: Vec<DriveChoice>,
-    privacy_opt_in: bool,
     focus_handle: FocusHandle,
     model: Entity<SearchAppModel>,
 }
@@ -63,14 +62,13 @@ impl OnboardingView {
         Self {
             step: 0,
             drives,
-            privacy_opt_in: true,
             focus_handle: cx.focus_handle(),
             model,
         }
     }
 
     fn next_step(&mut self, cx: &mut Context<Self>) {
-        if self.step < 2 {
+        if self.step < 1 {
             self.step += 1;
             cx.notify();
         } else {
@@ -116,7 +114,8 @@ impl OnboardingView {
 
             config.volumes = selected;
             config.content_index_volumes = content_enabled;
-            config.app.telemetry_opt_in = self.privacy_opt_in;
+            // Telemetry is permanently disabled; enforce false regardless of UI.
+            config.app.telemetry_opt_in = false;
 
             let target = PathBuf::from("config/config.toml");
             if let Ok(toml) = toml::to_string_pretty(&config) {
@@ -133,12 +132,18 @@ impl OnboardingView {
         })
         .detach();
 
+        // Give the user immediate feedback that indexing is starting.
+        self.model.update(cx, |model, cx| {
+            model.status.indexing_state = "Starting indexing…".to_string();
+            cx.notify();
+        });
+
         cx.dispatch_action(&FinishOnboarding);
     }
 
     fn render_progress(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::active_colors(cx);
-        let labels = ["Welcome", "Choose drives", "Privacy"];
+        let labels = ["Welcome", "Choose drives"];
         div()
             .flex()
             .items_center()
@@ -302,12 +307,15 @@ impl OnboardingView {
                         div()
                             .cursor_pointer()
                             .relative()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.toggle_content(index, cx);
-                                }),
-                            )
+                            .when(drive.selected, |d: Div| {
+                                d.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.toggle_content(index, cx);
+                                    }),
+                                )
+                            })
+                            .opacity(if drive.selected { 1.0 } else { 0.4 })
                             .child(toggle(drive.content_indexing)),
                     ),
             )
@@ -380,7 +388,7 @@ impl Render for OnboardingView {
                     div()
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
-                        .child("Fixed NTFS drives are preferred for USN journaling and content indexing. Toggle drives and content per-volume."),
+                        .child("Uncheck a drive to exclude it entirely. Toggle the content switch to control deep content indexing per drive."),
                 )
                 .child(
                     div()
@@ -395,66 +403,42 @@ impl Render for OnboardingView {
                         } else {
                             div().children(drives)
                         }),
-                ),
-            2 => div()
+                )
+                .when(selected_count == 0, |d: Div| {
+                    d.child(
+                        div()
+                            .text_color(colors.text_secondary)
+                            .text_size(px(12.))
+                            .child("No drives selected. You can continue, but nothing will be indexed until you enable a drive in Settings."),
+                    )
+                }),
+            _ => div()
                 .flex()
                 .flex_col()
-                .gap_4()
-                .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).child("Privacy & Start"))
+                .gap_3()
+                .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).child("Ready to index"))
                 .child(
                     div()
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
-                        .child("Index data stays local. We only send anonymous diagnostics if you opt in."),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(20.))
-                                .h(px(20.))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(colors.border)
-                                .bg(if self.privacy_opt_in {
-                                    colors.match_highlight
-                                } else {
-                                    colors.panel_bg
-                                })
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                    this.privacy_opt_in = !this.privacy_opt_in;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(colors.text_primary)
-                                .child("Share anonymous diagnostics to improve UltraSearch (optional)"),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(colors.text_secondary)
-                        .child("Click \"Start indexing\" to save your choices and kick off the first scan immediately."),
+                        .child("Telemetry is disabled by design. Click \"Start indexing\" to save these drive choices and begin the first scan.")
                 ),
-            _ => div().child("Done"),
         };
 
         let primary_label = match self.step {
             0 => "Next",
-            1 => "Next",
-            2 => "Start indexing",
+            1 => {
+                if selected_count == 0 {
+                    "Skip (no drives selected)"
+                } else {
+                    "Start indexing"
+                }
+            }
             _ => "Next",
         };
 
         let can_go_back = self.step > 0;
-        let disable_primary = self.step == 2 && selected_count == 0;
+        let disable_primary = false;
 
         div()
             .track_focus(&self.focus_handle)

@@ -59,6 +59,16 @@ impl Render for StatusView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::active_colors(cx);
         let status = self.model.read(cx).status.clone();
+        let totals = status.volumes.iter().fold((0u64, 0u64), |acc, v| {
+            (acc.0 + v.indexed_files, acc.1 + v.pending_files)
+        });
+        let (indexed_files, pending_files) = totals;
+        let total_files = indexed_files + pending_files;
+        let progress_pct = if total_files > 0 {
+            ((indexed_files as f64 / total_files as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
 
         div()
             .track_focus(&self.focus_handle)
@@ -155,6 +165,56 @@ impl Render for StatusView {
                                         cx,
                                     )),
                             )
+                            // Section: Progress
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(14.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(colors.match_highlight)
+                                            .child("Indexing Progress"),
+                                    )
+                                    .child(self.render_kv_row(
+                                        "Indexed files",
+                                        format!("{}", indexed_files),
+                                        cx,
+                                    ))
+                                    .child(self.render_kv_row(
+                                        "Pending files",
+                                        format!("{}", pending_files),
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div().text_color(colors.text_secondary).child(
+                                                    format!("{:.0}% complete", progress_pct),
+                                                ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(200.))
+                                                    .h(px(8.))
+                                                    .rounded_full()
+                                                    .bg(colors.divider)
+                                                    .child(
+                                                        div()
+                                                            .h_full()
+                                                            .rounded_full()
+                                                            .bg(colors.match_highlight)
+                                                            .w(px((progress_pct as f32).max(0.0)
+                                                                * 2.0)),
+                                                    ),
+                                            ),
+                                    ),
+                            )
                             // Section: Metrics
                             .when(status.metrics.is_some(), |this: Div| {
                                 let m = status.metrics.as_ref().unwrap();
@@ -199,6 +259,21 @@ impl Render for StatusView {
                                         .child(self.render_kv_row(
                                             "Queue Depth",
                                             format!("{}", m.queue_depth.unwrap_or(0)),
+                                            cx,
+                                        ))
+                                        .child(self.render_kv_row(
+                                            "Active Workers",
+                                            format!("{}", m.active_workers.unwrap_or(0)),
+                                            cx,
+                                        ))
+                                        .child(self.render_kv_row(
+                                            "Jobs Enqueued",
+                                            format!("{}", m.content_enqueued.unwrap_or(0)),
+                                            cx,
+                                        ))
+                                        .child(self.render_kv_row(
+                                            "Jobs Dropped",
+                                            format!("{}", m.content_dropped.unwrap_or(0)),
                                             cx,
                                         )),
                                 )

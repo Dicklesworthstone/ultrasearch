@@ -105,6 +105,16 @@ impl UltraSearchWindow {
         });
     }
 
+    fn on_minimize_to_tray(
+        &mut self,
+        _: &MinimizeToTray,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Hide window; tray menu / hotkeys can restore it.
+        cx.hide();
+    }
+
     fn on_toggle_shortcuts(
         &mut self,
         _: &ToggleShortcuts,
@@ -376,6 +386,7 @@ impl Render for UltraSearchWindow {
             .on_action(cx.listener(Self::on_download_update))
             .on_action(cx.listener(Self::on_restart_update))
             .on_action(cx.listener(Self::on_toggle_opt_in))
+            .on_action(cx.listener(Self::on_minimize_to_tray))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_finish_onboarding))
             .on_action(cx.listener(Self::on_open_folder))
@@ -687,6 +698,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-o", OpenContainingFolder, None),
             KeyBinding::new("cmd-q", QuitApp, None),
             KeyBinding::new("ctrl-q", QuitApp, None),
+            KeyBinding::new("ctrl-m", MinimizeToTray, None),
         ]);
 
         // Open the main window

@@ -1,3 +1,4 @@
+use crate::actions::{MinimizeToTray, ToggleShortcuts};
 use crate::model::state::{BackendMode, SearchAppModel};
 use crate::theme;
 use gpui::prelude::*;
@@ -279,6 +280,27 @@ impl Render for SearchView {
         let query = model.query.clone();
         let ipc_recovered = model.ipc_recent_reconnect;
         let colors = theme::active_colors(cx);
+        let totals = status.volumes.iter().fold((0u64, 0u64), |acc, v| {
+            (acc.0 + v.indexed_files, acc.1 + v.pending_files)
+        });
+        let (indexed_files, pending_files) = totals;
+        let total_files = indexed_files + pending_files;
+        let progress_pct = if total_files > 0 {
+            ((indexed_files as f64 / total_files as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        let metrics = status.metrics.clone();
+        let queue_depth = metrics.as_ref().and_then(|m| m.queue_depth).unwrap_or(0);
+        let active_workers = metrics.as_ref().and_then(|m| m.active_workers).unwrap_or(0);
+        let enqueued = metrics
+            .as_ref()
+            .and_then(|m| m.content_enqueued)
+            .unwrap_or(0);
+        let dropped = metrics
+            .as_ref()
+            .and_then(|m| m.content_dropped)
+            .unwrap_or(0);
 
         // Keep local text in sync if model was changed externally.
         if query != self.input_text {
@@ -299,6 +321,79 @@ impl Render for SearchView {
             .border_b_1()
             .border_color(colors.border)
             .shadow_sm()
+            .child(
+                // Top app chrome
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .bg(colors.panel_bg)
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("UltraSearch"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(colors.text_secondary)
+                                    .child("Instant filename + deep content search, Windows-native."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(colors.bg)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .text_color(colors.text_primary)
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .child("Help / Shortcuts")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(Box::new(ToggleShortcuts), cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(colors.match_highlight)
+                                    .text_color(colors.bg)
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .child("Minimize to tray")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(Box::new(MinimizeToTray), cx);
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
             .child(
                 // Search input area with modern styling
                 div()
@@ -520,6 +615,54 @@ impl Render for SearchView {
                             .child(
                                 "Copy path: Ctrl/Cmd+C | Copy file: Ctrl+Shift+C | Properties: Alt+Enter",
                             ),
+                    ),
+            )
+            .child(
+                // Indexing progress snapshot
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(colors.panel_bg)
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_color(colors.text_secondary)
+                            .child(format!(
+                                "Indexed {} | Pending {}",
+                                Self::format_number(indexed_files),
+                                Self::format_number(pending_files)
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(colors.divider)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(colors.match_highlight)
+                                    .w(px((progress_pct as f32).max(0.0) * 1.6)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(colors.text_secondary)
+                            .child(format!("{:.0}% complete", progress_pct)),
+                    )
+                    .child(div().text_color(colors.border).child("•"))
+                    .child(
+                        div()
+                            .text_color(colors.text_secondary)
+                            .child(format!(
+                                "Queue {} | Workers {} | Enqueued {} | Dropped {}",
+                                queue_depth, active_workers, enqueued, dropped
+                            )),
                     ),
             )
             .child(

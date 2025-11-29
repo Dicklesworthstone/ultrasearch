@@ -23,6 +23,7 @@ actions!(
         DownloadUpdate,
         RestartToUpdate,
         ToggleUpdateOptIn,
+        MinimizeToTray,
         HotkeyConflictGeneral,
         HotkeyConflictPowerToys,
         ToggleShortcuts,
