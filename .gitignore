@@ -255,3 +255,6 @@ id_ed25519.pub
 # UBS (Ultimate Bug Scanner) artifacts
 .ubs-cache/
 ubs-report.json
+
+# bv (beads viewer) local config and caches
+.bv/
