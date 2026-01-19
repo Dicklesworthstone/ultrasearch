@@ -32,3 +32,9 @@ beads.left.jsonl
 beads.left.meta.json
 beads.right.jsonl
 beads.right.meta.json
+
+# Local history backups
+.br_history/
+
+# bv (beads viewer) lock file
+.bv.lock
