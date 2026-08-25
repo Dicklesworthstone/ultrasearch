@@ -5,12 +5,13 @@
       Id="*"
       Name="UltraSearch"
       Language="1033"
-      Version="0.1.0"
+      Version="$(var.Version)"
       Manufacturer="Ultrasearch Team"
       UpgradeCode="F5B2C1A2-5BC0-4C5D-93E4-0D6F9A6C9E11">
 
     <Package
         InstallerVersion="500"
+        Platform="x64"
         Compressed="yes"
         InstallScope="perMachine"
         InstallPrivileges="elevated" />
@@ -20,7 +21,7 @@
 
     <!-- Application directories -->
     <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFilesFolder">
+      <Directory Id="ProgramFiles64Folder">
         <Directory Id="INSTALLFOLDER" Name="UltraSearch" />
       </Directory>
       <Directory Id="ProgramMenuFolder">
@@ -86,8 +87,26 @@
       </Component>
     </DirectoryRef>
 
+    <!-- Start Menu folder ownership.
+         The shortcuts above are advertised into ApplicationProgramsFolder, but
+         nothing removed that folder on uninstall (ICE64), so it was left
+         behind. A component owning the directory, keyed off a per-user
+         registry value, is the standard way to make it go away cleanly. -->
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="cmp_start_menu_folder" Guid="*">
+        <RemoveFolder Id="rm_ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Ultrasearch Team\UltraSearch"
+                       Name="StartMenuFolder"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
     <!-- Features -->
     <Feature Id="MainFeature" Title="UltraSearch" Level="1">
+      <ComponentRef Id="cmp_start_menu_folder" />
       <ComponentRef Id="cmp_ui_exe" />
       <ComponentRef Id="cmp_service_exe" />
       <ComponentRef Id="cmp_protocol_handler" />
@@ -96,7 +115,7 @@
     <!-- ARP metadata -->
     <Property Id="ARPHELPLINK" Value="https://github.com/Dicklesworthstone/ultrasearch/issues" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dicklesworthstone/ultrasearch" />
-    <Property Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
 
   </Product>
 </Wix>
