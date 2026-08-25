@@ -1,5 +1,18 @@
 [toolchain]
-channel = "nightly"
+# Pinned to a dated nightly rather than the floating "nightly" channel.
+#
+# A floating channel makes this repo non-reproducible: the same commit can
+# build at one hour and fail the next because the channel moved underneath it,
+# and the failure usually surfaces as a compiler ICE in async-heavy code rather
+# than as anything resembling a toolchain problem.
+#
+# It also mutates shared build hosts. Building this repo on a shared Windows
+# builder advanced that machine's default nightly from 1.99.0 to 1.100.0 as a
+# side effect, changing state other work on that host depended on.
+#
+# 2026-08-25 is the nightly this project was last built and released with
+# (rustc 1.100.0-nightly, e7769602a). Bump it deliberately, not accidentally.
+channel = "nightly-2026-08-25"
 components = ["rustfmt", "clippy", "rust-analyzer"]
 profile = "default"
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "wasm32-unknown-unknown"]
