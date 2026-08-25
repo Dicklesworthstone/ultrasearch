@@ -181,10 +181,19 @@ jobs:
 
           # Build a minimal single-package manifest so cargo-wix can run without workspace inheritance.
           $wxsPath = (Join-Path $uiDir "wix\main.wxs").Replace('\\','/')
+
+          # Derive the MSI version from the workspace manifest. This was
+          # hardcoded to 0.1.0, so the installer advertised 0.1.0 no matter
+          # what was actually being released (ultrasearch#1).
+          $wsManifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $wsVersion = [regex]::Match((Get-Content $wsManifest -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $wsVersion) { throw "Could not read version from $wsManifest" }
+          Write-Host "MSI version from workspace manifest: $wsVersion"
+
           $manifestLines = @(
             '[package]'
             'name = "ui"'
-            'version = "0.1.0"'
+            ('version = "' + $wsVersion + '"')
             'edition = "2021"'
             'license = "MIT OR Apache-2.0"'
             'description = "UltraSearch desktop client"'

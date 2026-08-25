@@ -7,7 +7,7 @@ members = [
 [workspace.package]
 edition = "2024" # nightly policy
 rust-version = "1.84"
-version = "0.1.0"
+version = "1.5.0"
 license = "MIT OR Apache-2.0"
 authors = ["Ultrasearch Team"]
 repository = "https://github.com/Dicklesworthstone/ultrasearch"
