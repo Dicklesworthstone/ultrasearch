@@ -50,13 +50,17 @@ Combine **Everything‑style filename speed** with **Windows Search‑style cont
 
 This section is for people who just want to install and use UltraSearch. The rest of the README is a deep architectural dive.
 
-### 1. Download the installer
+### 1. Download
 
 > **Download (Windows)**
-> Get the latest UltraSearch installer from the Releases page:
 > **[https://github.com/Dicklesworthstone/ultrasearch/releases/latest](https://github.com/Dicklesworthstone/ultrasearch/releases/latest)**
 
-When releases are published, you’ll see a `.exe` installer asset there. Download that file (e.g. `UltraSearch-Setup-x.y.z.exe`).
+> [!IMPORTANT]
+> **There is currently no installer.** The MSI is built but deliberately not published, because uninstalling it fails and leaves a running service behind ([#3](https://github.com/Dicklesworthstone/ultrasearch/issues/3)). Removing it would require `sc delete` from an elevated prompt, so shipping it would be worse than shipping nothing.
+>
+> Until #3 is fixed, the release publishes the binaries directly and steps 2 and 3 below do not apply. Download `ui.exe`, `service.exe`, `index-worker.exe`, `cli.exe` and `launcher.exe`, place them together in one directory, and run `ui.exe`. The Windows service is not registered automatically.
+
+Once the installer is restored you will see a `.exe` or `.msi` installer asset on that page; download it and continue with the steps below.
 
 ### 2. Install
 
