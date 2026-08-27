@@ -100,14 +100,14 @@ impl MetadataCache {
         loop {
             let maybe_item = self.get(current_key).map(|item| (item.parent, item.name));
 
-            let (parent, name_spur) = if let Some(found) = maybe_item {
-                found
-            } else if let Some(meta) = fetch_miss(current_key) {
-                self.put(&meta);
-                let item = self.get(current_key).unwrap();
-                (item.parent, item.name)
-            } else {
-                return None;
+            let (parent, name_spur) = match maybe_item {
+                Some(found) => found,
+                None => {
+                    let meta = fetch_miss(current_key)?;
+                    self.put(&meta);
+                    let item = self.get(current_key)?;
+                    (item.parent, item.name)
+                }
             };
 
             let name_str = self.interner.resolve(&name_spur).to_owned();

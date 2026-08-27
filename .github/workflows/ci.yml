@@ -76,7 +76,7 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-clippy-
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -W warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   # Test suite - Windows only
   test:
