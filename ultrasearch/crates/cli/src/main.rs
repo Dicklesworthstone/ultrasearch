@@ -173,7 +173,6 @@ async fn main() -> Result<()> {
                             "path": path,
                             "config": cfg,
                         })
-                        .to_string()
                     );
                 } else {
                     println!("{}", style("Config path:").green());
@@ -218,7 +217,6 @@ async fn main() -> Result<()> {
                             "path": path,
                             "config": cfg,
                         })
-                        .to_string()
                     );
                 } else {
                     println!("{}", style("Updated config").green());

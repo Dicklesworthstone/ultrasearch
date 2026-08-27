@@ -42,8 +42,7 @@ pub fn init_tracing_with_config(
     // Size-based rotation with a conservative default (2 MiB). We avoid deleting old logs to
     // honor the no-delete policy; rotated files are timestamp-suffixed.
     let max_bytes = cfg.max_size_mb.saturating_mul(1024 * 1024);
-    let sized_writer =
-        SizeRotatingWriter::new(dir.to_path_buf(), file.to_string(), max_bytes as u64)?;
+    let sized_writer = SizeRotatingWriter::new(dir.to_path_buf(), file.to_string(), max_bytes)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(sized_writer);
 
@@ -165,7 +164,7 @@ impl SizeRotatingWriter {
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&inner.dir.join("__temp__.log"))?,
+                .open(inner.dir.join("__temp__.log"))?,
         ));
         let _ = fs::rename(&active_path, &rotated_path);
         let new_file = File::options()
