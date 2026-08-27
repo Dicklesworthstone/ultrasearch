@@ -180,7 +180,7 @@ fn wait_for_ipc_ready(service: &mut ChildGuard) -> Result<()> {
                     println!("{}", style("IPC ready").green());
                     return Ok(());
                 }
-                Err(err) if attempts < 120 => {
+                Err(_err) if attempts < 120 => {
                     attempts += 1;
                     print!(".");
                     let _ = std::io::stdout().flush();

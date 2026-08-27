@@ -173,7 +173,7 @@ fn load_icon_png(ext: &str) -> Option<Vec<u8>> {
         }
 
         // Convert BGRA -> RGBA
-        for chunk in pixels.chunks_exact_mut(4) {
+        for chunk in pixels.as_chunks_mut::<4>().0 {
             let b = chunk[0];
             let g = chunk[1];
             let r = chunk[2];
