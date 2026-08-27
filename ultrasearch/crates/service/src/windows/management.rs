@@ -12,7 +12,7 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
-const SERVICE_NAME: &str = "UltraSearch";
+const SERVICE_NAME: &str = "UltraSearchService";
 const SERVICE_LABEL: &str = "UltraSearch Background Service";
 const SERVICE_DESC: &str = "Indexes files and provides fast search capabilities for UltraSearch.";
 

@@ -1,4 +1,26 @@
+//! Windows Service Control Manager (SCM) host for the UltraSearch service.
+//!
+//! Lifecycle contract (issue #3 — the MSI's `ServiceControl Stop` used to
+//! time out and `sc stop` reported 1061):
+//!
+//! - The control handler is registered before any status is reported, and
+//!   `Running` is reported with STOP and SHUTDOWN accepted.
+//! - The application itself runs on a worker thread. The service main thread
+//!   only waits, so a long initial volume scan can never starve stop handling.
+//! - A STOP/SHUTDOWN control immediately reports `StopPending` (with a wait
+//!   hint) and signals the app. If the app does not wind down within
+//!   [`STOP_GRACE`], the service reports `Stopped` anyway and returns; the
+//!   process exit tears the worker down. An installer or `sc stop` therefore
+//!   always observes a bounded, well-formed stop.
+//! - A panic inside the app is caught so `Stopped` is still reported instead
+//!   of the SCM seeing an unexplained process death.
+
 use std::ffi::OsString;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
+use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,29 +31,84 @@ use windows_service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
         ServiceType,
     },
-    service_control_handler::{self, ServiceControlHandlerResult},
+    service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
     service_dispatcher,
 };
 
-const SERVICE_NAME: &str = "UltraSearch";
+/// Must match the `ServiceInstall/@Name` in the WiX package and the name used
+/// by the `install`/`uninstall`/`start`/`stop` subcommands.
+pub const SERVICE_NAME: &str = "UltraSearchService";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+/// How long a stop request waits for the application to wind down before the
+/// service reports `Stopped` regardless and lets process exit clean up.
+const STOP_GRACE: Duration = Duration::from_secs(20);
+/// Wait hint advertised with `StopPending`; slightly above the grace period.
+const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
+/// Polling cadence for the worker while the service is running.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn status(
+    state: ServiceState,
+    controls_accepted: ServiceControlAccept,
+    exit_code: ServiceExitCode,
+    checkpoint: u32,
+    wait_hint: Duration,
+) -> ServiceStatus {
+    ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: state,
+        controls_accepted,
+        exit_code,
+        checkpoint,
+        wait_hint,
+        process_id: None,
+    }
+}
+
+/// Outcome of the application worker thread.
+type AppOutcome = std::thread::Result<Result<()>>;
+
+fn exit_code_for(outcome: AppOutcome) -> ServiceExitCode {
+    match outcome {
+        Ok(Ok(())) => ServiceExitCode::Win32(0),
+        Ok(Err(e)) => {
+            eprintln!("UltraSearch service exited with error: {e:#}");
+            ServiceExitCode::Win32(1)
+        }
+        Err(_) => {
+            eprintln!("UltraSearch service worker panicked");
+            ServiceExitCode::Win32(1)
+        }
+    }
+}
 
 pub fn run_service<F>(_app_logic: F) -> Result<()>
 where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
 {
-    // The entry point where Windows calls us.
-    // We need to wrap the closure to match the signature expected by define_windows_service!
-    // but strictly speaking, define_windows_service! generates a static extern "system" fn.
-    // So we typically use a static or a trampoline.
-    // However, windows-service crate helper `service_dispatcher::start` takes a callback.
-
-    // We'll use a channel to signal shutdown to the app logic.
+    // Signals the application (bootstrap::run_app) to wind down.
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    // Lets the control handler report StopPending through the handle that
+    // only exists after registration.
+    let status_slot: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
+    let stop_requested = Arc::new(AtomicBool::new(false));
 
+    let handler_status = Arc::clone(&status_slot);
+    let handler_stop = Arc::clone(&stop_requested);
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
-            ServiceControl::Stop => {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                if let Some(handle) = handler_status.get() {
+                    let _ = handle.set_service_status(status(
+                        ServiceState::StopPending,
+                        ServiceControlAccept::empty(),
+                        ServiceExitCode::Win32(0),
+                        1,
+                        STOP_WAIT_HINT,
+                    ));
+                }
+                handler_stop.store(true, Ordering::SeqCst);
                 let _ = shutdown_tx.try_send(());
                 ServiceControlHandlerResult::NoError
             }
@@ -40,56 +117,73 @@ where
         }
     };
 
-    // Register service control handler.
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let _ = status_slot.set(status_handle);
 
-    // Tell Windows we are starting.
-    let next_status = ServiceStatus {
-        service_type: SERVICE_TYPE,
-        current_state: ServiceState::StartPending,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
+    status_handle.set_service_status(status(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        0,
+        Duration::from_secs(10),
+    ))?;
+
+    // Run the application off the service main thread so control requests
+    // are never queued behind config loading or the initial volume scan.
+    let (done_tx, done_rx) = std_mpsc::channel::<AppOutcome>();
+    thread::Builder::new()
+        .name("ultrasearch-app".into())
+        .spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                let cfg = core_types::config::load_or_create_config(None)?;
+                crate::bootstrap::run_app(&cfg, shutdown_rx)
+            }));
+            let _ = done_tx.send(outcome);
+        })?;
+
+    status_handle.set_service_status(status(
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ServiceExitCode::Win32(0),
+        0,
+        Duration::default(),
+    ))?;
+
+    let exit_code = loop {
+        match done_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(outcome) => break exit_code_for(outcome),
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!("UltraSearch service worker vanished without reporting");
+                break ServiceExitCode::Win32(1);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !stop_requested.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // Stop requested: give the app a bounded chance to finish
+                // cleanly, then stop regardless so the SCM (and an MSI
+                // uninstall) never waits on a worker stuck in a long scan.
+                match done_rx.recv_timeout(STOP_GRACE) {
+                    Ok(outcome) => break exit_code_for(outcome),
+                    Err(_) => {
+                        eprintln!(
+                            "UltraSearch service worker did not stop within {STOP_GRACE:?}; \
+                             reporting Stopped and exiting"
+                        );
+                        break ServiceExitCode::Win32(0);
+                    }
+                }
+            }
+        }
     };
-    status_handle.set_service_status(next_status)?;
 
-    // Tell Windows we are running.
-    let next_status = ServiceStatus {
-        service_type: SERVICE_TYPE,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    };
-    status_handle.set_service_status(next_status)?;
-
-    // Run the app logic (blocking this thread or spawning a runtime).
-    // We load config here because we are in a clean thread/process context.
-    // In a real service, environment variables might be tricky, so loading from file is best.
-    let cfg = core_types::config::load_or_create_config(None)?;
-
-    let result = crate::bootstrap::run_app(&cfg, shutdown_rx);
-
-    // Report exit status.
-    let exit_code = match result {
-        Ok(_) => ServiceExitCode::Win32(0),
-        Err(_) => ServiceExitCode::Win32(1),
-    };
-
-    let next_status = ServiceStatus {
-        service_type: SERVICE_TYPE,
-        current_state: ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
+    status_handle.set_service_status(status(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
         exit_code,
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    };
-    status_handle.set_service_status(next_status)?;
+        0,
+        Duration::default(),
+    ))?;
 
     Ok(())
 }
@@ -99,37 +193,15 @@ define_windows_service!(ffi_service_main, my_service_main);
 
 fn my_service_main(_arguments: Vec<OsString>) {
     if let Err(e) = run_service(|_| Ok(())) {
-        // We can't easily log to stdout here, so maybe log to event viewer or file if possible.
-        // For now, just ignore as we might be crashing anyway.
+        // No console under the SCM; stderr is the best available channel.
         eprintln!("Service failed: {e}");
     }
 }
 
-/// Called by main.rs when running as a service.
+/// Called by main.rs when running as a service. Blocks until the service stops.
 pub fn launch<F>(_app_logic: F) -> Result<()>
 where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + Sync + 'static,
 {
-    // Store the app logic in a static so the FFI callback can access it?
-    // Actually, `windows-service` doesn't easily support passing closure to the service main.
-    // We might need to invert this: `service_main` calls `app_logic` which we put in a global.
-
-    // For now, let's simplify. We will just define the `ffi_service_main` here and have it call
-    // a simpler "inner" service main that runs the reactor.
-
     service_dispatcher::start(SERVICE_NAME, ffi_service_main).map_err(|e| e.into())
 }
-
-// We need a place to stash the app logic if we want to be generic.
-// But simpler: main.rs imports `service_main`, `service_main` imports `run_app` (or whatever) from a shared place?
-// No, `run_app` is in `main.rs`. `main.rs` can't easily be imported by `lib.rs` (or submodules).
-//
-// Better approach: Move the `run_app` logic into `lib.rs` (or a module in lib) so both `main` (console) and `service_main` (service) can call it.
-//
-// Let's assume `crate::run_app_logic` is available or passed in.
-// Since `windows-service` is strict, let's use a global `OnceLock` for the closure?
-// No, closures are hard to store in statics.
-//
-// Alternative: Just hardcode the logic call in `my_service_main`.
-// We can move the logic currently in `main.rs` to `lib.rs` (e.g. `bootstrap.rs`).
-// Then `my_service_main` calls `bootstrap::run(shutdown_rx)`.
