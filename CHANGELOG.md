@@ -10,7 +10,28 @@ UltraSearch is a high-performance, memory-efficient desktop search engine for Wi
 
 ## [Unreleased]
 
-Post-v1.4.5 changes not yet tagged or released.
+## [v1.5.1] -- 2026-08-31
+
+### Fixed
+
+- **`UltraSearchService` now acts on service controls (#3).** The application
+  (config load, initial volume scan, scheduler) runs on a worker thread while
+  the service main thread waits; STOP/SHUTDOWN reports StopPending immediately
+  (30s wait hint) and the stop is bounded (20s grace, then Stopped is reported
+  and process exit tears down a worker stuck in a long scan). Previously the
+  app ran on the service main thread, so `sc stop` returned 1061 and the MSI's
+  `ServiceControl` action failed with error 1921 (uninstall exit 1603).
+  Landed in 0672c65, restructured in 2abe4ed.
+
+### Added
+
+- The MSI installer ships in the release again now that uninstall works
+  (v1.5.0 deliberately withheld it).
+
+## [v1.5.0] -- 2026-08-25
+
+Released on GitHub with the five binaries and no installer (see the v1.5.0
+release notes); the installer was withheld pending #3.
 
 ### Infrastructure
 
