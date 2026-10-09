@@ -138,11 +138,13 @@ fn main() -> Result<()> {
     let index: ContentIndex = content_index::open_or_create(&args.index_dir)?;
     let mut writer: IndexWriter = content_index::create_writer(&index, &WriterConfig::default())?;
     let mut pending = 0usize;
+    let mut failed_jobs = 0usize;
 
     if let Some(job_file) = args.job_file.clone() {
         let jobs = load_jobs(&job_file)?;
         for job in jobs {
             if let Err(err) = process_job(&stack, &index, &mut writer, job, &args) {
+                failed_jobs += 1;
                 warn!("job failed: {err}");
             }
             pending += 1;
@@ -178,6 +180,12 @@ fn main() -> Result<()> {
 
     if pending > 0 {
         writer.commit()?;
+    }
+
+    // Preserve successfully indexed documents, but let the dispatcher retain
+    // the batch whenever an item failed instead of retiring unfinished work.
+    if failed_jobs > 0 {
+        anyhow::bail!("batch contained {failed_jobs} failed job(s); successful jobs were committed");
     }
 
     Ok(())

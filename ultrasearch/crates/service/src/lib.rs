@@ -209,6 +209,99 @@ mod e2e_windows_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a real index-worker.exe and a retained E2E artifact directory"]
+    async fn e2e_mixed_worker_batch_preserves_failures_and_commits_successes() -> Result<()> {
+        use crate::dispatcher::job_dispatch::{JobDispatcher, JobSpec};
+        use tantivy::{collector::Count, query::QueryParser};
+
+        ensure!(
+            std::env::var("ULTRASEARCH_E2E").as_deref() == Ok("1"),
+            "set ULTRASEARCH_E2E=1 before explicitly running the mixed real-worker batch test"
+        );
+        let worker_path = std::env::var("ULTRASEARCH_WORKER_PATH")
+            .context("set ULTRASEARCH_WORKER_PATH to the built index-worker.exe")?;
+        ensure!(
+            std::path::Path::new(&worker_path).is_file(),
+            "real worker binary missing"
+        );
+        let artifact_dir = std::path::PathBuf::from(
+            std::env::var_os("ULTRASEARCH_E2E_ARTIFACT_DIR")
+                .context("set ULTRASEARCH_E2E_ARTIFACT_DIR to a retained test output directory")?,
+        );
+        ensure!(
+            artifact_dir.is_dir(),
+            "E2E artifact directory must already exist"
+        );
+        let root = artifact_dir.join(format!("mixed-worker-batch-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        eprintln!("retaining mixed real-worker artifacts at {}", root.display());
+        let input = root.join("document.txt");
+        let content_token = format!("content{}", Uuid::new_v4().simple());
+        std::fs::write(&input, &content_token)?;
+        let missing_input = root.join("missing-document.txt");
+        let index_dir = root.join("content-index");
+        std::fs::create_dir(&index_dir)?;
+        let jobs_dir = root.join("jobs");
+        let mut cfg = core_types::config::AppConfig::default();
+        cfg.paths.content_index = index_dir.to_string_lossy().into_owned();
+        cfg.paths.jobs_dir = jobs_dir.to_string_lossy().into_owned();
+        let jobs = vec![
+            JobSpec {
+                volume_id: 1,
+                file_id: 42,
+                path: input.clone(),
+                max_bytes: None,
+                max_chars: None,
+                file_size: std::fs::metadata(&input)?.len(),
+            },
+            JobSpec {
+                volume_id: 1,
+                file_id: 43,
+                path: missing_input.clone(),
+                max_bytes: Some(1024),
+                max_chars: Some(1024),
+                file_size: 0,
+            },
+        ];
+
+        let result = JobDispatcher::new(&cfg).spawn_batch(jobs.clone()).await;
+        let failure = result
+            .err()
+            .context("mixed batch with a missing input was reported as success")?;
+        ensure!(
+            failure.to_string().contains("failed with status"),
+            "spawn/join failure does not qualify a real worker exit: {failure:#}"
+        );
+        let files = std::fs::read_dir(&jobs_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        ensure!(files.len() == 1, "mixed failed batch must remain recoverable");
+        let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
+        ensure!(batch["version"] == 1, "retained batch version changed");
+        ensure!(
+            batch["jobs"] == serde_json::to_value(&jobs)?,
+            "retained mixed batch lost or changed an input"
+        );
+        ensure!(!missing_input.exists(), "missing input unexpectedly appeared");
+        ensure!(
+            std::fs::read_to_string(&input)? == content_token,
+            "worker changed the successful input"
+        );
+
+        // No test helper inserts documents: only the real worker can make the
+        // fresh content-only token searchable despite the other item's error.
+        let index = open_or_create(&index_dir)?;
+        let reader = content_index::open_reader(&index)?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let query = QueryParser::for_index(&index.index, vec![index.fields.content])
+            .parse_query(&content_token)?;
+        ensure!(
+            searcher.search(&query, &Count)? == 1 && searcher.num_docs() == 1,
+            "successful item was not committed exactly once before the failed batch exit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ULTRASEARCH_E2E=1 and a real built index-worker.exe"]
     async fn e2e_search_smoke() -> Result<()> {
         ensure!(
