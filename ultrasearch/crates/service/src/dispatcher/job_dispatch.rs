@@ -38,9 +38,9 @@ impl JobDispatcher {
             .or_else(|| {
                 std::env::current_exe()
                     .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("search-index-worker")))
+                    .and_then(|p| p.parent().map(|d| d.join("index-worker")))
             })
-            .unwrap_or_else(|| PathBuf::from("search-index-worker"));
+            .unwrap_or_else(|| PathBuf::from("index-worker"));
 
         if cfg!(windows) && worker_path.extension().is_none() {
             worker_path.set_extension("exe");
@@ -124,7 +124,7 @@ impl JobDispatcher {
                     .arg("--job-file")
                     .arg(&job_file_for_spawn)
                     .arg("--index-dir")
-                    .arg(&index_dir)
+                    .arg(&index_dir_for_spawn)
                     .spawn()
                     .context("failed to spawn worker process")?
                     .wait()?;
@@ -146,6 +146,10 @@ impl JobDispatcher {
                 status,
                 job_file_path.display(),
                 index_dir_for_log.display()
+            );
+            anyhow::bail!(
+                "worker batch {batch_id} failed with status {status}; retained job file {}",
+                job_file_path.display()
             );
         }
 

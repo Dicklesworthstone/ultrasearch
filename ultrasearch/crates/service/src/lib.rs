@@ -110,7 +110,7 @@ mod e2e_windows_tests {
         QueryExpr, SearchMode, SearchRequest, StatusRequest, TermExpr, TermModifier,
         client::PipeClient,
     };
-    use anyhow::Result;
+    use anyhow::{Context, Result, ensure};
     use content_index::{ContentDoc, WriterConfig, add_content_doc, create_writer, open_or_create};
     use core_types::{DocKey, FileFlags, FileMeta, Timestamp};
     use tempfile::tempdir;
@@ -127,24 +127,103 @@ mod e2e_windows_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn e2e_search_smoke() -> Result<()> {
-        if std::env::var("ULTRASEARCH_E2E").as_deref() != Ok("1") {
-            eprintln!("skipping e2e_search_smoke: set ULTRASEARCH_E2E=1 to enable");
-            return Ok(());
-        }
+    #[ignore = "requires a real index-worker.exe and a retained E2E artifact directory"]
+    async fn e2e_worker_failure_preserves_batch() -> Result<()> {
+        use crate::dispatcher::job_dispatch::{JobDispatcher, JobSpec};
 
-        // Resolve worker path if available so content jobs can run end-to-end.
-        let worker_path = std::env::var("CARGO_BIN_EXE_search-index-worker")
-            .or_else(|_| std::env::var("ULTRASEARCH_WORKER_PATH"))
-            .ok();
-        if let Some(ref path) = worker_path {
-            // On nightly, `std::env::set_var` is currently marked unsafe for
-            // mutation of the process environment; we only do this in the
-            // test harness to allow the worker binary path to flow through.
-            unsafe {
-                std::env::set_var("ULTRASEARCH_WORKER_PATH", path);
-            }
-        }
+        ensure!(
+            std::env::var("ULTRASEARCH_E2E").as_deref() == Ok("1"),
+            "set ULTRASEARCH_E2E=1 before explicitly running the real-worker failure test"
+        );
+        let worker_path = std::env::var("ULTRASEARCH_WORKER_PATH")
+            .context("set ULTRASEARCH_WORKER_PATH to the built index-worker.exe")?;
+        ensure!(
+            std::path::Path::new(&worker_path).is_file(),
+            "real worker binary missing"
+        );
+        let artifact_dir = std::path::PathBuf::from(
+            std::env::var_os("ULTRASEARCH_E2E_ARTIFACT_DIR")
+                .context("set ULTRASEARCH_E2E_ARTIFACT_DIR to a retained test output directory")?,
+        );
+        ensure!(
+            artifact_dir.is_dir(),
+            "E2E artifact directory must already exist"
+        );
+        let root = artifact_dir.join(format!("worker-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        eprintln!(
+            "retaining real-worker failure artifacts at {}",
+            root.display()
+        );
+        let input = root.join("document.txt");
+        std::fs::write(&input, "real worker failure preservation input")?;
+        // A regular file cannot become the Tantivy index directory. The real
+        // worker must fail, rather than a stand-in simulating its exit status.
+        let invalid_index = root.join("index-is-a-file");
+        std::fs::write(&invalid_index, "preserve this incumbent file")?;
+        let jobs_dir = root.join("jobs");
+        let mut cfg = core_types::config::AppConfig::default();
+        cfg.paths.content_index = invalid_index.to_string_lossy().into_owned();
+        cfg.paths.jobs_dir = jobs_dir.to_string_lossy().into_owned();
+        let job = JobSpec {
+            volume_id: 1,
+            file_id: 42,
+            path: input.clone(),
+            max_bytes: None,
+            max_chars: None,
+            file_size: std::fs::metadata(&input)?.len(),
+        };
+
+        let result = JobDispatcher::new(&cfg).spawn_batch(vec![job]).await;
+        let failure = result
+            .err()
+            .context("failed real worker was reported as success")?;
+        ensure!(
+            failure.to_string().contains("failed with status"),
+            "spawn/join failure does not qualify a real worker exit: {failure:#}"
+        );
+        let files = std::fs::read_dir(&jobs_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        ensure!(
+            files.len() == 1,
+            "failed batch must remain available for recovery"
+        );
+        let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
+        ensure!(batch["version"] == 1, "retained batch version changed");
+        let jobs = batch["jobs"].as_array().context("retained jobs missing")?;
+        ensure!(jobs.len() == 1, "retained batch lost its job");
+        let retained: JobSpec = serde_json::from_value(jobs[0].clone())?;
+        ensure!(
+            retained.path == input
+                && retained.file_id == 42
+                && retained.volume_id == 1
+                && retained.file_size == std::fs::metadata(&input)?.len()
+                && retained.max_bytes.is_none()
+                && retained.max_chars.is_none(),
+            "retained batch lost its input identity"
+        );
+        ensure!(
+            std::fs::read(&invalid_index)? == b"preserve this incumbent file",
+            "worker failure changed the incumbent index path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ULTRASEARCH_E2E=1 and a real built index-worker.exe"]
+    async fn e2e_search_smoke() -> Result<()> {
+        ensure!(
+            std::env::var("ULTRASEARCH_E2E").as_deref() == Ok("1"),
+            "set ULTRASEARCH_E2E=1 before explicitly running the real-worker smoke test"
+        );
+        // The worker belongs to a different package, so Cargo does not supply
+        // CARGO_BIN_EXE for it to this library test. Require the real artifact
+        // before starting any service thread; never silently omit content proof.
+        let worker_path = std::env::var("ULTRASEARCH_WORKER_PATH")
+            .context("set ULTRASEARCH_WORKER_PATH to the built index-worker.exe")?;
+        ensure!(
+            std::path::Path::new(&worker_path).is_file(),
+            "real worker binary missing at {worker_path}"
+        );
 
         let temp = tempdir()?;
         let data_dir = temp.path().join("data");
@@ -165,7 +244,8 @@ mod e2e_windows_tests {
         let docs_dir = temp.path().join("docs");
         std::fs::create_dir_all(&docs_dir)?;
         let file_path = docs_dir.join("hello.txt");
-        std::fs::write(&file_path, b"hello ultrasearch e2e")?;
+        let content_token = format!("content{}", Uuid::new_v4().simple());
+        std::fs::write(&file_path, format!("hello {content_token} e2e"))?;
         let meta = FileMeta::new(
             DocKey::from_parts(1, 1),
             1,
@@ -192,7 +272,7 @@ mod e2e_windows_tests {
             initial_metas: Some(vec![meta]),
             skip_initial_ingest: true,
             pipe_name: Some(pipe_name.clone()),
-            force_content_jobs: worker_path.is_some(),
+            force_content_jobs: true,
         };
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -236,34 +316,33 @@ mod e2e_windows_tests {
             resp.hits.len()
         );
 
-        if worker_path.is_some() {
-            // Poll for content results to confirm worker job execution.
-            let mut content_found = false;
-            for _ in 0..20 {
-                let content_req: SearchRequest = SearchRequest {
-                    id: Uuid::new_v4(),
-                    query: QueryExpr::Term(TermExpr {
-                        field: None,
-                        value: "ultrasearch".into(),
-                        modifier: TermModifier::Term,
-                    }),
-                    limit: 10,
-                    mode: SearchMode::Content,
-                    timeout: Some(Duration::from_secs(2)),
-                    offset: 0,
-                };
-                let resp = client.search(content_req).await?;
-                if resp.total > 0 {
-                    content_found = true;
-                    break;
-                }
-                sleep(Duration::from_millis(200)).await;
+        // Only the real worker can put this fresh, content-only token in the
+        // index. A filename hit or a pre-seeded fixture cannot satisfy the test.
+        let mut content_found = false;
+        for _ in 0..20 {
+            let content_req: SearchRequest = SearchRequest {
+                id: Uuid::new_v4(),
+                query: QueryExpr::Term(TermExpr {
+                    field: None,
+                    value: content_token.clone(),
+                    modifier: TermModifier::Term,
+                }),
+                limit: 10,
+                mode: SearchMode::Content,
+                timeout: Some(Duration::from_secs(2)),
+                offset: 0,
+            };
+            let resp = client.search(content_req).await?;
+            if resp.total > 0 {
+                content_found = true;
+                break;
             }
-            assert!(
-                content_found,
-                "content search should return results once worker runs"
-            );
+            sleep(Duration::from_millis(200)).await;
         }
+        assert!(
+            content_found,
+            "content search should return the generated token once the real worker runs"
+        );
 
         // Shutdown
         let _ = shutdown_tx.send(()).await;

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   WiX Installer for UltraSearch
-  Combines Service, UI, and Launcher into a single MSI.
+  Combines Service, indexing worker, UI, and Launcher into a single MSI.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
@@ -103,11 +103,11 @@
     <!-- UI Component -->
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="cmp_ui_exe" Guid="*" Win64="yes">
-        <File Id="fil_ui_exe" Source="target\release\ui.exe" KeyPath="yes" />
+        <File Id="fil_ui_exe" Source="$(var.CargoTargetBinDir)\ui.exe" KeyPath="yes" />
       </Component>
 
       <Component Id="cmp_launcher_exe" Guid="*" Win64="yes">
-        <File Id="fil_launcher_exe" Source="target\release\launcher.exe" KeyPath="yes" />
+        <File Id="fil_launcher_exe" Source="$(var.CargoTargetBinDir)\launcher.exe" KeyPath="yes" />
       </Component>
 
       <Component Id="cmp_shortcuts" Guid="*">
@@ -151,7 +151,7 @@
 
       <!-- Service Component -->
       <Component Id="cmp_service_exe" Guid="*" Win64="yes">
-        <File Id="fil_service_exe" Source="target\release\service.exe" KeyPath="yes" />
+        <File Id="fil_service_exe" Source="$(var.CargoTargetBinDir)\service.exe" KeyPath="yes" />
         
         <ServiceInstall
             Id="ServiceInstaller"
@@ -171,6 +171,11 @@
             Remove="uninstall" 
             Name="UltraSearchService" 
             Wait="yes" />
+      </Component>
+
+      <!-- The service launches this binary from its own installation directory. -->
+      <Component Id="cmp_index_worker_exe" Guid="*" Win64="yes">
+        <File Id="fil_index_worker_exe" Source="$(var.CargoTargetBinDir)\index-worker.exe" KeyPath="yes" />
       </Component>
 
       <!-- Protocol Handler Component -->
@@ -193,6 +198,7 @@
       <ComponentRef Id="cmp_ui_exe" />
       <ComponentRef Id="cmp_launcher_exe" />
       <ComponentRef Id="cmp_service_exe" />
+      <ComponentRef Id="cmp_index_worker_exe" />
       <ComponentRef Id="cmp_protocol_handler" />
       <ComponentRef Id="cmp_shortcuts" />
       <ComponentRef Id="cmp_data_dir" />
