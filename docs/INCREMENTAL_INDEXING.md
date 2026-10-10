@@ -32,6 +32,14 @@ beyond the journal head requires reconciliation. Malformed records and
 unsupported record versions produce errors; the implemented reader requests
 USN version 2 records.
 
+Metadata access failures reject the whole bounded read, including any events
+resolved before the failure. Only file/path-not-found means that an identity
+disappeared; access denied, sharing violations, unavailable devices, and failed
+path/exclusion probes cannot acknowledge deletion or silently omit a baseline
+entry. Content refresh reasons include transacted changes and ordinary data
+writes, including data reasons accumulated into close records. CLOSE alone
+changes no indexed state.
+
 The volume GUID and journal ID have different purposes. GUIDs bind persisted
 volume IDs to mounted volumes; journal IDs identify journal incarnations on
 those volumes. A document key preserves the volume ID and all 64 bits of the
@@ -60,7 +68,9 @@ The service processes one serialized ingestion lane with this ordering:
    ends with a complete receipt. The dispatcher verifies
    the complete receipt after a successful exit before acknowledging the batch.
    Reconciliation jobs verify file identity and metadata around
-   extraction and read content from the verified open file handle. A pathname
+   extraction. Windows captures bounded immutable bytes under an oplock on the
+   verified file object, then releases its capture handles before extraction.
+   The non-Windows test path reads the verified open file handle. A pathname
    swapped away and back cannot supply another file's contents. Windows checks
    the full FRN and volume serial; for production GUID paths it also resolves the
    handle's actual volume GUID to reject cross-volume junction substitutions.
@@ -79,6 +89,12 @@ visibility cover the interval between their commits. A restart replays pending
 work before later journal records. Deletes and replacements are idempotent, so
 replay does not append another result for the same key or retain obsolete body
 terms. Both search readers reload while holding the visibility read guard.
+
+Already durable intent replays even when its volume is offline or deselected,
+including when no selected volume is mounted. Its recorded GUID paths and content
+policy remain authoritative. Unavailable source files become durable deferred
+outcomes, releasing the shared lane for other volumes; the unavailable volume
+remains hidden. Mount selection still controls new reads and scheduled retries.
 
 Fatal worker failure, failed persistence, or backpressure leaves the cursor behind
 the uncompleted batch. The service retries that batch and does not silently drop
@@ -122,17 +138,25 @@ MFT enumeration, resets the volume through the worker lane, applies the snapshot
 and replays changes from that captured position. A journal gap during this work
 requires another reconciliation.
 
-Reconciliation pulls bounded MFT batches. One scanner retains a 256 KiB raw
-buffer and resolves at most 128 raw records per pull, including excluded or
-disappeared entries. The service commits the current mutation batch before
-requesting the next one; paused worker admission cannot accumulate an entire
-volume snapshot in memory. An empty batch represents bounded progress and does
-not end the scan. Each pull and native EOF revalidate the original journal
-cursor, so a journal that wraps during a worker pause invalidates the scan.
+Reconciliation pulls bounded MFT batches. Each active volume retains one reader
+with a 256 KiB raw buffer and resolves at most 128 raw records per pull, including
+excluded or disappeared entries. In each scheduling round, a volume performs one
+reset, one MFT page, or validated EOF, or one bounded journal read. Other volumes
+therefore receive turns between baseline pages. Active work continues after a
+cooperative yield; the one-second poll applies when no continuation is pending.
+The service commits the current mutation batch before requesting its next page;
+paused worker admission cannot accumulate an entire volume snapshot in memory.
+A page rejected for retry capacity remains attached to its reader until admitted,
+so recovery neither drops it nor pulls ahead. An empty page is bounded progress
+and still ends that volume's turn. Each pull and native EOF revalidate the original
+journal cursor, so a journal that wraps during a worker pause invalidates the scan.
 
 Reader/worker failures and cancellation keep the incomplete-scan marker and any
-pending intent durable. Only a successful native EOF completes the baseline,
-and the volume remains hidden until journal catch-up. Index writers, extraction,
+pending intent durable. Only a successful native EOF and durable checkpoint write
+complete the baseline. A failed EOF save preserves both the in-memory and on-disk
+incomplete checkpoint. Restart discards volatile readers, replays pending work,
+and starts an incomplete baseline with a fresh reset and captured journal head.
+The volume remains hidden until journal catch-up. Index writers, extraction,
 and individual path lengths still contribute to memory use. Large volumes and
 sustained churn can take substantial time; bounded batches do not establish a
 maximum end-to-end catch-up time.
@@ -178,8 +202,9 @@ accepted as obsolete; unavailable or mismatched roots retain a retry obligation.
 Changed identities invalidate obsolete jobs. Unknown extraction/I/O errors and
 files changing during extraction require deferred retry as described below.
 
-Production's SimpleText and Noop backends support extraction from the verified
-handle. Optional backends that require reopening a pathname explicitly report
+Production's SimpleText and Noop backends support extraction from verified
+snapshot bytes as well as the verified-handle path. Optional backends that require
+reopening a pathname explicitly report
 unsupported for reconciliation jobs, so these jobs retain metadata with empty
 content and an omission warning. There is no pathname fallback for reconciliation.
 Standalone strict Upsert jobs retain their existing path-based extractor contract.
@@ -187,6 +212,34 @@ Standalone strict Upsert jobs retain their existing path-based extractor contrac
 Consequently, healthy journal ingestion does not promise that every file has
 full-text content. Inspect worker omission warnings and extraction policy when a
 filename is searchable but its body is absent.
+
+### Coherent Windows content capture
+
+Windows Reconcile jobs atomically open the file for a Read-Handle oplock while
+allowing read, write, and delete sharing. The oplock request immediately follows
+the open, before any metadata operation. A granted lease covers identity checks
+and reads of at most 64 KiB at a time, with at most one byte beyond the persisted
+content limit. A break before, during, or just after a read rejects the snapshot,
+including a break racing EOF. Same-length overwrites cannot be accepted merely
+because their final last-write timestamp has not yet appeared.
+
+Capture cancellation closes the source handle promptly, then drains outstanding
+I/O before releasing its buffers. A new share-incompatible application opener can
+continue after that close. CPU extraction consumes only immutable captured bytes
+after all capture handles close. The final identity/metadata probe requests only
+attributes, so it does not acquire another data-read share during extraction.
+Unsupported oplocks, read failures, and interrupted captures retain a deferred
+retry obligation rather than publishing possibly mixed bytes. Recognized content
+permission and size omissions retain their separate policy described above.
+
+Each pending read waits up to five seconds before cancellation is requested.
+This is not a universal wall-clock bound on filesystem operations or driver
+cancellation. Changes after a completed capture are handled by the final metadata
+check and subsequent journal replay; the index remains eventually consistent.
+
+The native protocol follows Microsoft's [oplock overview](https://learn.microsoft.com/en-us/windows/win32/fileio/opportunistic-locks),
+[FSCTL_REQUEST_OPLOCK contract](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_request_oplock),
+and [asynchronous cancellation lifetime rules](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex).
 
 ## Deferred extraction without stopping journal progress
 
@@ -243,7 +296,9 @@ successful native read or conceal a fatal dependency failure.
 | --- | --- |
 | `watching; last bounded journal read succeeded` | A real read succeeded and observed catch-up completed. This is distinct from scheduler idle or an extraction-coverage guarantee. |
 | Reconciling/catching up | Allow the selected volume to rebuild and catch up. Repeated reconciliation can indicate a journal wrapping faster than processing completes. |
+| Previously caught-up volume has new backlog | The next bounded read records catching-up state before mutation admission. Prior healthy status cannot survive a newly observed backlog. |
 | Unsupported platform or no configured NTFS volume mounted | Ingestion reports unavailable. There is no active polling fallback. Correct the runtime, mount, or selected-volume configuration. |
+| Backup privilege initialization failed | Windows ingestion requires `SeBackupPrivilege` already assigned to the dedicated service process token. Startup enables only that privilege and rejects incomplete assignment; correct the service account and restart. No account rights or ACLs are changed by ingestion. |
 | Journal unavailable or access denied | Check the mounted volume, existing journal, and service account's access. Restore access and let retry/reconciliation proceed; no successful empty read is substituted. |
 | Worker failure, full admission queue, or unwritable output | Retain state and job artifacts. Inspect logs, the worker executable/configuration, permissions, and free space. Restore the dependency; pending work is retried without advancing its checkpoint. |
 | `degraded: N files deferred for extraction retry` | Other journal changes can progress. Pending file/byte totals include the retained obligations. Restore file access or release locks and allow the bounded retry schedule to run; readiness requires no selected-volume obligations. |
@@ -406,6 +461,50 @@ and recursive directory deletion with a moved-out survivor. The missing-root
 fixture does not mount, unmount, or alter a volume. These Windows-only tests still
 require native execution before acceptance can be claimed.
 
+### Fair volume progress and coherent Windows capture verification
+
+The next pass makes baseline scans resumable between volume turns, retains a
+capacity-rejected page, replays admitted work independently of source-volume
+selection, and makes baseline EOF persistence transactional. It also rejects
+partial native metadata resolution, handles transacted content changes, enables
+the service token's already-held backup privilege, and captures immutable Windows
+content under an atomic Read-Handle oplock before CPU extraction.
+
+There were **154 distinct passing Linux tests** across the affected packages:
+service 60, ntfs-watcher 30, index-worker 20, content-extractor 17, content-index
+14, and meta-index 13. All passed, with zero failed or ignored tests. This includes
+14 new host regressions; repeated extractor and worker runs are not additional
+distinct tests. The new scanner regressions use the production bounded-turn and
+pending-replay functions with real metadata/content index commits. Native calls
+and offline worker outcomes modeled by those host tests remain separate from
+Windows execution evidence.
+
+The regressions verify other-volume create/edit/delete progress between MFT pages,
+empty-page fairness, retaining a rejected page at the 1,024-file retry limit,
+replaying a failed page commit before advancing the same reader, offline-volume
+pending recovery and remount, healthy-to-backlog status, and failed EOF checkpoint
+persistence. Watcher tests cover rejected metadata/exclusion probes and exact
+replay, transacted changes, and complete privilege assignment. Worker/extractor
+tests cover bounded snapshot reads, breaks racing reads and EOF, read errors,
+verified bytes surviving path replacement, and content limits/omission policy.
+
+| Gate | Recorded result |
+| --- | --- |
+| Linux tests for the six affected packages, with `--locked --offline -- --test-threads=1` | All 154 passed. The Windows-only service integration target ran zero tests on Linux. |
+| Linux all-target check and strict Clippy for the same six packages | Both passed. The post-freeze worker test rerun passed all 20 tests again. |
+| Windows GNU all-target check and strict Clippy for `ntfs-watcher` and `ipc` | Both passed, including the privilege helper and duplicate-token test targets. |
+| Windows GNU all-target check and strict Clippy for `service`, `index-worker`, and `content-extractor`, with `service/e2e-windows` | Both passed, including the native oplock code, writer-contention tests, and NTFS integration target. These are compilation/lint results, not native execution. |
+| Workspace `cargo fmt --all -- --check` and Git staged/unstaged whitespace checks | Passed. |
+| Whole-workspace Linux check and Clippy | Both attempted and exited 101 in the unchanged UI dependency `glib-sys 0.18.1`: `pkg-config` is absent and `glib-2.0 >= 2.56` cannot be resolved. Neither whole-workspace gate passed. |
+| Native Windows execution, installed MSI acceptance, and native performance qualification | Not run; no Windows runtime is available here. |
+
+Verification used the pinned `nightly-2026-08-31` toolchain, locked dependencies,
+the host linker/OpenSSL settings and official LLVM-MinGW Windows GNU toolchain
+described above, one build job and test thread, no incremental compilation, and
+no debug symbols. Host linking emitted the toolchain's existing gold-linker
+deprecation notice. No dependency versions, feature gates, receipt formats, or
+checkpoint schema versions changed in this pass. UBS and RCH were unavailable.
+
 ## Native NTFS acceptance
 
 Use an **elevated Windows developer PowerShell** with an isolated mounted NTFS
@@ -424,6 +523,8 @@ New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 fsutil usn queryjournal V:
 
 cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc native_ntfs_lifecycle -- --ignored --nocapture --test-threads=1
+cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc held_backup_privilege_is_enabled_idempotently_on_a_copied_token -- --ignored --nocapture --test-threads=1
+cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
 cargo test -p index-worker --bin index-worker --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
 cargo test -p service --target x86_64-pc-windows-msvc --features e2e-windows --test ntfs_incremental -- --ignored --nocapture --test-threads=1
 ```
@@ -432,9 +533,22 @@ The low-level watcher test uses the Windows temporary directory, hence the
 explicit `TEMP`/`TMP` setting. It checks real create/modify/attribute/rename/delete
 records, GUID paths, identity, and cursor rejection. It also enumerates the
 isolated volume through two-record MFT pulls, verifies the fixture's identity
-and metadata, and replays a change made after the captured baseline head. Recursive
+and metadata, and replays a change made after the captured baseline head. It checks
+same-length edits while a writer stays open and a later close-derived refresh.
+The test explicitly enables its already-held backup privilege and fails when that
+prerequisite is absent. Separate token regressions use duplicate tokens to test
+activation, idempotence, and rejection when the privilege is genuinely absent;
+they do not change the test process token or grant account rights. Recursive
 directory removal verifies each deleted identity, a moved-out survivor, and replay
 without a full-volume reset.
+Worker component tests exercise actual atomic oplock capture with existing and
+new fully shared writers, a same-length overwrite, and recovery after the broken
+capture closes. Another test opens a share-incompatible writer on a separate
+thread and requires the snapshot reader to release it after observing the break.
+A real batch/extractor test holds an exclusive writer through CPU extraction and
+the final attribute-only probe. These native component tests complement the
+durable tombstone/restart service test; they do not by themselves establish an
+end-to-end service race result or writable-memory-mapping qualification.
 The service test uses
 `ULTRASEARCH_NTFS_TEST_ROOT` and `ULTRASEARCH_WORKER_PATH`, creates files after
 baseline completion, and verifies all three search modes, current metadata,

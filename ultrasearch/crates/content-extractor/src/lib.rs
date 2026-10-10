@@ -68,6 +68,20 @@ pub trait Extractor {
             self.name()
         )))
     }
+
+    /// Extract from an immutable, bounded snapshot captured by the caller.
+    /// Implementations must not reopen `ctx.path` to read document contents.
+    fn extract_bytes(
+        &self,
+        _ctx: &ExtractContext,
+        _key: DocKey,
+        _bytes: &[u8],
+    ) -> Result<ExtractedContent, ExtractError> {
+        Err(ExtractError::Unsupported(format!(
+            "{} does not support extraction from verified snapshot bytes",
+            self.name()
+        )))
+    }
 }
 
 /// Ordered stack of extractors with first-win semantics.
@@ -139,6 +153,24 @@ impl ExtractorStack {
         let ext = resolve_ext(ctx).unwrap_or_else(|| "unknown".to_string());
         Err(anyhow::anyhow!(ExtractError::Unsupported(ext)))
     }
+
+    /// Process a verified snapshot after filesystem protection has been released.
+    /// Path-only backends must explicitly decline instead of rereading a name.
+    #[instrument(skip(self, ctx, bytes))]
+    pub fn extract_bytes(
+        &self,
+        key: DocKey,
+        ctx: &ExtractContext,
+        bytes: &[u8],
+    ) -> Result<ExtractedContent> {
+        for backend in &self.backends {
+            if backend.supports(ctx) {
+                return backend.extract_bytes(ctx, key, bytes).map_err(Into::into);
+            }
+        }
+        let ext = resolve_ext(ctx).unwrap_or_else(|| "unknown".to_string());
+        Err(anyhow::anyhow!(ExtractError::Unsupported(ext)))
+    }
 }
 
 /// Minimal placeholder extractor that returns empty text; used until real
@@ -173,6 +205,15 @@ impl Extractor for NoopExtractor {
         _file: &fs::File,
     ) -> Result<ExtractedContent, ExtractError> {
         // This backend produces no content and does not read a pathname.
+        self.extract(ctx, key)
+    }
+
+    fn extract_bytes(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        _bytes: &[u8],
+    ) -> Result<ExtractedContent, ExtractError> {
         self.extract(ctx, key)
     }
 }
@@ -227,11 +268,26 @@ impl Extractor for SimpleTextExtractor {
             .rewind()
             .map_err(|e| ExtractError::Failed(e.to_string()))?;
         let data = read_bounded(source, ctx.max_bytes)?;
-        if is_probably_binary(&data) {
+        self.extract_bytes(ctx, key, &data)
+    }
+
+    fn extract_bytes(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        bytes: &[u8],
+    ) -> Result<ExtractedContent, ExtractError> {
+        if bytes.len() > ctx.max_bytes {
+            return Err(ExtractError::FileTooLarge {
+                bytes: bytes.len() as u64,
+                max_bytes: ctx.max_bytes as u64,
+            });
+        }
+        if is_probably_binary(bytes) {
             return Err(ExtractError::Unsupported("binary".into()));
         }
 
-        let text_raw = String::from_utf8_lossy(&data);
+        let text_raw = String::from_utf8_lossy(bytes);
         let (text, truncated, used_bytes) = enforce_limits_str(&text_raw, ctx);
 
         Ok(ExtractedContent {
@@ -426,6 +482,77 @@ mod tests {
             error.downcast_ref::<ExtractError>(),
             Some(ExtractError::Unsupported(reason)) if reason.contains("verified file handle")
         ));
+        let error = stack.extract_bytes(key, &ctx, b"verified").unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExtractError>(),
+            Some(ExtractError::Unsupported(reason)) if reason.contains("verified snapshot bytes")
+        ));
+    }
+
+    #[test]
+    fn snapshot_bytes_survive_path_replacement_and_disappearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.txt");
+        fs::write(&path, "verified original").unwrap();
+        let captured = fs::read(&path).unwrap();
+        let ctx = ExtractContext {
+            path: path.to_str().unwrap(),
+            max_bytes: 1024,
+            max_chars: 1024,
+            ext_hint: Some("txt"),
+            mime_hint: None,
+        };
+        let key = DocKey::from_parts(4, 52);
+        let stack = ExtractorStack::simple_only();
+        fs::write(&path, "wrong replacement").unwrap();
+        let out = stack.extract_bytes(key, &ctx, &captured).unwrap();
+        assert_eq!(out.key, key);
+        assert_eq!(out.text, "verified original");
+        assert_eq!(out.bytes_processed, captured.len());
+        fs::rename(&path, dir.path().join("retained.txt")).unwrap();
+        assert_eq!(
+            stack.extract_bytes(key, &ctx, &captured).unwrap().text,
+            "verified original"
+        );
+    }
+
+    #[test]
+    fn snapshot_bytes_apply_size_character_and_binary_policy() {
+        let key = DocKey::from_parts(4, 52);
+        let mut ctx = ExtractContext {
+            path: "missing.txt",
+            max_bytes: 6,
+            max_chars: 2,
+            ext_hint: Some("txt"),
+            mime_hint: None,
+        };
+        let out = SimpleTextExtractor
+            .extract_bytes(&ctx, key, "ééé".as_bytes())
+            .unwrap();
+        assert_eq!(out.text, "éé");
+        assert_eq!(out.bytes_processed, 4);
+        assert!(out.truncated);
+
+        ctx.max_bytes = 5;
+        assert!(matches!(
+            SimpleTextExtractor.extract_bytes(&ctx, key, "ééé".as_bytes()),
+            Err(ExtractError::FileTooLarge {
+                bytes: 6,
+                max_bytes: 5
+            })
+        ));
+        assert!(matches!(
+            SimpleTextExtractor.extract_bytes(&ctx, key, b"a\0b"),
+            Err(ExtractError::Unsupported(reason)) if reason == "binary"
+        ));
+        ctx.max_bytes = 0;
+        assert_eq!(
+            SimpleTextExtractor
+                .extract_bytes(&ctx, key, b"")
+                .unwrap()
+                .text,
+            ""
+        );
     }
 
     #[test]

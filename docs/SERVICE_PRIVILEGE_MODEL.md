@@ -1,19 +1,49 @@
 # Service Privilege Model & Hardening
 
 ## Service Account
-The UltraSearch service (`ultrasearch-service.exe`) must run with high privileges to function correctly as a system-wide indexer.
 
-### Required Privileges
-*   **SeBackupPrivilege**: Required to open files and directories for indexing regardless of discretionary access control lists (DACLs). This allows indexing user content without changing permissions.
-*   **SeRestorePrivilege**: Often paired with Backup; technically not needed for read-only indexing but standard for backup operators.
-*   **SeManageVolumePrivilege**: Required for opening volume handles and utilizing USN journal controls (FSCTL_READ_USN_JOURNAL).
-*   **SeDebugPrivilege**: Useful for obtaining process handles if needed for priority tuning, though typically not strictly required for file I/O.
+The UltraSearch service (`ultrasearch-service.exe`) runs in its own process and
+requires access to selected NTFS volumes and their existing USN journals.
+The expected account is `LocalSystem` (`NT AUTHORITY\SYSTEM`). A dedicated
+account must independently satisfy volume access and privilege requirements;
+group membership alone is not evidence that native ingestion succeeds.
 
-**Recommended Account:** `LocalSystem` (NT AUTHORITY\SYSTEM).
-*   Has all necessary privileges by default.
-*   Has Full Control over the system volume.
+### Backup privilege activation
 
-*Alternative:* A dedicated Managed Service Account (MSA) or Virtual Account (e.g., `NT SERVICE\UltraSearch`) added to the **Backup Operators** group.
+Windows ingestion calls `ntfs_watcher::enable_backup_privilege()` before the
+durable ingestion lane discovers volumes or reads MFT/journal records. Bootstrap
+may already have discovered volume names to initialize selection defaults.
+The helper opens its own process token with
+`TOKEN_ADJUST_PRIVILEGES` and enables only `SeBackupPrivilege`, which must already
+be present. LocalSystem has this privilege disabled by default. The reader's
+`FILE_FLAG_BACKUP_SEMANTICS` opens can override file read ACLs only when the
+appropriate privilege is enabled.
+
+`AdjustTokenPrivileges` cannot grant a missing privilege. The helper checks both
+the API result and its immediately captured last error; a successful BOOL with
+`ERROR_NOT_ALL_ASSIGNED` is a startup failure. Ingestion reports the failure and
+keeps existing volume results hidden. It never substitutes a healthy empty scan
+for inaccessible metadata, and it never changes account rights or file ACLs.
+No restore, debug, or manage-volume privilege is enabled by this initialization.
+
+Activation lasts for the dedicated service process lifetime. MFT readers move
+between blocking worker threads, so restoring the shared process token after
+individual calls would race other active reads. Ingestion threads must not
+impersonate clients or later disable the privilege. Adding impersonation would
+require scoped thread-token handling for each native batch; process-token
+activation does not override an impersonation token.
+
+This prerequisite does not guarantee access to every device or full-text content
+for every file. Content reads retain their verification and omission/retry
+policy; unresolved journal metadata remains an explicit volume error. See
+[incremental indexing and recovery](INCREMENTAL_INDEXING.md) for operational
+status, deferred work, and native acceptance commands.
+
+Microsoft references:
+
+- [LocalSystem account privileges](https://learn.microsoft.com/en-us/windows/win32/services/localsystem-account)
+- [OpenFileById access and backup semantics](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilebyid)
+- [AdjustTokenPrivileges result and assignment semantics](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-adjusttokenprivileges)
 
 ## File System ACLs
 The service stores data in `%PROGRAMDATA%\UltraSearch`.
@@ -56,7 +86,7 @@ The pipe security descriptor should allow:
 1.  Copy binaries to `%ProgramFiles%\UltraSearch`.
 2.  Register service:
     ```powershell
-    sc.exe create "UltraSearch" binPath= "C:\Program Files\UltraSearch\ultrasearch-service.exe" start= auto type= own
+    sc.exe create "UltraSearchService" binPath= "C:\Program Files\UltraSearch\ultrasearch-service.exe" start= auto type= own
     ```
 3.  Ensure directory exists and ACLs are set:
     ```powershell

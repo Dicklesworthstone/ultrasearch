@@ -12,15 +12,15 @@ use core_types::config::AppConfig;
 use core_types::{DocKey, FileMeta, VolumeId};
 use ipc::VolumeStatus;
 use ntfs_watcher::{
-    FileEvent, JournalCursor, NtfsError, ReaderConfig, VolumeInfo, begin_mft_scan, canonical_path,
-    discover_volumes, tail_usn_batch_with_config,
+    FileEvent, JournalBatch, JournalCursor, NtfsError, ReaderConfig, VolumeInfo, begin_mft_scan,
+    canonical_path, discover_volumes, tail_usn_batch_with_config,
 };
 use state::{
     BATCH_LIMIT, ContentPolicy, DeferredFile, MAX_DEFERRED_FILES, MetadataChange, PendingBatch,
     StateStore, event_changes, pending_for_volume, validate_deferred_outcome,
 };
 use stats::IndexStatistics;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
@@ -29,6 +29,36 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 
 static RESCAN_GENERATION: AtomicU64 = AtomicU64::new(0);
 const MUTATION_BATCH_LIMIT: usize = 128;
+
+type MftPages = Box<dyn Iterator<Item = std::result::Result<Vec<FileMeta>, NtfsError>> + Send>;
+type MftScans = BTreeMap<VolumeId, MftProgress<MftPages>>;
+
+/// One bounded reader and, at most, one not-yet-admitted page per volume.
+/// Readers are deliberately volatile: a service restart repeats the reset and
+/// baseline, while durable pending work must finish before any reader resumes.
+struct MftProgress<I> {
+    start: JournalCursor,
+    batches: Option<I>,
+    reset_admitted: bool,
+    page: Option<Vec<FileMeta>>,
+}
+
+impl<I> MftProgress<I> {
+    fn new(start: JournalCursor, batches: I) -> Self {
+        Self {
+            start,
+            batches: Some(batches),
+            reset_admitted: false,
+            page: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct VolumeProgress {
+    journal_read: bool,
+    work_remaining: bool,
+}
 
 /// Request reconciliation on the same serialized lane as journal changes.
 pub fn request_rescan() {
@@ -129,14 +159,27 @@ pub fn initialize_indexes(cfg: &AppConfig) -> Result<IngestionSession> {
 }
 
 pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) -> Result<()> {
+    #[cfg(windows)]
+    ntfs_watcher::enable_backup_privilege()
+        .context("USN indexing requires SeBackupPrivilege in the service token")?;
     let store = &mut session.store;
     let mut generation = RESCAN_GENERATION.load(Ordering::Relaxed);
     let mut last_idle_checkpoint = Instant::now();
     let mut statistics = IndexStatistics::new(Path::new(&cfg.paths.meta_index))?;
+    let mut scans = MftScans::new();
+    let mut work_remaining = true;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
+        if work_remaining {
+            // Give every selected volume one bounded turn before continuing
+            // active scans/backlogs. The one-second idle poll must not throttle
+            // a large baseline to one 128-record page per second.
+            tokio::task::yield_now().await;
+        } else {
+            ticker.tick().await;
+        }
+        work_remaining = false;
         let current = core_types::config::get_current_config();
         // Changing index destinations requires a service restart, since readers
         // and the dispatcher already own the original paths.
@@ -152,6 +195,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         cfg = current;
         let requested = RESCAN_GENERATION.load(Ordering::Relaxed);
         if requested != generation {
+            scans.clear();
             for volume in &mut store.state.volumes {
                 volume.needs_scan = true;
                 volume.catching_up = true;
@@ -165,6 +209,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         let volumes = match discovered {
             Ok(volumes) => filter_volumes(&cfg, volumes),
             Err(error) => {
+                scans.clear();
                 for volume in &store.state.volumes {
                     hide_volume(volume.id);
                 }
@@ -178,34 +223,32 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         let mut volumes = volumes;
         for volume in &mut volumes {
             store.bind_volume(volume)?;
-            refresh_content_policy(store, volume, &cfg)?;
+            if refresh_content_policy(store, volume, &cfg)? {
+                scans.remove(&volume.id);
+            }
         }
         let selected: BTreeSet<_> = volumes.iter().map(|v| v.id).collect();
+        scans.retain(|id, _| selected.contains(id));
         for volume in &store.state.volumes {
             if !selected.contains(&volume.id) {
                 hide_volume(volume.id);
             }
         }
+        // A failed batch remains durable and masks stale results. Replay it
+        // before reading any later journal record, preserving worker ordering.
+        // Recorded jobs are GUID-bound and retain their admission policy. An
+        // unavailable source becomes a durable worker deferral; deselection or
+        // unmounting cannot strand every other volume behind the global intent.
+        if let Err(error) = replay_pending(store, &cfg, &selected, commit_pending).await {
+            update_status_ingestion_state(format!("retrying durable batch: {error:#}"));
+            tracing::error!(%error, "pending batch failed; cursor retained");
+            publish_status(store, &mut statistics)?;
+            continue;
+        }
         if volumes.is_empty() {
             update_status_ingestion_state("unavailable: no configured NTFS volume is mounted");
             publish_status(store, &mut statistics)?;
             continue;
-        }
-
-        // A failed batch remains durable and masks stale results. Replay it
-        // before reading any later journal record, preserving worker ordering.
-        if let Some(batch) = &store.state.pending {
-            if !selected.contains(&batch.volume) {
-                update_status_ingestion_state(
-                    "blocked: pending volume is unavailable or deselected",
-                );
-                continue;
-            }
-            if let Err(error) = commit_pending(store, &cfg).await {
-                update_status_ingestion_state(format!("retrying durable batch: {error:#}"));
-                tracing::error!(%error, "pending batch failed; cursor retained");
-                continue;
-            }
         }
 
         let mut retried = false;
@@ -250,6 +293,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         let mut retry_volumes = Vec::new();
         for volume in &volumes {
             if store.volume(volume.id)?.needs_scan
+                && !scans.contains_key(&volume.id)
                 && store
                     .state
                     .deferred
@@ -267,9 +311,13 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
                 ));
                 continue;
             }
-            match process_volume(store, volume, &cfg).await {
-                Ok(true) => retry_volumes.push(volume.clone()),
-                Ok(false) => {}
+            match process_volume(store, volume, &cfg, &mut scans).await {
+                Ok(progress) => {
+                    work_remaining |= progress.work_remaining;
+                    if progress.journal_read {
+                        retry_volumes.push(volume.clone());
+                    }
+                }
                 Err(error) => {
                     if error.is::<state::DeferredCapacity>() {
                         // Admission stopped before installing new intent. Old
@@ -363,6 +411,27 @@ fn filter_volumes(cfg: &AppConfig, volumes: Vec<VolumeInfo>) -> Vec<VolumeInfo> 
         .collect()
 }
 
+/// Availability controls new reads and retries, never already durable intent.
+/// Completing an unavailable volume's GUID-bound batch can defer its files and
+/// release the global lane while keeping that volume hidden from every search.
+async fn replay_pending<C>(
+    store: &mut StateStore,
+    cfg: &AppConfig,
+    selected: &BTreeSet<VolumeId>,
+    mut commit: C,
+) -> Result<()>
+where
+    C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()>,
+{
+    if let Some(batch) = &store.state.pending {
+        if !selected.contains(&batch.volume) {
+            hide_volume(batch.volume);
+        }
+        commit(store, cfg).await?;
+    }
+    Ok(())
+}
+
 fn refresh_content_policy(
     store: &mut StateStore,
     volume: &VolumeInfo,
@@ -379,15 +448,20 @@ fn refresh_content_policy(
     Ok(true)
 }
 
-/// Return whether a bounded journal read succeeded. Retry fairness must not
-/// depend on reaching the journal head; gaps and structural changes return false.
+/// A volume receives one bounded baseline turn or one bounded journal read.
+/// Retry fairness must not depend on reaching the journal head.
 async fn process_volume(
     store: &mut StateStore,
     volume: &VolumeInfo,
     cfg: &AppConfig,
-) -> Result<bool> {
+    scans: &mut MftScans,
+) -> Result<VolumeProgress> {
     if store.volume(volume.id)?.needs_scan || store.volume(volume.id)?.cursor.is_none() {
-        reconcile_volume(store, volume, cfg).await?;
+        reconcile_volume(store, volume, cfg, scans).await?;
+        return Ok(VolumeProgress {
+            journal_read: false,
+            work_remaining: true,
+        });
     }
     let cursor = store
         .volume(volume.id)?
@@ -407,87 +481,138 @@ async fn process_volume(
             state.catching_up = true;
             store.save()?;
             update_status_ingestion_state(format!("volume {} journal gap; reconciling", volume.id));
-            Ok(false)
+            Ok(VolumeProgress {
+                journal_read: false,
+                work_remaining: true,
+            })
         }
         Err(error) => Err(error.into()),
-        Ok(batch) => {
-            let events = batch.events;
-            let next = batch.cursor;
-            let Some(changes) = resolve_events(&events, cfg, &store.state.deferred)? else {
-                hide_volume(volume.id);
-                let state = store.volume_mut(volume.id)?;
-                state.needs_scan = true;
-                state.catching_up = true;
-                store.save()?;
-                return Ok(false);
-            };
-            if !changes.is_empty() {
-                // Bound durable JSON even for long paths. The raw read's cursor
-                // belongs only to its final mutation batch; earlier chunks can
-                // safely be replayed if the service restarts between them.
-                let count = changes.chunks(MUTATION_BATCH_LIMIT).len();
-                for (number, chunk) in changes.chunks(MUTATION_BATCH_LIMIT).enumerate() {
-                    let checkpoint = (number + 1 == count).then_some(next);
-                    store.begin(pending_for_volume(
-                        volume,
-                        chunk.to_vec(),
-                        checkpoint,
-                        false,
-                        cfg,
-                    ))?;
-                    commit_pending(store, cfg).await?;
-                }
-            } else {
-                store.volume_mut(volume.id)?.cursor = Some(next);
-            }
-            // The reader compares against its observed pre-read journal head,
-            // so our own checkpoint/log writes cannot prevent catch-up forever.
-            if batch.caught_up {
-                if store.volume(volume.id)?.catching_up {
-                    store.volume_mut(volume.id)?.catching_up = false;
-                    store.save()?;
-                }
-                show_volume(volume.id);
-            }
-            Ok(true)
-        }
+        Ok(batch) => apply_journal_batch(store, volume, cfg, batch, commit_pending).await,
     }
+}
+
+async fn apply_journal_batch<C>(
+    store: &mut StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    batch: JournalBatch,
+    mut commit: C,
+) -> Result<VolumeProgress>
+where
+    C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()>,
+{
+    ensure!(
+        store.state.pending.is_none() && !store.volume(volume.id)?.needs_scan,
+        "journal work requires a completed baseline and no pending index work"
+    );
+    let next = batch.cursor;
+    let Some(changes) = resolve_events(&batch.events, cfg, &store.state.deferred)? else {
+        hide_volume(volume.id);
+        let state = store.volume_mut(volume.id)?;
+        state.needs_scan = true;
+        state.catching_up = true;
+        store.save()?;
+        return Ok(VolumeProgress {
+            journal_read: false,
+            work_remaining: true,
+        });
+    };
+    // A previously healthy volume can acquire a backlog. Record that transition
+    // before admission, so a pause or failure cannot retain an old healthy state.
+    if !batch.caught_up && !store.volume(volume.id)?.catching_up {
+        store.volume_mut(volume.id)?.catching_up = true;
+        store.save()?;
+    }
+    if !changes.is_empty() {
+        // The raw read's cursor belongs only to its final mutation batch;
+        // earlier chunks can safely replay after an interrupted volume turn.
+        let count = changes.chunks(MUTATION_BATCH_LIMIT).len();
+        for (number, chunk) in changes.chunks(MUTATION_BATCH_LIMIT).enumerate() {
+            let checkpoint = (number + 1 == count).then_some(next);
+            store.begin(pending_for_volume(
+                volume,
+                chunk.to_vec(),
+                checkpoint,
+                false,
+                cfg,
+            ))?;
+            commit(store, cfg).await?;
+        }
+    } else {
+        store.volume_mut(volume.id)?.cursor = Some(next);
+    }
+    // Our own checkpoint/log writes cannot prevent catch-up forever: the reader
+    // compares progress against its observed pre-read head.
+    if batch.caught_up {
+        if store.volume(volume.id)?.catching_up {
+            store.volume_mut(volume.id)?.catching_up = false;
+            store.save()?;
+        }
+        show_volume(volume.id);
+    }
+    Ok(VolumeProgress {
+        journal_read: true,
+        work_remaining: !batch.caught_up,
+    })
 }
 
 async fn reconcile_volume(
     store: &mut StateStore,
     volume: &VolumeInfo,
     cfg: &AppConfig,
+    scans: &mut MftScans,
 ) -> Result<()> {
-    hide_volume(volume.id);
-    let state = store.volume_mut(volume.id)?;
-    state.needs_scan = true;
-    state.catching_up = true;
-    store.save()?;
-    update_status_ingestion_state(format!("reconciling volume {}", volume.id));
-    let scan_volume = volume.clone();
-    let mut reader_config = reader_config(cfg, &store.state.retired_indices)?;
-    reader_config.max_records_per_tick = MUTATION_BATCH_LIMIT;
-    let mut scan =
-        tokio::task::spawn_blocking(move || begin_mft_scan(&scan_volume, &reader_config)).await??;
-    // Opening the scan captures the journal head before any MFT enumeration.
-    let start = scan.journal_cursor();
-    let batches = std::iter::from_fn(move || scan.next_batch().transpose());
-    apply_mft_scan(store, volume, cfg, start, batches, commit_pending).await
+    if let std::collections::btree_map::Entry::Vacant(entry) = scans.entry(volume.id) {
+        hide_volume(volume.id);
+        let state = store.volume_mut(volume.id)?;
+        state.needs_scan = true;
+        state.catching_up = true;
+        store.save()?;
+        update_status_ingestion_state(format!("reconciling volume {}", volume.id));
+        let scan_volume = volume.clone();
+        let mut reader_config = reader_config(cfg, &store.state.retired_indices)?;
+        reader_config.max_records_per_tick = MUTATION_BATCH_LIMIT;
+        let mut scan =
+            tokio::task::spawn_blocking(move || begin_mft_scan(&scan_volume, &reader_config))
+                .await??;
+        // Opening the scan captures the journal head before reset or MFT pulls.
+        // The same bounded native reader is resumed on later volume turns.
+        let start = scan.journal_cursor();
+        let batches: MftPages = Box::new(std::iter::from_fn(move || scan.next_batch().transpose()));
+        entry.insert(MftProgress::new(start, batches));
+    }
+    let scan = scans
+        .get_mut(&volume.id)
+        .context("MFT reader disappeared before its volume turn")?;
+    match apply_mft_scan(store, volume, cfg, scan, commit_pending).await {
+        Ok(true) => {
+            scans.remove(&volume.id);
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => {
+            // Rejected capacity keeps the one unadmitted page for retry. Once
+            // admitted, durable pending work owns that page and must replay
+            // before any later pull. Reader errors restart with a fresh reset.
+            if store.state.pending.is_none() && !error.is::<state::DeferredCapacity>() {
+                scans.remove(&volume.id);
+            }
+            Err(error)
+        }
+    }
 }
 
-/// Pull the next bounded page only after the previous page's durable work has
-/// committed. There is no background producer that can accumulate the MFT while
-/// worker admission is paused. Reader/worker failure or cancellation leaves the
-/// persisted `needs_scan` marker and any pending intent intact.
+/// Apply one reset, one bounded raw page (including an empty page), or EOF, then
+/// yield to other volumes. Return true only after a journal-validated native EOF.
+/// There is no producer running ahead of admission, and a page whose admission
+/// failed stays in memory until it is durably owned or the scan is restarted.
 async fn apply_mft_scan<I, C>(
     store: &mut StateStore,
     volume: &VolumeInfo,
     cfg: &AppConfig,
-    start: JournalCursor,
-    mut batches: I,
+    scan: &mut MftProgress<I>,
     mut commit: C,
-) -> Result<()>
+) -> Result<bool>
 where
     I: Iterator<Item = std::result::Result<Vec<FileMeta>, NtfsError>> + Send + 'static,
     C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()>,
@@ -496,41 +621,67 @@ where
         store.volume(volume.id)?.needs_scan,
         "MFT reconciliation must be marked incomplete before it starts"
     );
+    ensure!(
+        store.state.pending.is_none(),
+        "durable pending work must finish before the next MFT turn"
+    );
     // Reset through the worker lane as well, so old extraction jobs cannot
     // resurrect files after deletion. A crash restarts this complete scan.
-    store.begin(pending_for_volume(volume, Vec::new(), None, true, cfg))?;
-    commit(store, cfg).await?;
-    loop {
+    if !scan.reset_admitted {
+        store.begin(pending_for_volume(volume, Vec::new(), None, true, cfg))?;
+        scan.reset_admitted = true;
+        commit(store, cfg).await?;
+        return Ok(false);
+    }
+    if scan.page.is_none() {
+        let mut batches = scan
+            .batches
+            .take()
+            .context("MFT reader task was cancelled")?;
         let (returned, batch) = tokio::task::spawn_blocking(move || {
             let batch = batches.next();
             (batches, batch)
         })
         .await
         .context("MFT reader task failed")?;
-        batches = returned;
+        scan.batches = Some(returned);
         let Some(metas) = batch else {
-            break;
+            // Until this succeeds the previous durable cursor and incomplete
+            // marker remain authoritative. Catch-up starts at the head captured
+            // before the reset, including changes made between volume turns.
+            store.complete_scan(volume.id, scan.start)?;
+            return Ok(true);
         };
-        let metas = metas?;
-        ensure!(
-            metas.len() <= MUTATION_BATCH_LIMIT,
-            "MFT reader exceeded the mutation batch limit"
-        );
-        // An empty page is progress through excluded/missing records, not EOF.
-        if metas.is_empty() {
-            continue;
-        }
-        let changes = metas.into_iter().map(MetadataChange::Upsert).collect();
-        store.begin(pending_for_volume(volume, changes, None, false, cfg))?;
-        commit(store, cfg).await?;
+        let metas = match metas {
+            Ok(metas) if metas.len() <= MUTATION_BATCH_LIMIT => metas,
+            result => {
+                // A failed page cannot later turn into a successful EOF if a
+                // caller accidentally retains this progress object. Its prefix
+                // stays hidden and a new scan must reset/replay the baseline.
+                scan.batches = None;
+                let metas = result?;
+                anyhow::bail!(
+                    "MFT reader exceeded the mutation batch limit: {}",
+                    metas.len()
+                );
+            }
+        };
+        scan.page = Some(metas);
     }
-    // Only a successful, journal-validated native EOF completes the baseline.
-    let state = store.volume_mut(volume.id)?;
-    state.cursor = Some(start);
-    state.needs_scan = false;
-    state.catching_up = true;
-    store.save()?;
-    Ok(())
+    let metas = scan.page.as_ref().context("MFT page was not retained")?;
+    // An empty page is bounded progress through excluded/missing records. It
+    // still ends this turn, so excluded-heavy volumes cannot monopolize reads.
+    if metas.is_empty() {
+        scan.page = None;
+        return Ok(false);
+    }
+    let changes = metas.iter().cloned().map(MetadataChange::Upsert).collect();
+    store.begin(pending_for_volume(volume, changes, None, false, cfg))?;
+    // From here the global intent owns these records, including on cancellation.
+    // A later volume turn is forbidden until that intent has been completed.
+    scan.page = None;
+    commit(store, cfg).await?;
+    Ok(false)
 }
 
 /// Unknown tombstones and our own output need no index commits. If an indexed
@@ -1230,6 +1381,37 @@ mod tests {
         Ok((cfg, store, volume, previous))
     }
 
+    async fn commit_metadata_batch(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
+        let batch = store
+            .state
+            .pending
+            .clone()
+            .context("missing metadata intent")?;
+        ensure!(
+            batch
+                .worker
+                .jobs
+                .iter()
+                .all(|job| job.operation == JobOperation::Delete),
+            "metadata fixture unexpectedly requires native extraction"
+        );
+        hide_pending(&batch);
+        worker_commit(cfg, &batch, None)?;
+        finish(store, cfg, &batch)
+    }
+
+    async fn metadata_turn<I>(
+        store: &mut StateStore,
+        volume: &VolumeInfo,
+        cfg: &AppConfig,
+        scan: &mut MftProgress<I>,
+    ) -> Result<bool>
+    where
+        I: Iterator<Item = std::result::Result<Vec<FileMeta>, NtfsError>> + Send + 'static,
+    {
+        apply_mft_scan(store, volume, cfg, scan, commit_metadata_batch).await
+    }
+
     #[tokio::test]
     async fn mft_scan_waits_for_commit_and_continues_after_empty_pages() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -1251,6 +1433,13 @@ mod tests {
             last_usn: 200,
             ..previous
         };
+        let mut progress = MftProgress::new(start, batches);
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut progress).await?);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "reset must precede every MFT pull"
+        );
         let commit = async |store: &mut StateStore, cfg: &AppConfig| {
             let batch = store.state.pending.clone().context("missing MFT intent")?;
             hide_pending(&batch);
@@ -1264,7 +1453,11 @@ mod tests {
             finish(store, cfg, &batch)
         };
         let mut operation = Box::pin(apply_mft_scan(
-            &mut store, &volume, &cfg, start, batches, commit,
+            &mut store,
+            &volume,
+            &cfg,
+            &mut progress,
+            commit,
         ));
         tokio::select! {
             result = &mut operation => panic!("scan completed before worker acknowledgement: {result:?}"),
@@ -1282,7 +1475,17 @@ mod tests {
         assert!(read_visibility().volumes.contains(&volume.id));
 
         release_tx.send(()).expect("scan is waiting for its worker");
-        operation.await?;
+        assert!(!operation.await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        // An excluded-only page still consumes exactly one volume turn.
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut progress).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(store.volume(volume.id)?.needs_scan);
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut progress).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(metadata_turn(&mut store, &volume, &cfg, &mut progress).await?);
         assert_eq!(reads.load(Ordering::SeqCst), 4);
         assert_eq!(store.volume(volume.id)?.cursor, Some(start));
         assert!(!store.volume(volume.id)?.needs_scan);
@@ -1317,22 +1520,17 @@ mod tests {
             Err(NtfsError::Mft("injected truncated MFT page".into())),
         ]
         .into_iter();
-        let result = apply_mft_scan(
-            &mut store,
-            &volume,
-            &cfg,
+        let mut progress = MftProgress::new(
             JournalCursor {
                 last_usn: 200,
                 ..previous
             },
             batches,
-            async |store: &mut StateStore, cfg: &AppConfig| {
-                let batch = store.state.pending.clone().context("missing MFT intent")?;
-                worker_commit(cfg, &batch, None)?;
-                finish(store, cfg, &batch)
-            },
-        )
-        .await;
+        );
+        for _ in 0..2 {
+            assert!(!metadata_turn(&mut store, &volume, &cfg, &mut progress).await?);
+        }
+        let result = metadata_turn(&mut store, &volume, &cfg, &mut progress).await;
         assert!(format!("{:#}", result.unwrap_err()).contains("truncated MFT page"));
         assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
         assert!(store.volume(volume.id)?.needs_scan);
@@ -1368,17 +1566,21 @@ mod tests {
             observed.fetch_add(1, Ordering::SeqCst);
             Some(Ok(vec![file.clone()]))
         });
+        let mut progress = MftProgress::new(
+            JournalCursor {
+                last_usn: 200,
+                ..previous
+            },
+            batches,
+        );
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut progress).await?);
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let mut waiting_tx = Some(waiting_tx);
         let mut operation = Box::pin(apply_mft_scan(
             &mut store,
             &volume,
             &cfg,
-            JournalCursor {
-                last_usn: 200,
-                ..previous
-            },
-            batches,
+            &mut progress,
             async |store: &mut StateStore, cfg: &AppConfig| {
                 let batch = store.state.pending.clone().context("missing MFT intent")?;
                 hide_pending(&batch);
@@ -1401,6 +1603,12 @@ mod tests {
         let pending_id = store.state.pending.as_ref().unwrap().worker.id;
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        let blocked = metadata_turn(&mut store, &volume, &cfg, &mut progress)
+            .await
+            .unwrap_err();
+        assert!(format!("{blocked:#}").contains("pending work must finish"));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        drop(progress);
         drop(store);
         let mut store = StateStore::open(&cfg)?;
         let pending = store
@@ -1417,7 +1625,643 @@ mod tests {
         assert!(store.volume(volume.id)?.needs_scan);
         assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
         assert!(read_visibility().volumes.contains(&volume.id));
+        // The volatile reader was lost at restart. A new attempt must first
+        // reset the partial index, then retain its own pre-enumeration head.
+        let restarted = JournalCursor {
+            last_usn: 300,
+            ..previous
+        };
+        let mut fresh = MftProgress::new(
+            restarted,
+            vec![Ok(vec![meta(
+                DocKey::from_parts(volume.id, 11),
+                "restartedbaseline.txt",
+                20,
+            )])]
+            .into_iter(),
+        );
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut fresh).await?);
+        let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+        assert_eq!(meta_index::open_reader(&index)?.searcher().num_docs(), 0);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut fresh).await?);
+        assert!(metadata_turn(&mut store, &volume, &cfg, &mut fresh).await?);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(restarted));
+        assert!(!store.volume(volume.id)?.needs_scan);
+        assert!(store.volume(volume.id)?.catching_up);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "discarded reader cannot resume after restart"
+        );
         show_volume(volume.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_baseline_turns_allow_other_volume_changes_and_track_new_backlog() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, baseline, previous) = baseline_store(root.path(), 60_020)?;
+        cfg.volumes.push("Y:\\".into());
+        let mut live = VolumeInfo {
+            id: 0,
+            guid_path: "live-during-another-baseline".into(),
+            drive_letters: vec!['Y'],
+        };
+        store.bind_volume(&mut live)?;
+        let live_start = JournalCursor {
+            journal_id: 27,
+            last_usn: 700,
+        };
+        let live_state = store.volume_mut(live.id)?;
+        live_state.cursor = Some(live_start);
+        live_state.needs_scan = false;
+        live_state.catching_up = false;
+        store.save()?;
+        show_volume(live.id);
+
+        let first = meta(
+            DocKey::from_parts(baseline.id, 10),
+            "firstfairbaseline.txt",
+            10,
+        );
+        let last = meta(
+            DocKey::from_parts(baseline.id, 20),
+            "lastfairbaseline.txt",
+            20,
+        );
+        let mut pages = vec![Ok(vec![first.clone()]), Ok(Vec::new()), Ok(vec![last])].into_iter();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let mut scan = MftProgress::new(
+            JournalCursor {
+                last_usn: 200,
+                ..previous
+            },
+            std::iter::from_fn(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                pages.next()
+            }),
+        );
+        let live_key = DocKey::from_parts(live.id, 30);
+        let old_live = meta(live_key, "oldfairlive.txt", 30);
+        let seed = pending_for_volume(
+            &live,
+            vec![MetadataChange::Upsert(old_live)],
+            None,
+            false,
+            &cfg,
+        );
+        store.begin(seed)?;
+        commit_metadata_batch(&mut store, &cfg).await?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "oldfairlive", SearchMode::NameOnly).total,
+            1
+        );
+
+        assert!(!metadata_turn(&mut store, &baseline, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(!metadata_turn(&mut store, &baseline, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.volume(baseline.id)?.cursor, Some(previous));
+        assert_eq!(
+            search(&handler, "firstfairbaseline", SearchMode::NameOnly).total,
+            0
+        );
+
+        // A healthy volume can receive more than one bounded journal turn.
+        // Persist its backlog marker before worker admission, even while the
+        // other volume still has an incomplete, hidden baseline.
+        let mut saw_backlog_before_commit = false;
+        let renamed = meta(live_key, "newfairlive.txt", 40);
+        let progress = apply_journal_batch(
+            &mut store,
+            &live,
+            &cfg,
+            ntfs_watcher::JournalBatch {
+                events: vec![FileEvent::Renamed {
+                    from: live_key,
+                    to: renamed,
+                }],
+                cursor: JournalCursor {
+                    last_usn: 780,
+                    ..live_start
+                },
+                caught_up: false,
+            },
+            async |store: &mut StateStore, cfg: &AppConfig| {
+                let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                    Path::new(&cfg.paths.state_dir).join("ingestion-v2.json"),
+                )?)?;
+                saw_backlog_before_commit =
+                    disk["volumes"].as_array().unwrap().iter().any(|volume| {
+                        volume["id"].as_u64() == Some(u64::from(live.id))
+                            && volume["catching_up"] == true
+                    });
+                commit_metadata_batch(store, cfg).await
+            },
+        )
+        .await?;
+        assert!(saw_backlog_before_commit);
+        assert!(progress.journal_read && progress.work_remaining);
+        assert!(store.volume(live.id)?.catching_up);
+        assert_eq!(store.volume(live.id)?.cursor.unwrap().last_usn, 780);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            search(&handler, "oldfairlive", SearchMode::NameOnly).total,
+            0
+        );
+        let result = search(&handler, "newfairlive", SearchMode::NameOnly);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.hits[0].key, live_key);
+
+        // Empty filtered progress must yield rather than pulling the next page.
+        assert!(!metadata_turn(&mut store, &baseline, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(store.volume(baseline.id)?.needs_scan);
+        let progress = apply_journal_batch(
+            &mut store,
+            &live,
+            &cfg,
+            ntfs_watcher::JournalBatch {
+                events: vec![FileEvent::Deleted(live_key)],
+                cursor: JournalCursor {
+                    last_usn: 860,
+                    ..live_start
+                },
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        assert!(progress.journal_read && !progress.work_remaining);
+        assert!(!store.volume(live.id)?.catching_up);
+        assert_eq!(
+            search(&handler, "newfairlive", SearchMode::NameOnly).total,
+            0
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        assert!(!metadata_turn(&mut store, &baseline, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert_eq!(store.volume(baseline.id)?.cursor, Some(previous));
+        assert!(metadata_turn(&mut store, &baseline, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        assert_eq!(store.volume(baseline.id)?.cursor, Some(scan.start));
+        assert!(read_visibility().volumes.contains(&baseline.id));
+
+        // Replay a change made after the captured baseline head. The snapshot
+        // prefix cannot become visible before this journal replacement commits.
+        let current = meta(first.key, "currentfairbaseline.txt", 50);
+        apply_journal_batch(
+            &mut store,
+            &baseline,
+            &cfg,
+            ntfs_watcher::JournalBatch {
+                events: vec![FileEvent::Modified(current)],
+                cursor: JournalCursor {
+                    last_usn: 300,
+                    ..previous
+                },
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        assert!(!read_visibility().volumes.contains(&baseline.id));
+        assert_eq!(
+            search(&handler, "firstfairbaseline", SearchMode::NameOnly).total,
+            0
+        );
+        for term in ["currentfairbaseline", "lastfairbaseline"] {
+            assert_eq!(search(&handler, term, SearchMode::NameOnly).total, 1);
+        }
+        drop(store);
+        let restored = StateStore::open(&cfg)?;
+        assert_eq!(restored.volume(baseline.id)?.cursor.unwrap().last_usn, 300);
+        assert_eq!(restored.volume(live.id)?.cursor.unwrap().last_usn, 860);
+        assert!(!restored.volume(baseline.id)?.needs_scan);
+        assert!(!restored.volume(live.id)?.catching_up);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_mft_page_stays_bounded_until_cleanup_frees_retry_capacity() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, volume, previous) = baseline_store(root.path(), 60_022)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        let mut other = VolumeInfo {
+            id: 0,
+            guid_path: "other-volume-reserved-capacity".into(),
+            drive_letters: vec!['Y'],
+        };
+        store.bind_volume(&mut other)?;
+        // These already-tombstoned obligations belong to another volume, so
+        // this baseline's reset cannot release their reserved retry capacity.
+        store.state.deferred = (1..=MAX_DEFERRED_FILES)
+            .map(|file| DeferredFile {
+                meta: meta(
+                    DocKey::from_parts(other.id, file as u64),
+                    "deferredcapacity.txt",
+                    1,
+                ),
+                attempts: 1,
+                retry_at: i64::MAX,
+            })
+            .collect();
+        store.save()?;
+        let file = meta(DocKey::from_parts(volume.id, 10), "retainedpage.txt", 10);
+        let mut pages = vec![Ok(vec![file.clone()])].into_iter();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let mut scan = MftProgress::new(
+            JournalCursor {
+                last_usn: 200,
+                ..previous
+            },
+            std::iter::from_fn(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                pages.next()
+            }),
+        );
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        for _ in 0..2 {
+            let error = metadata_turn(&mut store, &volume, &cfg, &mut scan)
+                .await
+                .unwrap_err();
+            assert!(error.is::<state::DeferredCapacity>());
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert_eq!(scan.page.as_deref(), Some(std::slice::from_ref(&file)));
+            assert!(store.state.pending.is_none());
+            assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        }
+
+        // An actual durable deletion, rather than a manual ledger edit, frees
+        // one slot while the original scan keeps its single unadmitted page.
+        let released_key = store.state.deferred[0].meta.key;
+        store.begin(pending_for_volume(
+            &other,
+            vec![MetadataChange::Delete(released_key)],
+            None,
+            false,
+            &cfg,
+        ))?;
+        commit_metadata_batch(&mut store, &cfg).await?;
+        assert_eq!(store.state.deferred.len(), MAX_DEFERRED_FILES - 1);
+        assert!(
+            !apply_mft_scan(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut scan,
+                async |store: &mut StateStore, cfg: &AppConfig| {
+                    let pending = store
+                        .state
+                        .pending
+                        .clone()
+                        .context("retained page was not admitted")?;
+                    hide_pending(&pending);
+                    worker_commit(cfg, &pending, Some((&file, "retainedpagetoken")))?;
+                    finish(store, cfg, &pending)
+                },
+            )
+            .await?
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "admission retry cannot skip to the next page"
+        );
+        assert!(scan.page.is_none());
+        assert!(metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(scan.start));
+        show_volume(volume.id);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "retainedpage", SearchMode::NameOnly).total,
+            1
+        );
+        assert_eq!(
+            search(&handler, "retainedpagetoken", SearchMode::Content).total,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_mft_page_commit_replays_before_the_same_reader_continues() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volume, previous) = baseline_store(root.path(), 60_024)?;
+        let first = meta(
+            DocKey::from_parts(volume.id, 10),
+            "replayedfirstpage.txt",
+            10,
+        );
+        let last = meta(
+            DocKey::from_parts(volume.id, 20),
+            "continuedlastpage.txt",
+            20,
+        );
+        let mut pages = vec![Ok(vec![first]), Ok(vec![last])].into_iter();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let mut scan = MftProgress::new(
+            JournalCursor {
+                last_usn: 200,
+                ..previous
+            },
+            std::iter::from_fn(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                pages.next()
+            }),
+        );
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        let error = apply_mft_scan(
+            &mut store,
+            &volume,
+            &cfg,
+            &mut scan,
+            async |store: &mut StateStore, cfg: &AppConfig| {
+                let pending = store
+                    .state
+                    .pending
+                    .clone()
+                    .context("missing failed-page intent")?;
+                hide_pending(&pending);
+                worker_commit(cfg, &pending, None)?;
+                anyhow::bail!("injected failure before metadata commit")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("before metadata commit"));
+        let pending_id = store
+            .state
+            .pending
+            .as_ref()
+            .context("failed page lost its intent")?
+            .worker
+            .id;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert!(
+            scan.page.is_none(),
+            "durable intent now owns the consumed page"
+        );
+        assert!(
+            metadata_turn(&mut store, &volume, &cfg, &mut scan)
+                .await
+                .is_err()
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        replay_pending(
+            &mut store,
+            &cfg,
+            &BTreeSet::from([volume.id]),
+            commit_metadata_batch,
+        )
+        .await?;
+        assert_eq!(store.state.completed_batch, Some(pending_id));
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(scan.start));
+        show_volume(volume.id);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        for term in ["replayedfirstpage", "continuedlastpage"] {
+            assert_eq!(search(&handler, term, SearchMode::NameOnly).total, 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_pending_volume_defers_without_blocking_other_volumes_and_recovers()
+    -> Result<()> {
+        for no_volumes_mounted in [false, true] {
+            let root = tempfile::tempdir()?;
+            let (mut cfg, mut store, source, start) = baseline_store(root.path(), 60_025)?;
+            cfg.volumes.push("Y:\\".into());
+            cfg.content_index_volumes = vec!["X:\\".into(), "Y:\\".into()];
+            let mut available = VolumeInfo {
+                id: 0,
+                guid_path: "available-after-source-volume-loss".into(),
+                drive_letters: vec!['Y'],
+            };
+            store.bind_volume(&mut available)?;
+            let available_start = JournalCursor {
+                journal_id: 71,
+                last_usn: 700,
+            };
+            for (id, cursor) in [(source.id, start), (available.id, available_start)] {
+                let checkpoint = store.volume_mut(id)?;
+                checkpoint.cursor = Some(cursor);
+                checkpoint.needs_scan = false;
+                checkpoint.catching_up = false;
+                show_volume(id);
+            }
+            store.save()?;
+            let key = DocKey::from_parts(source.id, 10);
+            let original = meta(key, "offlinequeued.txt", 10);
+            let seed = pending_for_volume(
+                &source,
+                vec![MetadataChange::Upsert(original.clone())],
+                None,
+                false,
+                &cfg,
+            );
+            store.begin(seed.clone())?;
+            worker_commit(&cfg, &seed, Some((&original, "beforeofflinetoken")))?;
+            finish(&mut store, &cfg, &seed)?;
+            let handler = UnifiedSearchHandler::try_new(
+                Path::new(&cfg.paths.meta_index),
+                Path::new(&cfg.paths.content_index),
+            )?;
+            assert_eq!(
+                search(&handler, "beforeofflinetoken", SearchMode::Content).total,
+                1
+            );
+
+            let queued = meta(key, "offlinequeued.txt", 30);
+            let pending = pending_for_volume(
+                &source,
+                vec![MetadataChange::Upsert(queued.clone())],
+                Some(JournalCursor {
+                    last_usn: 300,
+                    ..start
+                }),
+                false,
+                &cfg,
+            );
+            store.begin(pending.clone())?;
+            drop(store);
+            let mut store = StateStore::open(&cfg)?;
+            assert_eq!(
+                store.state.pending.as_ref().unwrap().worker.id,
+                pending.worker.id
+            );
+            // The source is now deselected or absent. Persisted admission
+            // retains its original extraction policy and exact batch identity.
+            cfg.volumes = vec!["Y:\\".into()];
+            cfg.content_index_volumes = vec!["Y:\\".into()];
+            let selected = if no_volumes_mounted {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([available.id])
+            };
+            let mut committed_unavailable = false;
+            replay_pending(
+                &mut store,
+                &cfg,
+                &selected,
+                async |store: &mut StateStore, cfg: &AppConfig| {
+                    assert!(read_visibility().volumes.contains(&source.id));
+                    let batch = store
+                        .state
+                        .pending
+                        .clone()
+                        .context("unavailable intent vanished")?;
+                    assert_eq!(batch.worker.id, pending.worker.id);
+                    assert_eq!(batch.worker.jobs[0].operation, JobOperation::Reconcile);
+                    // Model the real worker's unavailable-GUID outcome with
+                    // actual durable content tombstones and commit receipts.
+                    worker_outcome(cfg, &batch, &[], &[key])?;
+                    finish(store, cfg, &batch)?;
+                    committed_unavailable = true;
+                    Ok(())
+                },
+            )
+            .await?;
+            assert!(committed_unavailable);
+            assert!(store.state.pending.is_none());
+            assert_eq!(store.volume(source.id)?.cursor.unwrap().last_usn, 300);
+            assert_eq!(store.state.deferred.len(), 1);
+            assert_eq!(store.state.deferred[0].meta, queued);
+            assert!(read_visibility().volumes.contains(&source.id));
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Hybrid,
+            ] {
+                assert_eq!(search(&handler, "offlinequeued", mode).total, 0);
+                assert_eq!(search(&handler, "beforeofflinetoken", mode).total, 0);
+            }
+
+            let other = meta(
+                DocKey::from_parts(available.id, 20),
+                "availablevolume.txt",
+                40,
+            );
+            apply_journal_batch(
+                &mut store,
+                &available,
+                &cfg,
+                ntfs_watcher::JournalBatch {
+                    events: vec![FileEvent::Created(other.clone())],
+                    cursor: JournalCursor {
+                        last_usn: 800,
+                        ..available_start
+                    },
+                    caught_up: true,
+                },
+                async |store: &mut StateStore, cfg: &AppConfig| {
+                    let batch = store
+                        .state
+                        .pending
+                        .clone()
+                        .context("available volume was blocked")?;
+                    worker_commit(cfg, &batch, Some((&other, "availablevolumetoken")))?;
+                    finish(store, cfg, &batch)
+                },
+            )
+            .await?;
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Hybrid,
+            ] {
+                assert_eq!(search(&handler, "availablevolume", mode).total, 1);
+            }
+            let due_at = store.state.deferred[0].retry_at;
+            assert!(
+                store
+                    .due_retry(std::slice::from_ref(&available), &cfg, due_at, 128)
+                    .is_none()
+            );
+            drop(store);
+            let mut store = StateStore::open(&cfg)?;
+            assert_eq!(store.state.deferred[0].meta, queued);
+            assert!(store.state.retired_indices.is_empty());
+
+            cfg.volumes.push("X:\\".into());
+            cfg.content_index_volumes.push("X:\\".into());
+            let retry = store
+                .due_retry(std::slice::from_ref(&source), &cfg, due_at, 128)
+                .context("remounted source did not recover its retry")?;
+            assert!(retry.retry && retry.next_cursor.is_none());
+            store.begin(retry)?;
+            let recovered = meta(key, "offlinequeued.txt", 90);
+            replay_pending(
+                &mut store,
+                &cfg,
+                &BTreeSet::from([source.id, available.id]),
+                async |store: &mut StateStore, cfg: &AppConfig| {
+                    let batch = store
+                        .state
+                        .pending
+                        .clone()
+                        .context("retry intent missing")?;
+                    worker_commit(cfg, &batch, Some((&recovered, "recoveredofflinetoken")))?;
+                    finish(store, cfg, &batch)
+                },
+            )
+            .await?;
+            assert!(store.state.deferred.is_empty());
+            assert_eq!(store.volume(source.id)?.cursor.unwrap().last_usn, 300);
+            apply_journal_batch(
+                &mut store,
+                &source,
+                &cfg,
+                ntfs_watcher::JournalBatch {
+                    events: Vec::new(),
+                    cursor: JournalCursor {
+                        last_usn: 300,
+                        ..start
+                    },
+                    caught_up: true,
+                },
+                commit_metadata_batch,
+            )
+            .await?;
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Hybrid,
+            ] {
+                let result = search(&handler, "offlinequeued", mode);
+                assert_eq!(result.total, 1);
+                assert_eq!(result.hits[0].key, key);
+                assert_eq!(result.hits[0].size, Some(90));
+                assert_eq!(search(&handler, "beforeofflinetoken", mode).total, 0);
+            }
+            assert_eq!(
+                search(&handler, "recoveredofflinetoken", SearchMode::Content).total,
+                1
+            );
+        }
         Ok(())
     }
 

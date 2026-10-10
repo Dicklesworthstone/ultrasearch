@@ -389,6 +389,35 @@ impl StateStore {
             .context("unknown volume identity")
     }
 
+    /// Publish a completed baseline only after its validated native EOF. Keep
+    /// the previous in-memory checkpoint as well as the durable one on failure,
+    /// so another volume turn cannot mistake a failed save for completed work.
+    pub fn complete_scan(&mut self, id: VolumeId, cursor: JournalCursor) -> Result<()> {
+        ensure!(
+            self.state.pending.is_none(),
+            "cannot finish an MFT baseline with pending index work"
+        );
+        let mut completed = self.state.clone();
+        let volume = completed
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.id == id)
+            .context("unknown volume identity")?;
+        ensure!(volume.needs_scan, "MFT baseline is already complete");
+        volume.cursor = Some(cursor);
+        volume.needs_scan = false;
+        volume.catching_up = true;
+        validate_state(&completed)?;
+        let bytes = serde_json::to_vec(&completed)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_STATE_BYTES,
+            "completed baseline exceeds ingestion state size limit"
+        );
+        atomic_write(&self.path, &bytes)?;
+        self.state = completed;
+        Ok(())
+    }
+
     pub fn begin(&mut self, pending: PendingBatch) -> Result<()> {
         ensure!(
             self.state.pending.is_none(),
@@ -1872,6 +1901,69 @@ mod tests {
                 .count(),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_eof_save_failure_keeps_both_checkpoints_incomplete() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = volume("transactional-baseline-eof");
+        store.bind_volume(&mut volume)?;
+        let previous = JournalCursor {
+            journal_id: 41,
+            last_usn: 100,
+        };
+        let completed = JournalCursor {
+            last_usn: 200,
+            ..previous
+        };
+        store.volume_mut(volume.id)?.cursor = Some(previous);
+        store.save()?;
+        let state_path = store.path.clone();
+        let before = fs::read(&state_path)?;
+        let receipts = (
+            store.state.completed_batch,
+            store.state.meta_commit,
+            store.state.content_commit,
+        );
+
+        // A real filesystem failure, independent of index mutation, prevents
+        // writing the final baseline checkpoint. No file is removed or replaced
+        // to inject it: the candidate state's parent is an ordinary fixture file.
+        let blocked_parent = root.path().join("blocked-checkpoint-parent");
+        fs::write(&blocked_parent, b"not a directory")?;
+        store.path = blocked_parent.join("ingestion.json");
+        assert!(store.complete_scan(volume.id, completed).is_err());
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(store.volume(volume.id)?.needs_scan);
+        assert_eq!(fs::read(&state_path)?, before);
+        assert_eq!(
+            (
+                store.state.completed_batch,
+                store.state.meta_commit,
+                store.state.content_commit,
+            ),
+            receipts
+        );
+
+        store.path = state_path;
+        store.complete_scan(volume.id, completed)?;
+        assert_eq!(store.volume(volume.id)?.cursor, Some(completed));
+        assert!(!store.volume(volume.id)?.needs_scan);
+        assert!(store.volume(volume.id)?.catching_up);
+        drop(store);
+        let mut restored = StateStore::open(&cfg)?;
+        assert_eq!(restored.volume(volume.id)?.cursor, Some(completed));
+        assert!(!restored.volume(volume.id)?.needs_scan);
+        assert!(restored.volume(volume.id)?.catching_up);
+
+        restored.volume_mut(volume.id)?.needs_scan = true;
+        restored.begin(pending_for_volume(&volume, Vec::new(), None, true, &cfg))?;
+        assert!(restored.complete_scan(volume.id, completed).is_err());
+        assert!(restored.state.pending.is_some());
+        assert!(restored.volume(volume.id)?.needs_scan);
         Ok(())
     }
 

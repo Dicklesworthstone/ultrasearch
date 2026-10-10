@@ -141,6 +141,8 @@ impl MftScan {
 /// Errors that can surface while interacting with NTFS / USN APIs.
 #[derive(Debug, Error)]
 pub enum NtfsError {
+    #[error("NTFS privilege initialization failed: {0}")]
+    Privilege(String),
     #[error("volume discovery failed: {0}")]
     Discovery(String),
     #[error("usn journal error: {0}")]
@@ -153,6 +155,49 @@ pub enum NtfsError {
     NotSupported,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Enable the backup privilege already assigned to this process's token.
+///
+/// Call once before starting production ingestion in the dedicated service
+/// process. LocalSystem holds this privilege but starts with it disabled;
+/// `FILE_FLAG_BACKUP_SEMANTICS` alone cannot bypass file read ACLs. This never
+/// grants a privilege, changes an ACL, or enables restore/debug privileges.
+/// Missing privileges are an initialization error, not partial scan coverage.
+///
+/// Activation intentionally lasts for the process lifetime. MFT scans move
+/// between blocking threads, so enabling/disabling the shared process token
+/// around individual calls would race other scans. Callers must not impersonate
+/// clients on ingestion threads or later disable the privilege. Supporting such
+/// token changes would require scoped thread tokens on every native batch;
+/// merely enabling this process token would not affect an impersonation token.
+#[cfg(windows)]
+pub fn enable_backup_privilege() -> Result<(), NtfsError> {
+    native::enable_process_backup_privilege()
+}
+
+#[cfg(not(windows))]
+pub fn enable_backup_privilege() -> Result<(), NtfsError> {
+    Err(NtfsError::NotSupported)
+}
+
+#[cfg(any(windows, test))]
+fn check_backup_privilege_adjustment(succeeded: bool, last_error: u32) -> Result<(), NtfsError> {
+    // AdjustTokenPrivileges can return TRUE while changing no privilege at all.
+    // ERROR_NOT_ALL_ASSIGNED must not be treated as successful initialization.
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+    if last_error == ERROR_NOT_ALL_ASSIGNED {
+        return Err(NtfsError::Privilege(
+            "SeBackupPrivilege is absent from the access token (Win32 error 1300)".into(),
+        ));
+    }
+    if !succeeded || last_error != ERROR_SUCCESS {
+        return Err(NtfsError::Privilege(format!(
+            "AdjustTokenPrivileges(SeBackupPrivilege) failed (Win32 error {last_error})"
+        )));
+    }
+    Ok(())
 }
 
 /// Trait abstraction to make the platform-specific implementation swap-able in tests.
@@ -390,22 +435,16 @@ pub fn tail_usn_batch_with_config(
     let before = native::query_state(&handle)?;
     journal::validate_cursor(cursor, before)?;
     let bytes = native::read_batch(&handle, cursor, config.chunk_size)?;
-    let (records, next) = journal::parse_batch(&bytes, cursor, config.max_records_per_tick)?;
-    let mut events = Vec::with_capacity(records.len());
-    for record in records {
-        if let Some(event) = journal::event_from_record(volume.id, &record, || {
-            native::resolve_metadata(&handle, volume.id, &record)
-        })? {
-            if native::excluded_event(&handle, volume.id, &record, &event, &config.exclude_paths)? {
-                events.push(FileEvent::Excluded {
-                    doc: DocKey::from_parts(volume.id, record.frn),
-                    is_dir: record.attributes & journal::ATTRIBUTE_DIRECTORY != 0,
-                });
-            } else {
-                events.push(event);
-            }
-        }
-    }
+    let (events, next) = journal::resolve_batch(
+        volume.id,
+        &bytes,
+        cursor,
+        config.max_records_per_tick,
+        |record| native::resolve_metadata(&handle, volume.id, record),
+        |record, event| {
+            native::excluded_event(&handle, volume.id, record, event, &config.exclude_paths)
+        },
+    )?;
     // A reset/wrap during metadata resolution must not be acknowledged as a
     // complete batch. Validate the original position, not only the new one.
     let after = native::query_state(&handle)?;
@@ -437,7 +476,11 @@ mod journal {
     pub(super) const REASON_RENAME_NEW: u32 = 0x0000_2000;
     pub(super) const REASON_HARD_LINK: u32 = 0x0001_0000;
     pub(super) const REASON_REPARSE: u32 = 0x0010_0000;
-    pub(super) const REASON_CONTENT: u32 = 0x0020_0077;
+    pub(super) const REASON_TRANSACTED: u32 = 0x0040_0000;
+    // TxF commits can identify changed stream data with TRANSACTED_CHANGE;
+    // consuming that record without refreshing content loses the committed edit.
+    // https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-usn_record_v2
+    pub(super) const REASON_CONTENT: u32 = 0x0020_0077 | REASON_TRANSACTED;
     pub(super) const REASON_ATTRIBUTES: u32 = 0x001F_CC00;
     #[cfg(test)]
     pub(super) const REASON_CLOSE: u32 = 0x8000_0000;
@@ -605,6 +648,35 @@ mod journal {
         Ok(())
     }
 
+    /// Resolve a bounded raw batch atomically from the caller's perspective.
+    /// A failed metadata or exclusion probe yields neither a partial event set
+    /// nor a cursor that could acknowledge an unresolved file. The caller can
+    /// replay the same input position after access is restored.
+    pub(super) fn resolve_batch(
+        volume: VolumeId,
+        buffer: &[u8],
+        cursor: JournalCursor,
+        max_records: usize,
+        mut metadata: impl FnMut(&Record) -> Result<Option<FileMeta>, NtfsError>,
+        mut excluded: impl FnMut(&Record, &FileEvent) -> Result<bool, NtfsError>,
+    ) -> Result<(Vec<FileEvent>, JournalCursor), NtfsError> {
+        let (records, next) = parse_batch(buffer, cursor, max_records)?;
+        let mut events = Vec::with_capacity(records.len());
+        for record in records {
+            if let Some(event) = event_from_record(volume, &record, || metadata(&record))? {
+                if excluded(&record, &event)? {
+                    events.push(FileEvent::Excluded {
+                        doc: DocKey::from_parts(volume, record.frn),
+                        is_dir: record.attributes & ATTRIBUTE_DIRECTORY != 0,
+                    });
+                } else {
+                    events.push(event);
+                }
+            }
+        }
+        Ok((events, next))
+    }
+
     pub(super) fn event_from_record(
         volume: VolumeId,
         record: &Record,
@@ -639,8 +711,10 @@ mod journal {
             return Ok(None);
         }
         let Some(meta) = metadata()? else {
-            // The record may outlive its file. Inaccessible files also lose
-            // any prior searchable content; a later security change retries.
+            // The record may outlive its file. Missing metadata means the full
+            // identity no longer resolves, not that access happened to fail.
+            // Access failures remain errors so this cursor cannot silently
+            // discard a still-existing file or rely on another security event.
             return Ok(Some(FileEvent::Deleted(doc)));
         };
         if meta.key != doc || meta.volume != volume {
@@ -825,8 +899,8 @@ mod native {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_JOURNAL_ENTRY_DELETED,
-        ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, FILETIME, HANDLE,
+        ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_JOURNAL_ENTRY_DELETED, ERROR_MORE_DATA,
+        ERROR_PATH_NOT_FOUND, FILETIME, HANDLE,
     };
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
@@ -844,6 +918,71 @@ mod native {
 
     fn raw(handle: &OwnedHandle) -> HANDLE {
         HANDLE(handle.as_raw_handle() as isize)
+    }
+
+    pub(super) fn captured_last_error_code(result: windows::core::Result<()>) -> u32 {
+        // windows 0.52 projects GetLastError as Result<(), Error>, converting
+        // nonzero Win32 codes to HRESULTs. Unwrap that projection without
+        // making another Windows call or turning an unknown failure into zero.
+        match result {
+            Ok(()) => 0,
+            Err(error) => {
+                let code = error.code().0 as u32;
+                if code & 0xffff_0000 == 0x8007_0000 && code & 0xffff != 0 {
+                    code & 0xffff
+                } else {
+                    code.max(1)
+                }
+            }
+        }
+    }
+
+    pub(super) fn enable_process_backup_privilege() -> Result<(), NtfsError> {
+        use windows::Win32::Security::TOKEN_ADJUST_PRIVILEGES;
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = HANDLE::default();
+        // SAFETY: this opens only our own process token, with the access needed
+        // to enable an existing privilege. No previous-state query is requested.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
+            .map_err(|error| {
+                NtfsError::Privilege(format!("OpenProcessToken for SeBackupPrivilege: {error}"))
+            })?;
+        // SAFETY: OpenProcessToken succeeded and ownership transfers exactly once.
+        let token = unsafe { OwnedHandle::from_raw_handle(token.0 as RawHandle) };
+        enable_backup_privilege_on_token(&token)
+    }
+
+    pub(super) fn enable_backup_privilege_on_token(token: &OwnedHandle) -> Result<(), NtfsError> {
+        use windows::Win32::Foundation::{GetLastError, LUID};
+        use windows::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
+            SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES,
+        };
+
+        let mut luid = LUID::default();
+        // SAFETY: SE_BACKUP_NAME is terminated and the output LUID is writable.
+        unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_BACKUP_NAME, &mut luid) }.map_err(
+            |error| {
+                NtfsError::Privilege(format!("LookupPrivilegeValueW(SeBackupPrivilege): {error}"))
+            },
+        )?;
+        let requested = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        // SAFETY: the token is owned, and the one-entry request lives through
+        // this synchronous call. Capture GetLastError before any logging or
+        // other Windows call; a successful BOOL is insufficient on its own.
+        let (succeeded, last_error) = unsafe {
+            let result = AdjustTokenPrivileges(raw(token), false, Some(&requested), 0, None, None);
+            let last_error = GetLastError();
+            (result.is_ok(), last_error)
+        };
+        check_backup_privilege_adjustment(succeeded, captured_last_error_code(last_error))
     }
 
     pub(super) fn canonical_path(path: &std::path::Path) -> Result<String, NtfsError> {
@@ -1116,14 +1255,13 @@ mod native {
         }))
     }
 
-    fn inaccessible(error: &WindowsError) -> bool {
-        [
-            ERROR_FILE_NOT_FOUND,
-            ERROR_PATH_NOT_FOUND,
-            ERROR_ACCESS_DENIED,
-        ]
-        .iter()
-        .any(|code| error.code() == HRESULT::from_win32(code.0))
+    pub(super) fn missing_file(error: &WindowsError) -> bool {
+        // An access-denied probe does not prove deletion. It can be caused by
+        // the token, an ancestor's access policy, or transient filesystem state
+        // without a later per-file USN record that would restore this document.
+        [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND]
+            .iter()
+            .any(|code| error.code() == HRESULT::from_win32(code.0))
     }
 
     pub(super) fn resolve_metadata(
@@ -1155,7 +1293,7 @@ mod native {
             )
         } {
             Ok(handle) => handle,
-            Err(error) if inaccessible(&error) => return Ok(None),
+            Err(error) if missing_file(&error) => return Ok(None),
             Err(error) => return Err(journal_error("OpenFileById", error)),
         };
         // SAFETY: OpenFileById returned a new valid handle and ownership is
@@ -1164,7 +1302,7 @@ mod native {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: the handle remains valid and info is a live output struct.
         if let Err(error) = unsafe { GetFileInformationByHandle(raw(&handle), &mut info) } {
-            if inaccessible(&error) {
+            if missing_file(&error) {
                 return Ok(None);
             }
             return Err(journal_error("GetFileInformationByHandle", error));
@@ -1206,7 +1344,7 @@ mod native {
                 unsafe { GetFinalPathNameByHandleW(raw(handle), &mut buffer, VOLUME_NAME_GUID) };
             if length == 0 {
                 let error = WindowsError::from_win32();
-                if inaccessible(&error) {
+                if missing_file(&error) {
                     return Ok(None);
                 }
                 return Err(journal_error("GetFinalPathNameByHandleW", error));
@@ -1698,6 +1836,85 @@ mod tests {
     }
 
     #[test]
+    fn mft_access_denial_never_becomes_an_omitted_file_or_successful_eof() {
+        let config = ReaderConfig {
+            max_records_per_tick: 2,
+            ..ReaderConfig::default()
+        };
+        let records = [
+            record(100, 10, 0, "before-denied.txt"),
+            record(180, 11, 0, "temporarily-denied.txt"),
+            record(260, 12, 0, "after-denied.txt"),
+        ];
+        let mut scan = mft::State::default();
+        let mut resolved = Vec::new();
+        let denied = scan.next_batch(
+            42,
+            &config,
+            |_| Ok(Some(encoded_batch(13, &records))),
+            |record| {
+                resolved.push(record.frn);
+                if record.frn == records[1].frn {
+                    Err(NtfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "metadata access temporarily denied",
+                    )))
+                } else {
+                    Ok(Some(resolved_meta(record)))
+                }
+            },
+        );
+        assert!(matches!(
+            denied,
+            Err(NtfsError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(resolved, [10, 11]);
+        assert!(
+            scan.next_batch(
+                42,
+                &config,
+                |_| panic!("a failed scan must not request or acknowledge EOF"),
+                |_| panic!("access restoration requires a fresh baseline"),
+            )
+            .is_err()
+        );
+
+        // Once access is restored, a new scan includes the denied identity and
+        // resumes its raw page without skipping the bounded unread suffix.
+        let mut recovered = mft::State::default();
+        let first = recovered
+            .next_batch(
+                42,
+                &config,
+                |_| Ok(Some(encoded_batch(13, &records))),
+                |record| Ok(Some(resolved_meta(record))),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first,
+            records[..2].iter().map(resolved_meta).collect::<Vec<_>>()
+        );
+        let last = recovered
+            .next_batch(
+                42,
+                &config,
+                |_| panic!("the unread MFT suffix stays in the same bounded buffer"),
+                |record| Ok(Some(resolved_meta(record))),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(last, vec![resolved_meta(&records[2])]);
+        assert!(
+            recovered
+                .next_batch(42, &config, |_| Ok(None), |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn mft_partial_output_validates_complete_records_without_usn_order_assumptions() {
         let records = [
             record(900, 0x4321_0000_0000_0020, 0, "first.txt"),
@@ -1798,6 +2015,129 @@ mod tests {
         assert!(journal::validate_partial_output(&buffer[..7], cursor(100)).is_err());
         assert!(journal::validate_partial_output(&encoded_batch(340, &[]), cursor(100)).is_err());
         assert!(journal::validate_partial_output(&buffer, cursor(340)).is_err());
+    }
+
+    #[test]
+    fn denied_metadata_and_exclusion_probes_replay_the_entire_unacknowledged_batch() {
+        let records = [
+            record(100, 10, 1, "before-denied.txt"),
+            record(180, 11, 1, "temporarily-denied.txt"),
+            record(260, 12, 1, "after-denied.txt"),
+        ];
+        let bytes = encoded_batch(340, &records);
+        for denied_exclusion in [false, true] {
+            let mut resolved = Vec::new();
+            let failed = journal::resolve_batch(
+                42,
+                &bytes,
+                cursor(100),
+                2,
+                |record| {
+                    resolved.push(record.frn);
+                    if record.frn == 11 && !denied_exclusion {
+                        Err(NtfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "metadata access denied",
+                        )))
+                    } else {
+                        Ok(Some(resolved_meta(record)))
+                    }
+                },
+                |record, _| {
+                    if record.frn == 11 && denied_exclusion {
+                        Err(NtfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "parent path access denied",
+                        )))
+                    } else {
+                        Ok(false)
+                    }
+                },
+            );
+            assert!(matches!(
+                failed,
+                Err(NtfsError::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+            ));
+            assert_eq!(resolved, [10, 11]);
+
+            // No returned cursor can acknowledge either member of the failed
+            // batch. A successful retry replays its prefix, including the file
+            // whose probe failed, then continues at the first unread record.
+            let (replayed, next) = journal::resolve_batch(
+                42,
+                &bytes,
+                cursor(100),
+                2,
+                |record| Ok(Some(resolved_meta(record))),
+                |_, _| Ok(false),
+            )
+            .unwrap();
+            assert_eq!(
+                replayed,
+                records[..2]
+                    .iter()
+                    .map(|record| FileEvent::Modified(resolved_meta(record)))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(next, cursor(260));
+            let (last, end) = journal::resolve_batch(
+                42,
+                &encoded_batch(340, &records[2..]),
+                next,
+                2,
+                |record| Ok(Some(resolved_meta(record))),
+                |_, _| Ok(false),
+            )
+            .unwrap();
+            assert_eq!(last, vec![FileEvent::Modified(resolved_meta(&records[2]))]);
+            assert_eq!(end, cursor(340));
+        }
+    }
+
+    #[test]
+    fn transactional_stream_changes_refresh_content_across_bounded_replay() {
+        let frn = 0xFEDC_0000_0000_0020;
+        let records = [
+            record(100, frn, journal::REASON_TRANSACTED, "transactional.txt"),
+            record(
+                180,
+                frn,
+                journal::REASON_TRANSACTED | journal::REASON_CLOSE,
+                "transactional.txt",
+            ),
+            record(
+                260,
+                frn,
+                journal::REASON_TRANSACTED | journal::REASON_DELETE | journal::REASON_CLOSE,
+                "transactional.txt",
+            ),
+        ];
+        for _ in 0..2 {
+            let mut position = cursor(100);
+            for (number, record) in records.iter().enumerate() {
+                let (events, next) = journal::resolve_batch(
+                    42,
+                    &encoded_batch(340, &records[number..]),
+                    position,
+                    1,
+                    |record| {
+                        assert_eq!(record.reason & journal::REASON_DELETE, 0);
+                        Ok(Some(resolved_meta(record)))
+                    },
+                    |_, _| Ok(false),
+                )
+                .unwrap();
+                let expected = if number == 2 {
+                    FileEvent::Deleted(DocKey::from_parts(42, frn))
+                } else {
+                    FileEvent::Modified(resolved_meta(record))
+                };
+                assert_eq!(events, [expected]);
+                assert_eq!(next, cursor([180, 260, 340][number]));
+                position = next;
+            }
+        }
     }
 
     #[test]
@@ -2096,6 +2436,26 @@ mod tests {
         assert!(journal::event_from_record(42, &change, || Ok(Some(wrong))).is_err());
     }
 
+    #[test]
+    fn backup_privilege_requires_both_api_success_and_complete_assignment() {
+        assert!(check_backup_privilege_adjustment(true, 0).is_ok());
+        for (succeeded, last_error) in [
+            (false, 0),
+            (false, 5),
+            (true, 5),
+            (false, 1300),
+            (true, 1300),
+        ] {
+            let error = check_backup_privilege_adjustment(succeeded, last_error)
+                .expect_err("an unavailable privilege must not authorize native ingestion");
+            assert!(matches!(error, NtfsError::Privilege(_)));
+            assert!(error.to_string().contains("SeBackupPrivilege"));
+            if last_error == 1300 {
+                assert!(error.to_string().contains("absent"));
+            }
+        }
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn unsupported_platform_never_reports_an_idle_watcher() {
@@ -2104,6 +2464,10 @@ mod tests {
             guid_path: "unsupported".into(),
             drive_letters: vec![],
         };
+        assert!(matches!(
+            enable_backup_privilege(),
+            Err(NtfsError::NotSupported)
+        ));
         assert!(matches!(discover_volumes(), Err(NtfsError::NotSupported)));
         assert!(matches!(
             begin_mft_scan(&volume, &ReaderConfig::default()),
@@ -2119,6 +2483,163 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    mod backup_privilege_tokens {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows::Win32::Foundation::{
+            BOOL, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError, HANDLE, LUID,
+        };
+        use windows::Win32::Security::{
+            AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+            PRIVILEGE_SET, PrivilegeCheck, SE_BACKUP_NAME, SE_PRIVILEGE_REMOVED,
+            SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_PRIVILEGES,
+            TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY, TokenImpersonation,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        use windows::core::PCWSTR;
+
+        fn raw(token: &OwnedHandle) -> HANDLE {
+            HANDLE(token.as_raw_handle() as isize)
+        }
+
+        fn copied_token() -> OwnedHandle {
+            let mut source = HANDLE::default();
+            // SAFETY: the real process token is opened only for query/duplicate,
+            // never adjustment. The owned handle closes on every exit path.
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut source,
+                )
+            }
+            .expect("open test process token for duplication");
+            let source = unsafe { OwnedHandle::from_raw_handle(source.0 as _) };
+            let mut copy = HANDLE::default();
+            // SAFETY: create a separate token object. It is never assigned to a
+            // process or thread, and only this disposable copy will be changed.
+            unsafe {
+                DuplicateTokenEx(
+                    raw(&source),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    None,
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut copy,
+                )
+            }
+            .expect("duplicate test token");
+            unsafe { OwnedHandle::from_raw_handle(copy.0 as _) }
+        }
+
+        fn backup_entry(attributes: TOKEN_PRIVILEGES_ATTRIBUTES) -> LUID_AND_ATTRIBUTES {
+            let mut luid = LUID::default();
+            unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_BACKUP_NAME, &mut luid) }
+                .expect("look up backup privilege for fixture");
+            LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: attributes,
+            }
+        }
+
+        fn adjust_fixture(token: &OwnedHandle, attributes: TOKEN_PRIVILEGES_ATTRIBUTES) -> u32 {
+            let request = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [backup_entry(attributes)],
+            };
+            // SAFETY: this disposable token and one-entry request are valid
+            // throughout the synchronous call. No ambient token is modified.
+            let (result, last_error) = unsafe {
+                let result =
+                    AdjustTokenPrivileges(raw(token), false, Some(&request), 0, None, None);
+                let last_error = GetLastError();
+                (result, last_error)
+            };
+            result.expect("adjust disposable fixture token");
+            native::captured_last_error_code(last_error)
+        }
+
+        fn backup_enabled(token: &OwnedHandle) -> bool {
+            let mut requested = PRIVILEGE_SET {
+                PrivilegeCount: 1,
+                Control: 0,
+                Privilege: [backup_entry(TOKEN_PRIVILEGES_ATTRIBUTES::default())],
+            };
+            let mut enabled = BOOL::default();
+            // SAFETY: this is a query-only check of the duplicate impersonation
+            // token; both output structures are valid for this call.
+            unsafe { PrivilegeCheck(raw(token), &mut requested, &mut enabled) }
+                .expect("query backup privilege on fixture token");
+            enabled.as_bool()
+        }
+
+        #[test]
+        fn absent_backup_privilege_cannot_be_added_to_a_copied_token() {
+            let token = copied_token();
+            // SE_PRIVILEGE_REMOVED genuinely removes the entry, rather than
+            // merely disabling it. An already absent entry is also acceptable.
+            let removed = adjust_fixture(&token, SE_PRIVILEGE_REMOVED);
+            assert!(removed == ERROR_SUCCESS.0 || removed == ERROR_NOT_ALL_ASSIGNED.0);
+            assert!(!backup_enabled(&token));
+
+            let error = native::enable_backup_privilege_on_token(&token)
+                .expect_err("enabling must never add a privilege absent from the token");
+            assert!(matches!(error, NtfsError::Privilege(_)));
+            assert!(error.to_string().contains("absent"));
+            assert!(error.to_string().contains("1300"));
+            assert!(!backup_enabled(&token));
+        }
+
+        #[test]
+        #[ignore = "requires SeBackupPrivilege already present in the test process token"]
+        fn held_backup_privilege_is_enabled_idempotently_on_a_copied_token() {
+            let token = copied_token();
+            assert_eq!(
+                adjust_fixture(&token, TOKEN_PRIVILEGES_ATTRIBUTES::default()),
+                ERROR_SUCCESS.0,
+                "fixture requires an already assigned backup privilege"
+            );
+            assert!(!backup_enabled(&token));
+            native::enable_backup_privilege_on_token(&token)
+                .expect("enable existing disabled backup privilege");
+            assert!(backup_enabled(&token));
+            native::enable_backup_privilege_on_token(&token)
+                .expect("enabling an already enabled privilege is idempotent");
+            assert!(backup_enabled(&token));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_metadata_probe_errors_distinguish_missing_files_from_unavailable_access() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER,
+            ERROR_LOCK_VIOLATION, ERROR_NOT_READY, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+        };
+        use windows::core::{Error as WindowsError, HRESULT};
+
+        for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
+            let error = WindowsError::from(HRESULT::from_win32(code.0));
+            assert!(native::missing_file(&error));
+        }
+        for code in [
+            ERROR_ACCESS_DENIED,
+            ERROR_SHARING_VIOLATION,
+            ERROR_LOCK_VIOLATION,
+            ERROR_NOT_READY,
+            ERROR_GEN_FAILURE,
+            ERROR_INVALID_PARAMETER,
+        ] {
+            let error = WindowsError::from(HRESULT::from_win32(code.0));
+            assert!(
+                !native::missing_file(&error),
+                "Win32 error {} must not acknowledge deletion or omit a baseline file",
+                code.0
+            );
+        }
+    }
+
     /// Run explicitly on an elevated Windows host whose temp directory is on
     /// an isolated NTFS volume with an existing USN journal. This test also
     /// enumerates the whole volume through the bounded MFT reader:
@@ -2129,7 +2650,7 @@ mod tests {
     #[test]
     #[ignore = "requires elevated Windows, an isolated NTFS temp volume, and an enabled USN journal"]
     fn native_ntfs_lifecycle() {
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
         use std::time::{Duration, Instant};
 
         fn wait_for(
@@ -2213,6 +2734,8 @@ mod tests {
             *keys.first().unwrap()
         }
 
+        enable_backup_privilege()
+            .expect("native NTFS test requires SeBackupPrivilege already assigned to its token");
         let dir = tempfile::tempdir().unwrap();
         let directory = dir.path().to_str().expect("Unicode temp directory");
         let drive = directory
@@ -2323,6 +2846,36 @@ mod tests {
             &mut position,
             |event| matches!(event, FileEvent::Modified(meta) if meta.key == key && meta.size == 30),
         );
+
+        // Native NTFS records can arrive while a data writer is still open.
+        // Repeated writes may reuse the accumulated reason until the final
+        // CLOSE record. Both the early and final refresh must retain the same
+        // full identity, even for same-length in-place overwrites.
+        position = query_journal(&volume).unwrap();
+        let mut active_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old_path)
+            .unwrap();
+        active_writer.write_all(&[b'a'; 30]).unwrap();
+        active_writer.sync_all().unwrap();
+        wait_for(
+            &volume,
+            &mut position,
+            |event| matches!(event, FileEvent::Modified(meta) if meta.key == key && meta.size == 30),
+        );
+        active_writer.seek(SeekFrom::Start(0)).unwrap();
+        active_writer.write_all(&[b'b'; 30]).unwrap();
+        active_writer.sync_all().unwrap();
+        // Capture after the second write: observing the later event requires
+        // the native close, not a replay of the first write's journal record.
+        position = query_journal(&volume).unwrap();
+        drop(active_writer);
+        wait_for(
+            &volume,
+            &mut position,
+            |event| matches!(event, FileEvent::Modified(meta) if meta.key == key && meta.size == 30),
+        );
+        assert_eq!(std::fs::read(&old_path).unwrap(), [b'b'; 30]);
 
         let original_permissions = std::fs::metadata(&old_path).unwrap().permissions();
         let mut permissions = original_permissions.clone();

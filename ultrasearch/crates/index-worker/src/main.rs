@@ -425,7 +425,19 @@ fn process_job(
     if job.operation == JobOperation::Delete {
         return Ok(());
     }
-    let Some(before) = probe_job_file(&job)? else {
+    // Choose per-job limits before capturing bytes; capture obeys the same
+    // persisted policy as extraction even if the file has grown while queued.
+    let max_bytes = job.max_bytes.unwrap_or(args.max_bytes);
+    let max_chars = job.max_chars.unwrap_or(args.max_chars);
+    #[cfg(windows)]
+    let observed = if job.operation == JobOperation::Reconcile {
+        native_snapshot::capture(&job, max_bytes)
+    } else {
+        probe_job_file(&job)
+    };
+    #[cfg(not(windows))]
+    let observed = probe_job_file(&job);
+    let Some(before) = observed? else {
         // A queued path may have been renamed, deleted, or replaced since the
         // USN event. Never attribute a replacement file to the original FRN.
         anyhow::ensure!(
@@ -435,10 +447,6 @@ fn process_job(
         );
         return Ok(());
     };
-
-    // Choose per-job limits if present, otherwise fall back to CLI defaults.
-    let max_bytes = job.max_bytes.unwrap_or(args.max_bytes);
-    let max_chars = job.max_chars.unwrap_or(args.max_chars);
 
     let ext_owned = job
         .path
@@ -463,7 +471,16 @@ fn process_job(
     );
 
     let out = if before.content_readable {
-        let extracted = if job.operation == JobOperation::Reconcile {
+        let extracted = if let Some(captured) = &before.captured {
+            match captured {
+                Ok(bytes) => stack.extract_bytes(doc_key, &ctx, bytes),
+                Err(bytes) => Err(content_extractor::ExtractError::FileTooLarge {
+                    bytes: *bytes,
+                    max_bytes: max_bytes as u64,
+                }
+                .into()),
+            }
+        } else if job.operation == JobOperation::Reconcile {
             // Pathnames can be swapped away and back while their original
             // handle and metadata remain unchanged. Read the verified handle
             // itself so even that race cannot supply another file's bytes.
@@ -501,7 +518,17 @@ fn process_job(
             "content access denied; reconciling verified metadata and clearing obsolete text");
         omitted_content(doc_key)
     };
-    let Some(after) = probe_job_file(&job)? else {
+    #[cfg(windows)]
+    let observed = if before.captured.is_some() {
+        // Bytes are already captured. Attribute-only access validates current
+        // identity and metadata without requesting another data-read share.
+        probe_metadata_file(&job, true)
+    } else {
+        probe_job_file(&job)
+    };
+    #[cfg(not(windows))]
+    let observed = probe_job_file(&job);
+    let Some(after) = observed? else {
         anyhow::ensure!(
             job.operation == JobOperation::Reconcile,
             "file disappeared or identity changed during extraction: {}",
@@ -527,6 +554,10 @@ fn process_job(
     );
 
     let content_doc = to_content_doc(&job, &after.metadata, out)?;
+    // Release probe handles before Tantivy or output can block. The Windows
+    // oplock used to capture bytes has already been released before extraction.
+    drop(after);
+    drop(before);
     content_index::add_content_doc(writer, &index.fields, &content_doc)?;
 
     if args.json {
@@ -562,15 +593,55 @@ fn omitted_content(key: DocKey) -> content_extractor::ExtractedContent {
     }
 }
 
-/// Keep the validated file open throughout extraction so NTFS cannot reuse its
-/// MFT slot while a worker is processing it.
+/// Verified metadata plus either a live source handle or an immutable snapshot.
+/// Windows Reconcile captures bytes under an oplock and releases all capture
+/// handles before CPU extraction; the full FRN still detects later slot reuse.
 struct FileSnapshot {
     file: Option<fs::File>,
+    captured: Option<CapturedContent>,
     metadata: fs::Metadata,
     modified: std::time::SystemTime,
     content_readable: bool,
     #[cfg(windows)]
     identity: WindowsFileIdentity,
+}
+
+/// Successful bounded bytes, or the observed byte count exceeding the policy.
+type CapturedContent = std::result::Result<Vec<u8>, u64>;
+
+#[cfg(any(windows, test))]
+const SNAPSHOT_READ_SIZE: usize = 64 * 1024;
+
+#[cfg(any(windows, test))]
+trait SnapshotSource {
+    fn check_intact(&self) -> Result<()>;
+    fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<usize>;
+}
+
+/// Read at most one byte beyond the persisted limit, including files that grow
+/// after their metadata probe. The source must invalidate any read overlapping
+/// a change; checking again after each read rejects simultaneous break/EOF.
+#[cfg(any(windows, test))]
+fn capture_bounded(source: &mut impl SnapshotSource, max_bytes: usize) -> Result<CapturedContent> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(SNAPSHOT_READ_SIZE));
+    let mut chunk = [0u8; SNAPSHOT_READ_SIZE];
+    loop {
+        source.check_intact()?;
+        let wanted = max_bytes
+            .saturating_sub(bytes.len())
+            .saturating_add(1)
+            .min(chunk.len());
+        let length = source.read_at(bytes.len() as u64, &mut chunk[..wanted])?;
+        anyhow::ensure!(length <= wanted, "snapshot read exceeded its buffer");
+        source.check_intact()?;
+        if length == 0 {
+            return Ok(Ok(bytes));
+        }
+        if length > max_bytes.saturating_sub(bytes.len()) {
+            return Ok(Err(bytes.len().saturating_add(length) as u64));
+        }
+        bytes.extend_from_slice(&chunk[..length]);
+    }
 }
 
 impl FileSnapshot {
@@ -610,32 +681,7 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
             if job.operation == JobOperation::Reconcile
                 && allows_metadata_only_omission(&error) =>
         {
-            #[cfg(windows)]
-            let file = {
-                use std::os::windows::fs::OpenOptionsExt;
-                use windows::Win32::Storage::FileSystem::{
-                    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-                };
-                match open_job_path(job, || {
-                    fs::OpenOptions::new()
-                        .access_mode(FILE_READ_ATTRIBUTES.0)
-                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
-                        .open(&job.path)
-                })? {
-                    Ok(file) => Some(file),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| {
-                                format!("cannot verify metadata identity: {}", job.path.display())
-                            })
-                            .context(DeferredFileFailure);
-                    }
-                }
-            };
-            #[cfg(not(windows))]
-            let file = None;
-            (file, false)
+            return probe_metadata_file(job, false);
         }
         Err(error) => {
             return Err(error)
@@ -643,6 +689,43 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
                 .context(DeferredFileFailure);
         }
     };
+    probe_open_file(job, file, content_readable)
+}
+
+fn probe_metadata_file(job: &JobSpec, content_readable: bool) -> Result<Option<FileSnapshot>> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        };
+        match open_job_path(job, || {
+            fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES.0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+                .open(&job.path)
+        })? {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| {
+                        format!("cannot verify metadata identity: {}", job.path.display())
+                    })
+                    .context(DeferredFileFailure);
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    let file = None;
+    probe_open_file(job, file, content_readable)
+}
+
+fn probe_open_file(
+    job: &JobSpec,
+    file: Option<fs::File>,
+    content_readable: bool,
+) -> Result<Option<FileSnapshot>> {
     let metadata = file
         .as_ref()
         .map_or_else(|| fs::metadata(&job.path), fs::File::metadata)
@@ -678,6 +761,7 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
         .context(DeferredFileFailure)?;
     Ok(Some(FileSnapshot {
         file,
+        captured: None,
         metadata,
         modified,
         content_readable,
@@ -765,6 +849,376 @@ fn allows_metadata_only_omission(error: &std::io::Error) -> bool {
         }
     }
     true
+}
+
+/// Capture without denying application writers. Atomic Read-Handle oplocks
+/// notify us when data changes and let us close before a conflicting open fails
+/// its sharing check. CPU extraction runs only after all these handles close.
+#[cfg(windows)]
+mod native_snapshot {
+    use super::*;
+    use std::cell::UnsafeCell;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{
+        ERROR_HANDLE_EOF, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, GENERIC_READ, HANDLE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CREATEFILE2_EXTENDED_PARAMETERS, CreateFile2, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+    };
+    use windows::Win32::System::IO::{
+        CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
+    };
+    use windows::Win32::System::Ioctl::{
+        FSCTL_REQUEST_OPLOCK, OPLOCK_LEVEL_CACHE_HANDLE, OPLOCK_LEVEL_CACHE_READ,
+        REQUEST_OPLOCK_CURRENT_VERSION, REQUEST_OPLOCK_INPUT_BUFFER,
+        REQUEST_OPLOCK_INPUT_FLAG_REQUEST, REQUEST_OPLOCK_OUTPUT_BUFFER,
+    };
+    use windows::Win32::System::Threading::{
+        CreateEventW, INFINITE, ResetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    };
+    use windows::Win32::System::WindowsProgramming::FILE_FLAG_OPEN_REQUIRING_OPLOCK;
+    use windows::core::PCWSTR;
+
+    const READ_WAIT_MS: u32 = 5_000;
+
+    pub(super) fn win32_io_error(error: windows::core::Error) -> std::io::Error {
+        let code = error.code().0 as u32;
+        if code & 0xffff_0000 == 0x8007_0000 {
+            std::io::Error::from_raw_os_error((code & 0xffff) as i32)
+        } else {
+            std::io::Error::other(error)
+        }
+    }
+
+    fn open_atomic(job: &JobSpec) -> std::io::Result<fs::File> {
+        let path: Vec<_> = job.path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let parameters = CREATEFILE2_EXTENDED_PARAMETERS {
+            dwSize: std::mem::size_of::<CREATEFILE2_EXTENDED_PARAMETERS>() as u32,
+            dwFileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+            dwFileFlags: FILE_FLAG_OVERLAPPED.0 | FILE_FLAG_OPEN_REQUIRING_OPLOCK,
+            ..Default::default()
+        };
+        // SAFETY: path is terminated and parameters remain alive for this call.
+        // The returned handle is owned by File and used only with overlapped IO.
+        let handle = unsafe {
+            CreateFile2(
+                PCWSTR(path.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                OPEN_EXISTING,
+                Some(&parameters),
+            )
+        }
+        .map_err(win32_io_error)?;
+        Ok(unsafe { fs::File::from_raw_handle(handle.0 as _) })
+    }
+
+    fn event() -> Result<OwnedHandle> {
+        // SAFETY: unnamed, initially nonsignaled manual-reset event. The owned
+        // handle outlives every OVERLAPPED request that refers to it.
+        let handle = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }?;
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle.0 as _) })
+    }
+
+    fn raw(handle: &impl AsRawHandle) -> HANDLE {
+        HANDLE(handle.as_raw_handle() as _)
+    }
+
+    struct OplockRequest {
+        input: REQUEST_OPLOCK_INPUT_BUFFER,
+        output: REQUEST_OPLOCK_OUTPUT_BUFFER,
+        overlapped: OVERLAPPED,
+    }
+
+    struct ReadRequest {
+        bytes: [u8; SNAPSHOT_READ_SIZE],
+        overlapped: OVERLAPPED,
+    }
+
+    pub(super) struct Reader {
+        file: Option<fs::File>,
+        // Boxed storage never moves while the kernel owns these pointers.
+        // UnsafeCell permits kernel writes while check_intact borrows Reader.
+        oplock: Box<UnsafeCell<OplockRequest>>,
+        read: Box<UnsafeCell<ReadRequest>>,
+        oplock_event: OwnedHandle,
+        read_event: OwnedHandle,
+        oplock_pending: bool,
+        read_pending: bool,
+    }
+
+    impl Reader {
+        pub(super) fn open(job: &JobSpec) -> Result<Self> {
+            let oplock_event = event()?;
+            let read_event = event()?;
+            let mut reader = Self {
+                file: None,
+                oplock: Box::new(UnsafeCell::new(OplockRequest {
+                    input: REQUEST_OPLOCK_INPUT_BUFFER {
+                        StructureVersion: REQUEST_OPLOCK_CURRENT_VERSION as u16,
+                        StructureLength: std::mem::size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u16,
+                        RequestedOplockLevel: OPLOCK_LEVEL_CACHE_READ | OPLOCK_LEVEL_CACHE_HANDLE,
+                        Flags: REQUEST_OPLOCK_INPUT_FLAG_REQUEST,
+                    },
+                    output: REQUEST_OPLOCK_OUTPUT_BUFFER::default(),
+                    overlapped: OVERLAPPED {
+                        hEvent: raw(&oplock_event),
+                        ..Default::default()
+                    },
+                })),
+                read: Box::new(UnsafeCell::new(ReadRequest {
+                    bytes: [0; SNAPSHOT_READ_SIZE],
+                    overlapped: OVERLAPPED::default(),
+                })),
+                oplock_event,
+                read_event,
+                oplock_pending: false,
+                read_pending: false,
+            };
+            // No filesystem operation on a successful atomic handle is allowed
+            // between this open and the oplock request, including metadata.
+            reader.file = Some(open_job_path(job, || open_atomic(job))??);
+            let handle = raw(reader.file.as_ref().expect("opened snapshot handle"));
+            // No request is pending while these buffers are initialized.
+            let request = unsafe { &mut *reader.oplock.get() };
+            // SAFETY: every retained input/output/OVERLAPPED pointer addresses
+            // boxed storage owned until completion; no stack byte-count pointer
+            // escapes. Drop closes the handle and drains both owned events.
+            let result = unsafe {
+                DeviceIoControl(
+                    handle,
+                    FSCTL_REQUEST_OPLOCK,
+                    Some(std::ptr::from_ref(&request.input).cast()),
+                    std::mem::size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u32,
+                    Some(std::ptr::from_mut(&mut request.output).cast()),
+                    std::mem::size_of::<REQUEST_OPLOCK_OUTPUT_BUFFER>() as u32,
+                    None,
+                    Some(&mut request.overlapped),
+                )
+            };
+            match result {
+                Err(error)
+                    if win32_io_error(error.clone()).raw_os_error()
+                        == Some(ERROR_IO_PENDING.0 as i32) =>
+                {
+                    reader.oplock_pending = true;
+                    reader.check_intact()?;
+                    Ok(reader)
+                }
+                Err(error) => Err(error).context("cannot establish snapshot oplock"),
+                Ok(()) => anyhow::bail!("snapshot oplock completed without a pending lease"),
+            }
+        }
+
+        fn metadata(&self, job: &JobSpec) -> Result<Option<FileSnapshot>> {
+            self.check_intact()?;
+            // DuplicateHandle preserves the same file object/oplock key. It
+            // does not reopen a pathname that could block behind our own RH.
+            let file = self
+                .file
+                .as_ref()
+                .context("snapshot handle closed")?
+                .try_clone()?;
+            let mut snapshot = probe_open_file(job, Some(file), true)?;
+            if let Some(snapshot) = &mut snapshot {
+                snapshot.file = None;
+            }
+            self.check_intact()?;
+            Ok(snapshot)
+        }
+    }
+
+    impl SnapshotSource for Reader {
+        fn check_intact(&self) -> Result<()> {
+            // SAFETY: the event is owned and is never closed while self exists.
+            match unsafe { WaitForSingleObject(raw(&self.oplock_event), 0) } {
+                WAIT_TIMEOUT => Ok(()),
+                WAIT_OBJECT_0 => anyhow::bail!("snapshot oplock broke; retry required"),
+                _ => Err(std::io::Error::last_os_error()).context("cannot inspect snapshot oplock"),
+            }
+        }
+
+        fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<usize> {
+            self.check_intact()?;
+            anyhow::ensure!(
+                !self.read_pending && target.len() <= SNAPSHOT_READ_SIZE,
+                "invalid snapshot read state"
+            );
+            let handle = raw(self.file.as_ref().context("snapshot handle closed")?);
+            // SAFETY: no prior read owns this event/request now.
+            unsafe { ResetEvent(raw(&self.read_event)) }?;
+            // No kernel read owns this cell until ReadFile is issued below.
+            let request = unsafe { &mut *self.read.get() };
+            request.overlapped = OVERLAPPED {
+                hEvent: raw(&self.read_event),
+                Anonymous: OVERLAPPED_0 {
+                    Anonymous: OVERLAPPED_0_0 {
+                        Offset: offset as u32,
+                        OffsetHigh: (offset >> 32) as u32,
+                    },
+                },
+                ..Default::default()
+            };
+            // SAFETY: the boxed buffer and OVERLAPPED remain alive, at the same
+            // addresses, until completion or Drop's cancellation/close/drain.
+            let result = unsafe {
+                ReadFile(
+                    handle,
+                    Some(&mut request.bytes[..target.len()]),
+                    None,
+                    Some(&mut request.overlapped),
+                )
+            };
+            match result {
+                Ok(()) => {}
+                Err(error) => match win32_io_error(error.clone()).raw_os_error() {
+                    Some(code) if code == ERROR_HANDLE_EOF.0 as i32 => {
+                        self.check_intact()?;
+                        return Ok(0);
+                    }
+                    Some(code) if code == ERROR_IO_PENDING.0 as i32 => {
+                        self.read_pending = true;
+                        // Put break first so simultaneous read/break readiness
+                        // invalidates the snapshot. Writes need no RH ACK; a
+                        // conflicting open proceeds as soon as Drop closes us.
+                        let ready = unsafe {
+                            WaitForMultipleObjects(
+                                &[raw(&self.oplock_event), raw(&self.read_event)],
+                                false,
+                                READ_WAIT_MS,
+                            )
+                        };
+                        if ready == WAIT_OBJECT_0 {
+                            anyhow::bail!("snapshot oplock broke during read; retry required");
+                        }
+                        anyhow::ensure!(
+                            ready.0 == WAIT_OBJECT_0.0 + 1,
+                            "snapshot read timed out or wait failed"
+                        );
+                    }
+                    _ => return Err(error).context("snapshot read failed"),
+                },
+            }
+            let mut length = 0;
+            // SAFETY: immediate success or the read event establishes request
+            // completion. The original file handle remains valid here.
+            let completed = unsafe {
+                GetOverlappedResult(
+                    handle,
+                    std::ptr::addr_of!((*self.read.get()).overlapped),
+                    &mut length,
+                    false,
+                )
+            };
+            if completed.as_ref().is_err_and(|error| {
+                win32_io_error(error.clone()).raw_os_error() == Some(ERROR_IO_INCOMPLETE.0 as i32)
+            }) {
+                self.read_pending = true;
+                anyhow::bail!("snapshot read signaled without completing");
+            }
+            self.read_pending = false;
+            if let Err(error) = completed {
+                if win32_io_error(error.clone()).raw_os_error() == Some(ERROR_HANDLE_EOF.0 as i32) {
+                    // An overlapped EOF can complete asynchronously as well as
+                    // return directly from ReadFile. Both are terminal reads.
+                    self.check_intact()?;
+                    return Ok(0);
+                }
+                return Err(error).context("cannot finish snapshot read");
+            }
+            self.check_intact()?;
+            let length = length as usize;
+            anyhow::ensure!(length <= target.len(), "snapshot read exceeded its buffer");
+            // Completion above ended the kernel's mutable access to this cell.
+            let bytes = unsafe { &(*self.read.get()).bytes };
+            target[..length].copy_from_slice(&bytes[..length]);
+            Ok(length)
+        }
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            if let Some(file) = self.file.take() {
+                // Cancel only a data read. Canceling the oplock before closing
+                // its data handle could expose a sharing violation to a new
+                // application opener in between those two operations.
+                if self.read_pending {
+                    // SAFETY: the pending request's stable allocation remains
+                    // owned until its event is drained below, even on a race
+                    // where cancellation reports ERROR_NOT_FOUND.
+                    unsafe {
+                        let _ = CancelIoEx(
+                            raw(&file),
+                            Some(std::ptr::addr_of!((*self.read.get()).overlapped)),
+                        );
+                    }
+                }
+                // Close releases the data handle and cancels/acknowledges RH
+                // together. Do this before waiting for any outstanding read.
+                drop(file);
+            }
+            for (pending, event) in [
+                (self.read_pending, &self.read_event),
+                (self.oplock_pending, &self.oplock_event),
+            ] {
+                if pending && unsafe { WaitForSingleObject(raw(event), INFINITE) } != WAIT_OBJECT_0
+                {
+                    // Continuing/unwinding could free buffers still owned by
+                    // the kernel. A failed process cannot acknowledge its batch.
+                    // Abort directly: even a logging subscriber could panic
+                    // and unwind through these still-pending allocations.
+                    std::process::abort();
+                }
+            }
+        }
+    }
+
+    pub(super) fn capture(job: &JobSpec, max_bytes: usize) -> Result<Option<FileSnapshot>> {
+        capture_inner(job, max_bytes).context(DeferredFileFailure)
+    }
+
+    fn capture_inner(job: &JobSpec, max_bytes: usize) -> Result<Option<FileSnapshot>> {
+        let mut reader = match Reader::open(job) {
+            Ok(reader) => reader,
+            Err(error) => {
+                if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                    if io.kind() == std::io::ErrorKind::NotFound
+                        && !error.is::<DeferredFileFailure>()
+                    {
+                        return Ok(None);
+                    }
+                    if allows_metadata_only_omission(io) && !error.is::<DeferredFileFailure>() {
+                        return probe_metadata_file(job, false);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let Some(before) = reader.metadata(job)? else {
+            return Ok(None);
+        };
+        let bytes = if before.metadata.len() > max_bytes as u64 {
+            Err(before.metadata.len())
+        } else {
+            capture_bounded(&mut reader, max_bytes)?
+        };
+        let Some(mut after) = reader.metadata(job)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            before.matches(&after),
+            "file metadata changed during snapshot capture"
+        );
+        // This includes empty/oversized files and breaks racing the last read
+        // or metadata query. No data from a broken lease can become searchable.
+        reader.check_intact()?;
+        after.captured = Some(bytes);
+        drop(reader);
+        Ok(Some(after))
+    }
 }
 
 #[cfg(windows)]
@@ -977,6 +1431,98 @@ mod tests {
         }
     }
 
+    struct SnapshotFixture {
+        data: std::io::Cursor<Vec<u8>>,
+        max_read: usize,
+        reads: usize,
+        break_on_read: Option<usize>,
+        fail_on_read: Option<usize>,
+    }
+
+    impl SnapshotFixture {
+        fn new(data: &[u8], max_read: usize) -> Self {
+            Self {
+                data: std::io::Cursor::new(data.to_vec()),
+                max_read,
+                reads: 0,
+                break_on_read: None,
+                fail_on_read: None,
+            }
+        }
+    }
+
+    impl SnapshotSource for SnapshotFixture {
+        fn check_intact(&self) -> Result<()> {
+            anyhow::ensure!(
+                self.break_on_read != Some(self.reads),
+                "capture invalidated"
+            );
+            Ok(())
+        }
+        fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<usize> {
+            use std::io::Read;
+            self.reads += 1;
+            if self.fail_on_read == Some(self.reads) {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+            }
+            self.data.set_position(offset);
+            let length = target.len().min(self.max_read);
+            Ok(self.data.read(&mut target[..length])?)
+        }
+    }
+
+    #[test]
+    fn bounded_snapshot_enforces_limits_across_short_reads() -> Result<()> {
+        let mut source = SnapshotFixture::new(b"0123456789", 3);
+        assert_eq!(capture_bounded(&mut source, 8)?, Err(9));
+        assert_eq!(source.data.position(), 9);
+        assert_eq!(source.reads, 3);
+
+        let mut source = SnapshotFixture::new(b"0123456789", 3);
+        assert_eq!(
+            capture_bounded(&mut source, 10)?,
+            Ok(b"0123456789".to_vec())
+        );
+        assert_eq!(source.data.position(), 10);
+        let mut empty = SnapshotFixture::new(b"", 3);
+        assert_eq!(capture_bounded(&mut empty, 0)?, Ok(Vec::new()));
+        let mut nonempty = SnapshotFixture::new(b"more", 3);
+        assert_eq!(capture_bounded(&mut nonempty, 0)?, Err(1));
+        assert_eq!(nonempty.data.position(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_snapshot_rejects_breaks_before_read_after_read_and_at_eof() {
+        for break_on_read in [0, 1, 2] {
+            let mut source = SnapshotFixture::new(b"content", 7);
+            source.break_on_read = Some(break_on_read);
+            let error = capture_bounded(&mut source, 7).unwrap_err();
+            assert!(error.to_string().contains("capture invalidated"));
+            assert_eq!(source.reads, break_on_read);
+        }
+        // A break completing with EOF or the size-limit probe must not be
+        // accepted as a stable empty file or an intentional content omission.
+        for bytes in [&b""[..], &b"x"[..]] {
+            let mut source = SnapshotFixture::new(bytes, 1);
+            source.break_on_read = Some(1);
+            assert!(capture_bounded(&mut source, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_snapshot_propagates_read_failure_without_omission() {
+        let mut source = SnapshotFixture::new(b"content", 3);
+        source.fail_on_read = Some(2);
+        let error = capture_bounded(&mut source, 7).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(source.reads, 2);
+        assert_eq!(source.data.position(), 3);
+    }
+
     /// Inject a repeatable read failure for one actual file while letting the
     /// production verified-handle extractor read every other file normally.
     struct FailingFileExtractor {
@@ -1022,6 +1568,16 @@ mod tests {
         {
             self.check(key)?;
             content_extractor::SimpleTextExtractor.extract_file(ctx, key, file)
+        }
+        fn extract_bytes(
+            &self,
+            ctx: &ExtractContext,
+            key: DocKey,
+            bytes: &[u8],
+        ) -> std::result::Result<content_extractor::ExtractedContent, content_extractor::ExtractError>
+        {
+            self.check(key)?;
+            content_extractor::SimpleTextExtractor.extract_bytes(ctx, key, bytes)
         }
     }
 
@@ -1308,6 +1864,27 @@ mod tests {
                     .map_err(|error| content_extractor::ExtractError::Failed(error.to_string()))?;
                 Ok(extracted)
             }
+            fn extract_bytes(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+                bytes: &[u8],
+            ) -> std::result::Result<
+                content_extractor::ExtractedContent,
+                content_extractor::ExtractError,
+            > {
+                use std::io::Write;
+                let extracted =
+                    content_extractor::SimpleTextExtractor.extract_bytes(ctx, key, bytes)?;
+                // Windows must have released its capture handle before CPU
+                // extraction; application writes remain free to proceed.
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(ctx.path)
+                    .and_then(|mut writer| writer.write_all(b" appendedafterread"))
+                    .map_err(|error| content_extractor::ExtractError::Failed(error.to_string()))?;
+                Ok(extracted)
+            }
         }
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("changing.txt");
@@ -1416,6 +1993,212 @@ mod tests {
         assert_eq!(content_matches(&index, "lockedreplacement")?, 1);
         assert_eq!(content_matches(&index, "availableword")?, 1);
         assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_oplock_discards_capture_overlapping_a_shared_writer() -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        struct ConcurrentWriter {
+            reader: native_snapshot::Reader,
+            writer: fs::File,
+            wrote: bool,
+        }
+
+        impl SnapshotSource for ConcurrentWriter {
+            fn check_intact(&self) -> Result<()> {
+                self.reader.check_intact()
+            }
+            fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<usize> {
+                let length = self.reader.read_at(offset, target)?;
+                if !self.wrote {
+                    // Same-length overwrites cannot be detected from length,
+                    // and Windows need not publish mtime until writers close.
+                    self.writer.seek(SeekFrom::Start(0))?;
+                    self.writer.write_all(b"newcontent")?;
+                    self.wrote = true;
+                }
+                Ok(length)
+            }
+        }
+
+        // Existing shared writer handles may coexist with RH. A new shared
+        // writer is also allowed; actual data writes invalidate either lease.
+        for writer_open_first in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("changing.txt");
+            fs::write(&path, b"oldcontent")?;
+            let mut job = job_for(path.clone())?;
+            job.path = PathBuf::from(final_guid_path(&fs::File::open(&path)?)?);
+            let open_writer = || {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+                    .open(&path)
+            };
+            let first_writer = if writer_open_first {
+                Some(open_writer()?)
+            } else {
+                None
+            };
+            let reader = native_snapshot::Reader::open(&job)?;
+            let writer = match first_writer {
+                Some(writer) => writer,
+                None => open_writer()?,
+            };
+            let mut changing = ConcurrentWriter {
+                reader,
+                writer,
+                wrote: false,
+            };
+            let error = capture_bounded(&mut changing, 1024).unwrap_err();
+            assert!(changing.wrote, "the application write must succeed");
+            assert!(error.to_string().contains("oplock broke"));
+            assert_eq!(
+                changing.writer.metadata()?.len(),
+                b"oldcontent".len() as u64
+            );
+            drop(changing);
+
+            // No further data write is needed: release and retry captures the
+            // complete current document through the production capture path.
+            let recovered = native_snapshot::capture(&job, 1024)?.context("expected snapshot")?;
+            assert_eq!(recovered.captured, Some(Ok(b"newcontent".to_vec())));
+            assert_eq!(recovered.metadata.len(), b"newcontent".len() as u64);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_new_exclusive_writer_succeeds_after_capture_acknowledges_break() -> Result<()> {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("exclusive.txt");
+        fs::write(&path, b"oldcontent")?;
+        let job = job_for(path.clone())?;
+        let reader = native_snapshot::Reader::open(&job)?;
+        let (sent, received) = mpsc::channel();
+        let application = std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<()> {
+                let mut writer = fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(0)
+                    .open(path)?;
+                writer.write_all(b"newcontent")
+            })();
+            let _ = sent.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut broke = false;
+        while Instant::now() < deadline {
+            if reader.check_intact().is_err() {
+                broke = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Conflicting opens need RH acknowledgement. Always close before any
+        // join/receive/assertion so failure paths cannot strand the application.
+        drop(reader);
+        received.recv_timeout(Duration::from_secs(5))??;
+        application
+            .join()
+            .map_err(|_| anyhow::anyhow!("application writer panicked"))?;
+        assert!(broke, "exclusive writer must signal the RH break");
+        let current = native_snapshot::capture(&job, 1024)?.context("expected snapshot")?;
+        assert_eq!(current.captured, Some(Ok(b"newcontent".to_vec())));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extraction_and_final_probe_allow_a_new_exclusive_writer() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::{Arc, Mutex};
+
+        struct ExclusiveDuringExtraction(Arc<Mutex<Option<fs::File>>>);
+        impl Extractor for ExclusiveDuringExtraction {
+            fn name(&self) -> &'static str {
+                "exclusive-writer-during-extraction"
+            }
+            fn supports(&self, _: &ExtractContext) -> bool {
+                true
+            }
+            fn extract(
+                &self,
+                _: &ExtractContext,
+                _: DocKey,
+            ) -> std::result::Result<
+                content_extractor::ExtractedContent,
+                content_extractor::ExtractError,
+            > {
+                Err(content_extractor::ExtractError::Failed(
+                    "snapshot bytes required".into(),
+                ))
+            }
+            fn extract_bytes(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+                bytes: &[u8],
+            ) -> std::result::Result<
+                content_extractor::ExtractedContent,
+                content_extractor::ExtractError,
+            > {
+                let writer = fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(0)
+                    .open(ctx.path)
+                    .map_err(|error| content_extractor::ExtractError::Failed(error.to_string()))?;
+                *self.0.lock().expect("writer guard lock") = Some(writer);
+                content_extractor::SimpleTextExtractor.extract_bytes(ctx, key, bytes)
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("extraction.txt");
+        fs::write(&path, b"verifiedcontent")?;
+        let job = job_for(path)?;
+        let key = DocKey::from_parts(job.volume_id, job.file_id);
+        let held = Arc::new(Mutex::new(None));
+        let stack =
+            ExtractorStack::new(vec![Box::new(ExclusiveDuringExtraction(Arc::clone(&held)))]);
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        process_batch(
+            &stack,
+            &index,
+            &mut writer,
+            deferrable_batch(vec![job]),
+            &args(),
+        )?;
+        assert!(held.lock().expect("writer guard lock").is_some());
+        let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+        assert!(outcome.receipt.complete);
+        assert!(outcome.deferred.is_empty());
+        assert_eq!(content_matches(&index, "verifiedcontent")?, 1);
+        assert!(
+            content_index::read_file_meta(&index, &content_index::open_reader(&index)?, key)?
+                .is_some()
+        );
         Ok(())
     }
 
@@ -1774,15 +2557,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_a_file_changed_during_extraction() -> Result<()> {
+    fn snapshot_rejects_metadata_changes_during_extraction() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("snapshot.txt");
         fs::write(&path, "before")?;
         let job = job_for(path.clone())?;
         let before = probe_job_file(&job)?.expect("existing file");
-        fs::write(path, "changed and longer")?;
+        let metadata_writer = fs::OpenOptions::new().write(true).open(&path)?;
+        metadata_writer.set_modified(before.modified + std::time::Duration::from_secs(2))?;
+        drop(metadata_writer);
         let after = probe_job_file(&job)?.expect("existing file");
         assert!(!before.matches(&after));
+        drop(after);
+        drop(before);
+        fs::OpenOptions::new().write(true).open(path)?;
         Ok(())
     }
 
@@ -1829,6 +2617,14 @@ mod tests {
                 file: &fs::File,
             ) -> std::result::Result<ExtractedContent, ExtractError> {
                 Self::while_replaced(ctx, || SimpleTextExtractor.extract_file(ctx, key, file))
+            }
+            fn extract_bytes(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+                bytes: &[u8],
+            ) -> std::result::Result<ExtractedContent, ExtractError> {
+                Self::while_replaced(ctx, || SimpleTextExtractor.extract_bytes(ctx, key, bytes))
             }
         }
 
@@ -2147,6 +2943,17 @@ mod tests {
                 ctx: &ExtractContext,
                 key: DocKey,
                 _: &fs::File,
+            ) -> std::result::Result<
+                content_extractor::ExtractedContent,
+                content_extractor::ExtractError,
+            > {
+                self.extract(ctx, key)
+            }
+            fn extract_bytes(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+                _: &[u8],
             ) -> std::result::Result<
                 content_extractor::ExtractedContent,
                 content_extractor::ExtractError,
