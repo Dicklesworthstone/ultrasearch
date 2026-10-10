@@ -19,8 +19,23 @@ use crate::dispatcher::job_dispatch::{IndexBatch, JobOperation, JobSpec};
 use crate::scheduler_runtime::content_job_from_meta;
 
 pub(super) const BATCH_LIMIT: usize = 1024;
-const STATE_VERSION: u32 = 2;
+pub(super) const MAX_DEFERRED_FILES: usize = 1024;
+const STATE_VERSION: u32 = 3;
 const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RETRY_DELAY_SECS: i64 = 300;
+
+/// Admission failed before any index mutation. Older obligations can still run
+/// to release capacity even when this volume has unread journal records.
+#[derive(Debug)]
+pub(super) struct DeferredCapacity;
+
+impl std::fmt::Display for DeferredCapacity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("deferred extraction capacity is reserved; retry existing files before admitting new work")
+    }
+}
+
+impl std::error::Error for DeferredCapacity {}
 
 /// Policy represented by a volume's materialized content index. Missing policy
 /// in an older checkpoint requires reconciliation instead of assuming coverage.
@@ -80,6 +95,17 @@ pub(super) struct PendingBatch {
     pub worker: IndexBatch,
     pub metadata: Vec<MetadataChange>,
     pub next_cursor: Option<JournalCursor>,
+    /// Retry attempts never consume a later journal position. A subsequent
+    /// journal mutation supersedes the older per-file obligation.
+    #[serde(default)]
+    pub retry: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct DeferredFile {
+    pub meta: FileMeta,
+    pub attempts: u32,
+    pub retry_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +126,8 @@ pub(super) struct Checkpoints {
     pub content_commit: Option<Uuid>,
     pub volumes: Vec<VolumeCheckpoint>,
     pub pending: Option<PendingBatch>,
+    #[serde(default)]
+    pub deferred: Vec<DeferredFile>,
 }
 
 pub(super) struct StateStore {
@@ -128,12 +156,16 @@ impl StateStore {
                 file.metadata()?.len() <= MAX_STATE_BYTES,
                 "ingestion state exceeds size limit"
             );
-            let state: Checkpoints = serde_json::from_reader(file.take(MAX_STATE_BYTES))
+            let mut state: Checkpoints = serde_json::from_reader(file.take(MAX_STATE_BYTES))
                 .context("invalid ingestion state; refusing to guess volume identities")?;
             ensure!(
-                state.version == STATE_VERSION,
+                matches!(state.version, 2 | STATE_VERSION),
                 "unsupported ingestion state version"
             );
+            // Upgrade before publishing any deferred outcome. An older service
+            // rejects v3 rather than ignoring retry obligations and trusting its
+            // journal cursor. Keep the existing path and stable volume IDs.
+            state.version = STATE_VERSION;
             validate_state(&state)?;
             Some(state)
         } else {
@@ -202,6 +234,7 @@ impl StateStore {
             content_commit: None,
             volumes: Vec::new(),
             pending: None,
+            deferred: Vec::new(),
         });
         if rebuild {
             state.generation = Uuid::new_v4();
@@ -260,6 +293,7 @@ impl StateStore {
             state.meta_path = cfg.paths.meta_index.clone();
             state.content_path = cfg.paths.content_index.clone();
             state.pending = None;
+            state.deferred.clear();
             for volume in &mut state.volumes {
                 volume.cursor = None;
                 volume.needs_scan = true;
@@ -360,28 +394,88 @@ impl StateStore {
             self.state.pending.is_none(),
             "an ingestion batch is already pending"
         );
-        self.state.pending = Some(pending);
-        self.save()
+        reserve_retry_capacity(&self.state, &pending)?;
+        let mut admitted = self.state.clone();
+        admitted.pending = Some(pending);
+        validate_state(&admitted)?;
+        let bytes = serde_json::to_vec(&admitted)?;
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(DeferredCapacity.into());
+        }
+        // Failure leaves the old in-memory state usable for capacity recovery,
+        // just as it leaves the cursor unchanged on disk. Never install an
+        // oversized or invalid pending barrier before its durable write.
+        atomic_write(&self.path, &bytes)?;
+        self.state = admitted;
+        Ok(())
     }
 
     /// Call only after worker success and metadata commit. Failed saves leave the
     /// old on-disk intent available to replay, including its original batch ID.
     pub fn finish(&mut self) -> Result<()> {
+        self.finish_at(super::unix_timestamp_secs())
+    }
+
+    fn finish_at(&mut self, now: i64) -> Result<()> {
         let pending = self.state.pending.as_ref().context("no pending batch")?;
         let mut receipts = Vec::with_capacity(2);
-        for path in [&self.state.meta_path, &self.state.content_path] {
+        let mut deferred = Vec::new();
+        for (path, is_content) in [
+            (&self.state.meta_path, false),
+            (&self.state.content_path, true),
+        ] {
             let index = tantivy::Index::open_in_dir(path)?;
-            let receipt = content_index::batch_receipt(&index)?
+            let outcome = content_index::batch_outcome(&index)?
                 .with_context(|| format!("index {path} has no ingestion commit receipt"))?;
+            let receipt = outcome.receipt;
             ensure!(
                 receipt.complete && receipt.batch_id == pending.worker.id,
                 "index {} has not committed pending ingestion batch {}",
                 path,
                 pending.worker.id
             );
+            if is_content {
+                validate_deferred_outcome(pending, &outcome.deferred)?;
+                deferred = outcome.deferred;
+            } else {
+                ensure!(
+                    outcome.deferred.is_empty(),
+                    "metadata commit must not contain deferred extraction outcomes"
+                );
+            }
             receipts.push(receipt);
         }
         let mut completed = self.state.clone();
+        let mut retries: BTreeMap<_, _> = completed
+            .deferred
+            .into_iter()
+            .map(|retry| (retry.meta.key, retry))
+            .collect();
+        for volume in &pending.worker.reset_volumes {
+            retries.retain(|key, _| key.volume() != *volume);
+        }
+        for change in &pending.metadata {
+            let previous = retries.remove(&change.key());
+            if deferred.binary_search(&change.key()).is_ok() {
+                let MetadataChange::Upsert(meta) = change else {
+                    bail!("a deletion cannot defer extraction");
+                };
+                let attempts = if pending.retry {
+                    previous.map_or(1, |retry| retry.attempts.saturating_add(1))
+                } else {
+                    1
+                };
+                retries.insert(
+                    meta.key,
+                    DeferredFile {
+                        meta: meta.clone(),
+                        attempts,
+                        retry_at: now.saturating_add(retry_delay(attempts)),
+                    },
+                );
+            }
+        }
+        completed.deferred = retries.into_values().collect();
         if let Some(cursor) = pending.next_cursor {
             let volume = completed
                 .volumes
@@ -394,11 +488,262 @@ impl StateStore {
         completed.meta_commit = Some(receipts[0].commit_id);
         completed.content_commit = Some(receipts[1].commit_id);
         completed.pending = None;
+        validate_state(&completed)?;
         let bytes = serde_json::to_vec(&completed)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_STATE_BYTES,
+            "deferred ingestion state exceeds size limit; batch remains pending"
+        );
         atomic_write(&self.path, &bytes)?;
         self.state = completed;
         Ok(())
     }
+
+    /// Choose the oldest due obligation from the caller's admitted volumes.
+    /// Bound one attempt just like an ordinary mutation batch. Offline and
+    /// deselected volumes retain their obligations without blocking others.
+    pub fn due_retry(
+        &self,
+        volumes: &[VolumeInfo],
+        cfg: &AppConfig,
+        now: i64,
+        limit: usize,
+    ) -> Option<PendingBatch> {
+        if self.state.pending.is_some() {
+            return None;
+        }
+        let mut due: Vec<_> = self
+            .state
+            .deferred
+            .iter()
+            .filter(|retry| {
+                (retry.retry_at <= now || retry.retry_at > now.saturating_add(MAX_RETRY_DELAY_SECS))
+                    && volumes
+                        .iter()
+                        .any(|volume| volume.id == retry.meta.key.volume())
+            })
+            .collect();
+        due.sort_by_key(|retry| (retry.retry_at, retry.meta.key));
+        let volume_id = due.first()?.meta.key.volume();
+        let volume = volumes.iter().find(|volume| volume.id == volume_id)?;
+        let changes = due
+            .into_iter()
+            .filter(|retry| retry.meta.key.volume() == volume_id)
+            .take(limit.min(BATCH_LIMIT))
+            .map(|retry| MetadataChange::Upsert(retry.meta.clone()))
+            .collect::<Vec<_>>();
+        if changes.is_empty() {
+            return None;
+        }
+        let mut pending = pending_for_volume(volume, changes, None, false, cfg);
+        pending.retry = true;
+        // Measure the saved state once. Add entries only while their actual
+        // encoded metadata and worker jobs fit the remaining intent budget.
+        // Admission reserves room for the largest single-key retry, so an old
+        // long path cannot become permanently stranded behind shorter files.
+        let available =
+            MAX_STATE_BYTES.checked_sub(json_length(&self.state).ok()?.checked_sub(4)?)?;
+        let metadata = std::mem::take(&mut pending.metadata);
+        let jobs = std::mem::take(&mut pending.worker.jobs);
+        let mut used = json_length(&pending).ok()?;
+        for (change, job) in metadata.into_iter().zip(jobs) {
+            let separators = if pending.metadata.is_empty() { 0 } else { 2 };
+            let additional = json_length(&change)
+                .ok()?
+                .checked_add(json_length(&job).ok()?)?
+                .checked_add(separators)?;
+            let next = used.checked_add(additional)?;
+            if next > available {
+                break;
+            }
+            pending.metadata.push(change);
+            pending.worker.jobs.push(job);
+            used = next;
+        }
+        if pending.metadata.is_empty() {
+            return None;
+        }
+        Some(pending)
+    }
+}
+
+/// Reserve for the worst permitted worker outcome before admitting any new
+/// writes. A full retry queue must not strand a new global pending transaction
+/// in front of the older obligations that need to run to free that capacity.
+fn reserve_retry_capacity(state: &Checkpoints, pending: &PendingBatch) -> Result<()> {
+    let mut keys: std::collections::BTreeSet<_> =
+        state.deferred.iter().map(|retry| retry.meta.key).collect();
+    for volume in &pending.worker.reset_volumes {
+        keys.retain(|key| key.volume() != *volume);
+    }
+    for change in &pending.metadata {
+        keys.remove(&change.key());
+    }
+    keys.extend(
+        pending
+            .worker
+            .jobs
+            .iter()
+            .filter(|job| job.operation == JobOperation::Reconcile)
+            .map(|job| DocKey::from_parts(job.volume_id, job.file_id)),
+    );
+    if keys.len() > MAX_DEFERRED_FILES {
+        return Err(DeferredCapacity.into());
+    }
+
+    // Project the largest completed ledger this batch can legitimately leave.
+    // Counters/deadlines use their maximum JSON widths, so repeated failures or
+    // changed extraction limits cannot gradually consume reserved retry space.
+    let superseded: std::collections::BTreeSet<_> =
+        pending.metadata.iter().map(MetadataChange::key).collect();
+    let reconcile: std::collections::BTreeSet<_> = pending
+        .worker
+        .jobs
+        .iter()
+        .filter(|job| job.operation == JobOperation::Reconcile)
+        .map(|job| DocKey::from_parts(job.volume_id, job.file_id))
+        .collect();
+    let mut projected = state.clone();
+    projected.pending = None;
+    projected.deferred.retain(|retry| {
+        !pending
+            .worker
+            .reset_volumes
+            .contains(&retry.meta.key.volume())
+            && !superseded.contains(&retry.meta.key)
+    });
+    for change in &pending.metadata {
+        if let MetadataChange::Upsert(meta) = change
+            && reconcile.contains(&meta.key)
+        {
+            projected.deferred.push(DeferredFile {
+                meta: meta.clone(),
+                attempts: u32::MAX,
+                retry_at: i64::MAX,
+            });
+        }
+    }
+    for retry in &mut projected.deferred {
+        retry.attempts = u32::MAX;
+        retry.retry_at = i64::MAX;
+    }
+    if let Some(cursor) = pending.next_cursor {
+        projected
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.id == pending.volume)
+            .context("unknown volume identity")?
+            .cursor = Some(cursor);
+    }
+    // Completing a baseline can populate a missing cursor, and actionless
+    // progress can enlarge it or turn a catch-up flag false without admitting
+    // another worker batch. Reserve those maximum widths too.
+    for volume in &mut projected.volumes {
+        volume.cursor = Some(JournalCursor {
+            journal_id: u64::MAX,
+            last_usn: u64::MAX,
+        });
+        volume.needs_scan = false;
+        volume.catching_up = false;
+    }
+    projected.completed_batch = Some(pending.worker.id);
+    projected.meta_commit = Some(pending.worker.id);
+    projected.content_commit = Some(pending.worker.id);
+    let completed_bytes = json_length(&projected)?;
+    let mut largest_retry = 0;
+    for retry in &projected.deferred {
+        largest_retry = largest_retry.max(json_length(&largest_single_retry(&retry.meta)?)?);
+    }
+    let required = if largest_retry == 0 {
+        completed_bytes
+    } else {
+        // Checkpoints.pending always encodes as `null` without an intent.
+        completed_bytes
+            .saturating_sub(4)
+            .saturating_add(largest_retry)
+    };
+    if required > MAX_STATE_BYTES {
+        return Err(DeferredCapacity.into());
+    }
+    Ok(())
+}
+
+/// Maximum encoded single-file retry for this captured identity. The metadata
+/// cannot grow on retry; fresh observations pass through admission again. Job
+/// limits may change with configuration, so reserve their full integer widths.
+fn largest_single_retry(meta: &FileMeta) -> Result<PendingBatch> {
+    let path = meta
+        .path
+        .as_ref()
+        .context("deferred file has no retry path")?;
+    Ok(PendingBatch {
+        volume: meta.key.volume(),
+        worker: IndexBatch {
+            id: Uuid::from_u128(1), // Every textual UUID occupies the same 36 bytes.
+            jobs: vec![JobSpec {
+                operation: JobOperation::Reconcile,
+                volume_id: meta.key.volume(),
+                file_id: meta.key.file_id(),
+                path: PathBuf::from(path),
+                max_bytes: Some(usize::MAX),
+                max_chars: Some(usize::MAX),
+                file_size: u64::MAX,
+            }],
+            reset_volumes: Vec::new(),
+        },
+        metadata: vec![MetadataChange::Upsert(meta.clone())],
+        next_cursor: None,
+        retry: true,
+    })
+}
+
+/// Count JSON bytes without retaining another full copy of the bounded state.
+/// Measuring the base once plus each entry once keeps retry sizing linear in
+/// the total encoded path bytes instead of serializing the whole state per key.
+fn json_length(value: &impl Serialize) -> Result<u64> {
+    #[derive(Default)]
+    struct Length(u64);
+    impl Write for Length {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("ingestion JSON length overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut length = Length::default();
+    serde_json::to_writer(&mut length, value)?;
+    Ok(length.0)
+}
+
+fn retry_delay(attempts: u32) -> i64 {
+    (5i64 << attempts.saturating_sub(1).min(6)).min(MAX_RETRY_DELAY_SECS)
+}
+
+/// The worker may defer only a reconciliation that has a corresponding durable
+/// metadata snapshot. Reject invented keys before mutating metadata or moving a
+/// cursor; the receipt alone never creates an untracked retry obligation.
+pub(super) fn validate_deferred_outcome(pending: &PendingBatch, deferred: &[DocKey]) -> Result<()> {
+    ensure!(
+        deferred.len() <= BATCH_LIMIT && deferred.windows(2).all(|keys| keys[0] < keys[1]),
+        "invalid deferred extraction identity set"
+    );
+    for key in deferred {
+        ensure!(
+            pending.metadata.iter().any(|change| {
+                matches!(change, MetadataChange::Upsert(meta) if meta.key == *key)
+            }) && pending.worker.jobs.iter().any(|job| {
+                job.operation == JobOperation::Reconcile
+                    && DocKey::from_parts(job.volume_id, job.file_id) == *key
+            }),
+            "worker deferred a file outside the durable reconciliation batch: {key}"
+        );
+    }
+    Ok(())
 }
 
 /// The normal split-commit states are C/C, P/C, and P/P (content/metadata).
@@ -449,7 +794,32 @@ fn validate_state(state: &Checkpoints) -> Result<()> {
             "duplicate volume GUID"
         );
     }
+    ensure!(
+        state.deferred.len() <= MAX_DEFERRED_FILES,
+        "deferred extraction limit reached; batch remains pending"
+    );
+    let mut deferred_keys = std::collections::BTreeSet::new();
+    for retry in &state.deferred {
+        ensure!(
+            ids.contains(&retry.meta.key.volume())
+                && retry.meta.volume == retry.meta.key.volume()
+                && deferred_keys.insert(retry.meta.key)
+                && retry.attempts > 0
+                && retry.retry_at >= 0
+                && retry
+                    .meta
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| !path.is_empty()),
+            "invalid or duplicate deferred extraction obligation"
+        );
+    }
     if let Some(batch) = &state.pending {
+        reserve_retry_capacity(state, batch)?;
+        ensure!(
+            !batch.retry || (batch.next_cursor.is_none() && batch.worker.reset_volumes.is_empty()),
+            "retry batch cannot advance a journal cursor or reset a volume"
+        );
         ensure!(
             !batch.worker.id.is_nil(),
             "pending batch has a nil identity"
@@ -575,6 +945,7 @@ pub(super) fn make_pending(
         },
         metadata: changes,
         next_cursor,
+        retry: false,
     }
 }
 
@@ -683,6 +1054,110 @@ mod tests {
         Ok(())
     }
 
+    fn commit_outcome(path: &str, batch: Uuid, deferred: &[DocKey]) -> Result<()> {
+        let index = tantivy::Index::open_in_dir(path)?;
+        let mut writer = index.writer_with_num_threads(1, 20_000_000)?;
+        content_index::commit_batch_with_deferred(&mut writer, batch, deferred)?;
+        Ok(())
+    }
+
+    fn complete_at(
+        store: &mut StateStore,
+        cfg: &AppConfig,
+        deferred: &[DocKey],
+        now: i64,
+    ) -> Result<()> {
+        let id = store
+            .state
+            .pending
+            .as_ref()
+            .context("missing test intent")?
+            .worker
+            .id;
+        commit_outcome(&cfg.paths.content_index, id, deferred)?;
+        commit_marker(&cfg.paths.meta_index, id)?;
+        store.finish_at(now)
+    }
+
+    #[test]
+    fn byte_capacity_keeps_one_retry_admissible_and_shrinks_oversized_groups() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut cfg = config(root.path());
+        cfg.extract.max_bytes_per_file = u64::MAX;
+        cfg.extract.max_chars_per_file = u64::MAX;
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = volume("byte-capacity-volume");
+        store.bind_volume(&mut volume)?;
+        let first_key = DocKey::from_parts(volume.id, 42);
+        let mut first = meta(first_key, "long-first.txt", 1);
+        first.path = Some(format!("X:\\{}", "深".repeat(20_000)));
+        let mut second = first.clone();
+        second.key = DocKey::from_parts(volume.id, 43);
+        second.name = "long-second.txt".into();
+
+        let fresh = pending_for_volume(
+            &volume,
+            vec![MetadataChange::Upsert(first.clone())],
+            Some(JournalCursor {
+                journal_id: u64::MAX,
+                last_usn: u64::MAX,
+            }),
+            false,
+            &cfg,
+        );
+        // Model accumulated non-retry state without allocating many path
+        // copies. The incoming intent fits, but its possible completed ledger
+        // would not leave room to retry that same file afterward.
+        store.state.retired_indices.push(String::new());
+        let filler = MAX_STATE_BYTES - json_length(&store.state)? - (json_length(&fresh)? - 4) - 64;
+        store.state.retired_indices[0].extend(std::iter::repeat_n('a', filler as usize));
+        store.save()?;
+        let persisted_bytes = fs::metadata(&store.path)?.len();
+        {
+            let mut raw_admission = store.state.clone();
+            raw_admission.pending = Some(fresh.clone());
+            assert!(json_length(&raw_admission)? <= MAX_STATE_BYTES);
+        }
+        let error = store.begin(fresh).unwrap_err();
+        assert!(error.is::<DeferredCapacity>());
+        assert!(store.state.pending.is_none());
+        assert_eq!(fs::metadata(&store.path)?.len(), persisted_bytes);
+
+        // A legitimately reserved ledger admits one long-file retry even when
+        // the requested two-file group exceeds the available JSON budget.
+        store.state.retired_indices[0].clear();
+        store.state.deferred = vec![first, second]
+            .into_iter()
+            .map(|meta| DeferredFile {
+                meta,
+                attempts: u32::MAX,
+                retry_at: i64::MAX,
+            })
+            .collect();
+        let volumes = [volume];
+        let whole = store
+            .due_retry(&volumes, &cfg, i64::MAX, 2)
+            .context("two-file retry")?;
+        assert_eq!(whole.metadata.len(), 2);
+        let mut one = whole.clone();
+        one.metadata.truncate(1);
+        one.worker.jobs.truncate(1);
+        let filler = MAX_STATE_BYTES - json_length(&store.state)? - (json_length(&one)? - 4) - 256;
+        store.state.retired_indices[0].extend(std::iter::repeat_n('a', filler as usize));
+        assert!(json_length(&store.state)? - 4 + json_length(&whole)? > MAX_STATE_BYTES);
+        let retry = store
+            .due_retry(&volumes, &cfg, i64::MAX, 2)
+            .context("reserved single retry")?;
+        assert_eq!(retry.metadata.len(), 1);
+        assert_eq!(retry.metadata[0].key(), first_key);
+        assert_eq!(retry.worker.jobs.len(), 1);
+        reserve_retry_capacity(&store.state, &retry)?;
+        store.begin(retry)?;
+        assert_eq!(store.state.pending.as_ref().unwrap().metadata.len(), 1);
+        assert!(fs::metadata(&store.path)?.len() <= MAX_STATE_BYTES);
+        Ok(())
+    }
+
     fn copy_index_snapshot(source: &Path, target: &Path) -> Result<()> {
         fs::create_dir_all(target)?;
         for entry in fs::read_dir(source)? {
@@ -756,6 +1231,244 @@ mod tests {
         assert!(got.contains(&MetadataChange::Upsert(meta(new_key, "new.txt", 50))));
         assert!(got.contains(&MetadataChange::Upsert(renamed)));
         assert!(event_changes(&[FileEvent::RescanRequired { doc: other }]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_outcome_replays_across_both_commit_windows_and_retries_independently() -> Result<()>
+    {
+        for metadata_committed in [false, true] {
+            let root = tempfile::tempdir()?;
+            let cfg = config(root.path());
+            let mut store = StateStore::open(&cfg)?;
+            let mut vol = volume("deferred-crash-volume");
+            store.bind_volume(&mut vol)?;
+            let start = JournalCursor {
+                journal_id: 31,
+                last_usn: 100,
+            };
+            let next = JournalCursor {
+                last_usn: 500,
+                ..start
+            };
+            store.volume_mut(vol.id)?.cursor = Some(start);
+            store.volume_mut(vol.id)?.needs_scan = false;
+            store.volume_mut(vol.id)?.catching_up = false;
+            store.save()?;
+            let generation = store.state.generation;
+            let key = DocKey::from_parts(vol.id, 42);
+            let pending = make_pending(
+                vol.id,
+                vec![MetadataChange::Upsert(meta(key, "blocked.txt", 90))],
+                Some(next),
+                false,
+                &cfg,
+            );
+            let batch_id = pending.worker.id;
+            store.begin(pending)?;
+            commit_outcome(&cfg.paths.content_index, batch_id, &[key])?;
+            if metadata_committed {
+                commit_marker(&cfg.paths.meta_index, batch_id)?;
+            }
+            drop(store);
+
+            let mut replay = StateStore::open(&cfg)?;
+            assert_eq!(replay.state.generation, generation);
+            assert_eq!(replay.volume(vol.id)?.cursor, Some(start));
+            assert_eq!(replay.state.pending.as_ref().unwrap().worker.id, batch_id);
+            assert!(replay.state.deferred.is_empty());
+            if !metadata_committed {
+                assert!(replay.finish_at(1000).is_err());
+            }
+            // Replay republishes both physical commits, while the durable
+            // batch identity and the resulting obligation remain singular.
+            complete_at(&mut replay, &cfg, &[key], 1000)?;
+            assert_eq!(replay.volume(vol.id)?.cursor, Some(next));
+            assert!(replay.state.pending.is_none());
+            assert_eq!(replay.state.deferred.len(), 1);
+            assert_eq!(replay.state.deferred[0].meta.key, key);
+            assert_eq!(replay.state.deferred[0].attempts, 1);
+            assert_eq!(replay.state.deferred[0].retry_at, 1005);
+            drop(replay);
+
+            let mut replay = StateStore::open(&cfg)?;
+            assert_eq!(replay.state.generation, generation);
+            assert!(replay.state.retired_indices.is_empty());
+            assert_eq!(replay.state.deferred.len(), 1);
+            let later = JournalCursor {
+                last_usn: 700,
+                ..start
+            };
+            replay.begin(make_pending(
+                vol.id,
+                vec![MetadataChange::Upsert(meta(
+                    DocKey::from_parts(vol.id, 43),
+                    "healthy.txt",
+                    30,
+                ))],
+                Some(later),
+                false,
+                &cfg,
+            ))?;
+            complete_at(&mut replay, &cfg, &[], 1001)?;
+            assert_eq!(replay.volume(vol.id)?.cursor, Some(later));
+            assert_eq!(replay.state.deferred.len(), 1);
+            assert!(
+                replay
+                    .due_retry(std::slice::from_ref(&vol), &cfg, 1004, 128)
+                    .is_none()
+            );
+            assert!(replay.due_retry(&[], &cfg, 1005, 128).is_none());
+            assert!(
+                replay
+                    .due_retry(std::slice::from_ref(&vol), &cfg, 1005, 0)
+                    .is_none()
+            );
+            let retry = replay
+                .due_retry(std::slice::from_ref(&vol), &cfg, 1005, 128)
+                .unwrap();
+            assert!(retry.retry);
+            assert_eq!(retry.metadata.len(), 1);
+            assert!(retry.next_cursor.is_none());
+            replay.begin(retry)?;
+            complete_at(&mut replay, &cfg, &[key], 1005)?;
+            assert_eq!(replay.state.deferred[0].attempts, 2);
+            assert_eq!(replay.state.deferred[0].retry_at, 1015);
+            assert_eq!(replay.volume(vol.id)?.cursor, Some(later));
+            drop(replay);
+
+            let mut replay = StateStore::open(&cfg)?;
+            let retry = replay
+                .due_retry(std::slice::from_ref(&vol), &cfg, 1015, 128)
+                .unwrap();
+            replay.begin(retry)?;
+            complete_at(&mut replay, &cfg, &[], 1015)?;
+            assert!(replay.state.deferred.is_empty());
+            assert_eq!(replay.volume(vol.id)?.cursor, Some(later));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retry_capacity_rejects_new_intent_before_blocking_existing_recovery() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut vol = volume("retry-capacity-volume");
+        store.bind_volume(&mut vol)?;
+        let cursor = JournalCursor {
+            journal_id: 31,
+            last_usn: 100,
+        };
+        store.volume_mut(vol.id)?.cursor = Some(cursor);
+        store.state.deferred = (1..=MAX_DEFERRED_FILES as u64)
+            .map(|id| DeferredFile {
+                meta: meta(DocKey::from_parts(vol.id, id), &format!("held{id}.txt"), 20),
+                attempts: 1,
+                retry_at: 1000,
+            })
+            .collect();
+        store.save()?;
+        let before = fs::read(&store.path)?;
+        let new = make_pending(
+            vol.id,
+            vec![MetadataChange::Upsert(meta(
+                DocKey::from_parts(vol.id, 10_000),
+                "new.txt",
+                20,
+            ))],
+            Some(JournalCursor {
+                last_usn: 200,
+                ..cursor
+            }),
+            false,
+            &cfg,
+        );
+        let error = store.begin(new.clone()).unwrap_err();
+        assert!(error.is::<DeferredCapacity>(), "{error:#}");
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.volume(vol.id)?.cursor, Some(cursor));
+        assert_eq!(fs::read(&store.path)?, before);
+        // Incomplete scan/backlog flags cannot forbid capacity recovery. This
+        // admitted retry consumes no USN and frees room for the rejected event.
+        let retry = store
+            .due_retry(std::slice::from_ref(&vol), &cfg, 1000, 128)
+            .unwrap();
+        assert_eq!(retry.worker.jobs.len(), 128);
+        store.begin(retry)?;
+        complete_at(&mut store, &cfg, &[], 1000)?;
+        assert_eq!(store.state.deferred.len(), MAX_DEFERRED_FILES - 128);
+        assert_eq!(store.volume(vol.id)?.cursor, Some(cursor));
+        store.begin(new)?;
+        complete_at(&mut store, &cfg, &[], 1001)?;
+        assert_eq!(store.volume(vol.id)?.cursor.unwrap().last_usn, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn version_two_upgrade_preserves_bound_volume_and_physical_checkpoints() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut vol = volume("upgrade-volume");
+        store.bind_volume(&mut vol)?;
+        let cursor = JournalCursor {
+            journal_id: 31,
+            last_usn: 700,
+        };
+        store.volume_mut(vol.id)?.cursor = Some(cursor);
+        store.volume_mut(vol.id)?.needs_scan = false;
+        store.save()?;
+        let generation = store.state.generation;
+        let content_commit = store.state.content_commit;
+        let meta_commit = store.state.meta_commit;
+        let mut old = serde_json::to_value(&store.state)?;
+        old["version"] = 2.into();
+        old.as_object_mut().unwrap().remove("deferred");
+        atomic_write(&store.path, &serde_json::to_vec(&old)?)?;
+        drop(store);
+        let reopened = StateStore::open(&cfg)?;
+        assert_eq!(reopened.state.version, 3);
+        assert_eq!(reopened.state.generation, generation);
+        assert_eq!(reopened.state.content_commit, content_commit);
+        assert_eq!(reopened.state.meta_commit, meta_commit);
+        assert_eq!(reopened.volume(vol.id)?.cursor, Some(cursor));
+        assert!(!reopened.volume(vol.id)?.needs_scan);
+        assert!(reopened.state.deferred.is_empty());
+        assert!(reopened.state.retired_indices.is_empty());
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(&reopened.path)?)?;
+        assert_eq!(disk["version"], 3);
+        Ok(())
+    }
+
+    #[test]
+    fn unowned_deferred_outcome_cannot_publish_a_checkpoint() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut vol = volume("invalid-outcome-volume");
+        store.bind_volume(&mut vol)?;
+        let key = DocKey::from_parts(vol.id, 42);
+        store.begin(make_pending(
+            vol.id,
+            vec![MetadataChange::Upsert(meta(key, "owned.txt", 90))],
+            Some(JournalCursor {
+                journal_id: 31,
+                last_usn: 500,
+            }),
+            false,
+            &cfg,
+        ))?;
+        let error =
+            complete_at(&mut store, &cfg, &[DocKey::from_parts(vol.id, 43)], 1000).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the durable reconciliation batch")
+        );
+        assert!(store.state.pending.is_some());
+        assert!(store.state.deferred.is_empty());
+        assert!(store.volume(vol.id)?.cursor.is_none());
         Ok(())
     }
 

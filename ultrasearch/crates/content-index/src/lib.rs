@@ -141,40 +141,114 @@ pub struct BatchReceipt {
     pub complete: bool,
 }
 
-impl BatchReceipt {
-    fn payload(self) -> String {
-        format!(
-            "ultrasearch-ingestion-v1:{}:{}:{}",
-            self.batch_id,
-            self.commit_id,
-            if self.complete { "complete" } else { "partial" }
-        )
+/// A bounded set of file-level retries can complete with a batch. These keys
+/// have no live content document and must become durable retry obligations in
+/// the service's checkpoint before that checkpoint retires its pending intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchOutcome {
+    pub receipt: BatchReceipt,
+    pub deferred: Vec<DocKey>,
+}
+
+pub const MAX_DEFERRED_KEYS: usize = 1024;
+// A canonical key uses at most 24 bytes, plus its comma separator. Bound the
+// payload before parsing its keys, including invalid externally written input.
+const MAX_BATCH_PAYLOAD_BYTES: usize = 128 + MAX_DEFERRED_KEYS * 25;
+
+impl BatchOutcome {
+    fn payload(&self) -> Result<String> {
+        ensure!(
+            !self.receipt.batch_id.is_nil() && !self.receipt.commit_id.is_nil(),
+            "index batch receipt identities must not be nil"
+        );
+        validate_deferred(self.receipt.complete, &self.deferred)?;
+        let mut payload = format!(
+            "ultrasearch-ingestion-v2:{}:{}:{}:",
+            self.receipt.batch_id,
+            self.receipt.commit_id,
+            if self.receipt.complete {
+                "complete"
+            } else {
+                "partial"
+            }
+        );
+        for (position, key) in self.deferred.iter().enumerate() {
+            if position > 0 {
+                payload.push(',');
+            }
+            payload.push_str(&key.to_string());
+        }
+        Ok(payload)
     }
+}
+
+fn validate_deferred(complete: bool, deferred: &[DocKey]) -> Result<()> {
+    ensure!(
+        deferred.len() <= MAX_DEFERRED_KEYS,
+        "index batch exceeds the deferred key limit"
+    );
+    ensure!(
+        complete || deferred.is_empty(),
+        "partial receipts cannot publish deferred obligations"
+    );
+    ensure!(
+        deferred.windows(2).all(|keys| keys[0] < keys[1]),
+        "deferred keys must be sorted and unique"
+    );
+    ensure!(
+        deferred
+            .iter()
+            .all(|key| *key == DocKey::from_parts(key.volume(), key.file_id())),
+        "invalid deferred document identity"
+    );
+    Ok(())
 }
 
 /// Publish the successful batch identity atomically with its index mutations,
 /// including an empty batch. The service persists both indexes' exact physical
 /// commit identities before retiring its durable pending intent.
 pub fn commit_batch(writer: &mut IndexWriter, id: Uuid) -> Result<tantivy::Opstamp> {
-    commit_receipt(writer, id, true)
+    commit_batch_with_deferred(writer, id, &[])
+}
+
+/// Atomically publish a completed batch and its remaining per-file retry
+/// obligations. `deferred` must contain canonical keys in strictly increasing
+/// order, with no duplicates. A completed receipt attests that these omissions
+/// were recorded, not that every extraction succeeded.
+pub fn commit_batch_with_deferred(
+    writer: &mut IndexWriter,
+    id: Uuid,
+    deferred: &[DocKey],
+) -> Result<tantivy::Opstamp> {
+    commit_receipt(writer, id, true, deferred)
 }
 
 /// Publish a subset of a batch without attesting to completion. This includes
 /// periodic commits and any commit made by a worker that encountered a failed
 /// job. Only a matching durable pending intent permits recovery of this state.
 pub fn commit_partial_batch(writer: &mut IndexWriter, id: Uuid) -> Result<tantivy::Opstamp> {
-    commit_receipt(writer, id, false)
+    commit_receipt(writer, id, false, &[])
 }
 
-fn commit_receipt(writer: &mut IndexWriter, id: Uuid, complete: bool) -> Result<tantivy::Opstamp> {
+fn commit_receipt(
+    writer: &mut IndexWriter,
+    id: Uuid,
+    complete: bool,
+    deferred: &[DocKey],
+) -> Result<tantivy::Opstamp> {
     ensure!(!id.is_nil(), "index batch identity must not be nil");
-    let receipt = BatchReceipt {
-        batch_id: id,
-        commit_id: Uuid::new_v4(),
-        complete,
+    validate_deferred(complete, deferred)?;
+    let outcome = BatchOutcome {
+        receipt: BatchReceipt {
+            batch_id: id,
+            commit_id: Uuid::new_v4(),
+            complete,
+        },
+        deferred: deferred.to_vec(),
     };
+    let payload = outcome.payload()?;
     let mut prepared = writer.prepare_commit()?;
-    prepared.set_payload(&receipt.payload());
+    prepared.set_payload(&payload);
     Ok(prepared.commit()?)
 }
 
@@ -183,15 +257,27 @@ fn commit_receipt(writer: &mut IndexWriter, id: Uuid, complete: bool) -> Result<
 /// invalid receipts require recovery rather than assuming journal coverage.
 /// A partial receipt must never acknowledge work or validate a finished cursor.
 pub fn batch_receipt(index: &Index) -> Result<Option<BatchReceipt>> {
+    Ok(batch_outcome(index)?.map(|outcome| outcome.receipt))
+}
+
+/// Read both physical commit evidence and the file-level retry obligations
+/// committed with it. Legacy v1 receipts have no deferred keys. All consumers
+/// share this strict parser so malformed outcomes cannot be accepted as ACKs.
+pub fn batch_outcome(index: &Index) -> Result<Option<BatchOutcome>> {
     index
         .load_metas()?
         .payload
         .map(|payload| {
-            let mut parts = payload.split(':');
             ensure!(
-                parts.next() == Some("ultrasearch-ingestion-v1"),
-                "unsupported index batch receipt format"
+                payload.len() <= MAX_BATCH_PAYLOAD_BYTES,
+                "index batch receipt payload exceeds its byte limit"
             );
+            let mut parts = payload.splitn(5, ':');
+            let version = match parts.next() {
+                Some("ultrasearch-ingestion-v1") => 1,
+                Some("ultrasearch-ingestion-v2") => 2,
+                _ => anyhow::bail!("unsupported index batch receipt format"),
+            };
             let batch_id = Uuid::parse_str(parts.next().context("missing receipt batch id")?)
                 .context("invalid receipt batch id")?;
             let commit_id = Uuid::parse_str(parts.next().context("missing receipt commit id")?)
@@ -205,11 +291,34 @@ pub fn batch_receipt(index: &Index) -> Result<Option<BatchReceipt>> {
                 Some("partial") => false,
                 _ => anyhow::bail!("invalid receipt completion state"),
             };
-            ensure!(parts.next().is_none(), "unexpected index receipt fields");
-            Ok(BatchReceipt {
-                batch_id,
-                commit_id,
-                complete,
+            let mut deferred = Vec::new();
+            if version == 1 {
+                ensure!(parts.next().is_none(), "unexpected index receipt fields");
+            } else {
+                let encoded = parts.next().context("missing deferred key list")?;
+                if !encoded.is_empty() {
+                    for encoded_key in encoded.split(',') {
+                        ensure!(
+                            deferred.len() < MAX_DEFERRED_KEYS,
+                            "index batch exceeds the deferred key limit"
+                        );
+                        let key = encoded_key.parse::<DocKey>().map_err(anyhow::Error::msg)?;
+                        ensure!(
+                            key.to_string() == encoded_key,
+                            "deferred document identity is not canonical"
+                        );
+                        deferred.push(key);
+                    }
+                }
+            }
+            validate_deferred(complete, &deferred)?;
+            Ok(BatchOutcome {
+                receipt: BatchReceipt {
+                    batch_id,
+                    commit_id,
+                    complete,
+                },
+                deferred,
             })
         })
         .transpose()
@@ -515,12 +624,15 @@ mod tests {
         delete_doc(&mut writer, &index.fields, key);
         let mut prepared = writer.prepare_commit()?;
         prepared.set_payload(
-            &BatchReceipt {
-                batch_id: Uuid::new_v4(),
-                commit_id: Uuid::new_v4(),
-                complete: true,
+            &BatchOutcome {
+                receipt: BatchReceipt {
+                    batch_id: Uuid::new_v4(),
+                    commit_id: Uuid::new_v4(),
+                    complete: true,
+                },
+                deferred: vec![key],
             }
-            .payload(),
+            .payload()?,
         );
         assert_eq!(committed_batch(&index.index)?, Some(committed));
         assert_eq!(batch_receipt(&index.index)?, receipt);
@@ -580,6 +692,30 @@ mod tests {
         writer.commit()?;
         assert_eq!(committed_batch(&index.index)?, None);
         let id = Uuid::new_v4();
+        let legacy_receipt = BatchReceipt {
+            batch_id: id,
+            commit_id: Uuid::new_v4(),
+            complete: true,
+        };
+        let mut prepared = writer.prepare_commit()?;
+        prepared.set_payload(&format!(
+            "ultrasearch-ingestion-v1:{}:{}:complete",
+            legacy_receipt.batch_id, legacy_receipt.commit_id
+        ));
+        prepared.commit()?;
+        assert_eq!(
+            batch_outcome(&index.index)?,
+            Some(BatchOutcome {
+                receipt: legacy_receipt,
+                deferred: Vec::new(),
+            })
+        );
+        let first = DocKey::from_parts(7, 42);
+        let second = DocKey::from_parts(7, 43);
+        let over_limit = (0..=MAX_DEFERRED_KEYS)
+            .map(|position| DocKey::from_parts(7, position as u64).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         for invalid in [
             "not-a-batch-id".to_owned(),
             id.to_string(),
@@ -588,12 +724,126 @@ mod tests {
             format!("ultrasearch-ingestion-v1:{id}:{id}:unknown"),
             format!("ultrasearch-ingestion-v1:{id}:{id}:complete:extra"),
             format!("ultrasearch-ingestion-v2:{id}:{id}:complete"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:partial:{first}"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete:{first},{first}"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete:{second},{first}"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete:7:0x2a"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete:{first},"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete:{first}:extra"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete:{over_limit}"),
+            format!(
+                "ultrasearch-ingestion-v2:{id}:{id}:complete:{}",
+                "x".repeat(MAX_BATCH_PAYLOAD_BYTES)
+            ),
         ] {
             let mut prepared = writer.prepare_commit()?;
             prepared.set_payload(&invalid);
             prepared.commit()?;
+            assert!(batch_outcome(&index.index).is_err(), "{invalid}");
+            assert!(batch_receipt(&index.index).is_err());
             assert!(committed_batch(&index.index).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_receipts_commit_tombstones_survive_reopen_and_change_on_replay() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = open_or_create(dir.path())?;
+        let cfg = WriterConfig {
+            heap_size_bytes: 20_000_000,
+            num_threads: 1,
+        };
+        let mut writer = create_writer(&index, &cfg)?;
+        let blocked = DocKey::from_parts(u16::MAX, u64::MAX);
+        let available = DocKey::from_parts(7, 42);
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(blocked, "blocked.txt", "obsoleteblockedword"),
+        )?;
+        commit_batch(&mut writer, Uuid::new_v4())?;
+        delete_doc(&mut writer, &index.fields, blocked);
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(available, "available.txt", "availableword"),
+        )?;
+        let batch_id = Uuid::new_v4();
+        commit_batch_with_deferred(&mut writer, batch_id, &[blocked])?;
+        let outcome = batch_outcome(&index.index)?.unwrap();
+        assert_eq!(outcome.deferred, vec![blocked]);
+        assert_eq!(outcome.receipt.batch_id, batch_id);
+        assert!(outcome.receipt.complete);
+        assert_eq!(
+            matches(&index, index.fields.content, "obsoleteblockedword")?,
+            0
+        );
+        assert_eq!(matches(&index, index.fields.content, "availableword")?, 1);
+        drop(writer);
+        drop(index);
+
+        let index = open_or_create(dir.path())?;
+        assert_eq!(batch_outcome(&index.index)?, Some(outcome.clone()));
+        let reader = open_reader(&index)?;
+        assert!(read_file_meta(&index, &reader, blocked)?.is_none());
+        assert_eq!(reader.searcher().num_docs(), 1);
+        let mut writer = create_writer(&index, &cfg)?;
+        commit_batch_with_deferred(&mut writer, batch_id, &[blocked])?;
+        let replayed = batch_outcome(&index.index)?.unwrap();
+        assert_eq!(replayed.deferred, outcome.deferred);
+        assert_ne!(replayed.receipt.commit_id, outcome.receipt.commit_id);
+
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(blocked, "recovered.txt", "recoveredword"),
+        )?;
+        commit_batch_with_deferred(&mut writer, batch_id, &[])?;
+        let recovered = batch_outcome(&index.index)?.unwrap();
+        assert!(recovered.deferred.is_empty());
+        assert_ne!(recovered.receipt.commit_id, replayed.receipt.commit_id);
+        assert_eq!(
+            matches(&index, index.fields.content, "obsoleteblockedword")?,
+            0
+        );
+        assert_eq!(matches(&index, index.fields.content, "recoveredword")?, 1);
+        assert_eq!(open_reader(&index)?.searcher().num_docs(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_commit_limits_reject_before_mutating_commit_evidence() -> Result<()> {
+        let index = create_in_ram()?;
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let keys: Vec<_> = (0..MAX_DEFERRED_KEYS)
+            .map(|position| DocKey::from_parts(7, position as u64))
+            .collect();
+        let batch_id = Uuid::new_v4();
+        commit_batch_with_deferred(&mut writer, batch_id, &keys)?;
+        let committed = batch_outcome(&index.index)?.unwrap();
+        assert_eq!(committed.deferred, keys);
+        assert_eq!(committed_batch(&index.index)?, Some(batch_id));
+
+        let mut excessive = keys.clone();
+        excessive.push(DocKey::from_parts(8, 0));
+        for invalid in [
+            vec![keys[0], keys[0]],
+            vec![keys[1], keys[0]],
+            vec![DocKey(1u128 << 100)],
+            excessive,
+        ] {
+            assert!(commit_batch_with_deferred(&mut writer, batch_id, &invalid).is_err());
+            assert_eq!(batch_outcome(&index.index)?, Some(committed.clone()));
+        }
+        assert!(commit_batch_with_deferred(&mut writer, Uuid::nil(), &keys).is_err());
+        assert_eq!(batch_outcome(&index.index)?, Some(committed));
         Ok(())
     }
 

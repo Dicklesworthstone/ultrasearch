@@ -8,6 +8,8 @@
 //!
 //! The test indexes the configured volume. It creates a unique fixture directory
 //! and retains its indices, journal checkpoints, and success evidence for inspection.
+//! It holds a real sharing-violation handle across a service restart and allows
+//! up to six minutes for recovery through the persisted extraction retry schedule.
 
 #![cfg(all(windows, feature = "e2e-windows"))]
 
@@ -21,14 +23,22 @@ use serde_json::Value;
 use service::{SchedulerRuntime, SearchHandler, UnifiedSearchHandler, scanner, status_snapshot};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 use uuid::Uuid;
+use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+use windows::Win32::Storage::FileSystem::{
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
 const DEADLINE: Duration = Duration::from_secs(180);
+// Releasing a file must recover through its persisted retry schedule, without
+// writing another file event to bypass the capped five-minute backoff.
+const DEFERRED_RECOVERY_DEADLINE: Duration = Duration::from_secs(360);
 const MODES: [SearchMode; 3] = [
     SearchMode::NameOnly,
     SearchMode::Content,
@@ -163,6 +173,10 @@ impl Pipeline {
             state["pending"].is_null(),
             "durable intent is still pending"
         );
+        ensure!(
+            state["deferred"].as_array().is_some_and(Vec::is_empty),
+            "deferred extraction obligations remain or are missing from state"
+        );
         let volumes = state["volumes"]
             .as_array()
             .context("volume state missing")?;
@@ -218,8 +232,16 @@ impl Drop for Pipeline {
     }
 }
 
-async fn eventually<T>(label: &str, mut check: impl FnMut() -> Result<T>) -> Result<T> {
-    let deadline = Instant::now() + DEADLINE;
+async fn eventually<T>(label: &str, check: impl FnMut() -> Result<T>) -> Result<T> {
+    eventually_within(label, DEADLINE, check).await
+}
+
+async fn eventually_within<T>(
+    label: &str,
+    limit: Duration,
+    mut check: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + limit;
     loop {
         match check() {
             Ok(value) => return Ok(value),
@@ -369,6 +391,67 @@ fn volume_state(state: &Value, volume: VolumeId) -> Result<&Value> {
         .context("persisted volume identity missing")
 }
 
+fn deferred_file(state: &Value, key: DocKey) -> Result<&Value> {
+    let entries = state["deferred"]
+        .as_array()
+        .context("durable deferred extraction list missing")?;
+    ensure!(
+        entries.len() == 1,
+        "expected exactly the locked fixture to be deferred: {entries:?}"
+    );
+    let entry = &entries[0];
+    let expected_key = key.to_string();
+    ensure!(
+        entry["meta"]["key"].as_str() == Some(expected_key.as_str()),
+        "deferred identity does not match locked file {key}: {entry:?}"
+    );
+    ensure!(
+        entry["attempts"]
+            .as_u64()
+            .is_some_and(|attempts| attempts > 0)
+            && entry["retry_at"]
+                .as_i64()
+                .is_some_and(|retry_at| retry_at > 0),
+        "deferred work has no persisted retry schedule: {entry:?}"
+    );
+    Ok(entry)
+}
+
+fn deferred_snapshot(pipeline: &Pipeline, key: DocKey) -> Result<Value> {
+    pipeline.ensure_running()?;
+    let state = read_state(&pipeline.cfg)?;
+    ensure!(
+        state["version"] == 3,
+        "native deferral requires the v3 state protocol"
+    );
+    ensure!(
+        state["pending"].is_null(),
+        "failed file still blocks the durable journal batch"
+    );
+    deferred_file(&state, key)?;
+    let volume = volume_state(&state, key.volume())?;
+    ensure!(
+        volume["needs_scan"] == false
+            && volume["catching_up"] == false
+            && volume["cursor"]["last_usn"].as_u64().is_some()
+            && volume["cursor"]["journal_id"].as_u64().is_some(),
+        "unrelated volume coverage has not become available: {volume:?}"
+    );
+    let status = status_snapshot();
+    ensure!(
+        status.scheduler_state.contains("deferred")
+            && !status.scheduler_state.contains("ingestion=watching"),
+        "deferred extraction must not report healthy watching: {}",
+        status.scheduler_state
+    );
+    ensure!(
+        status.volumes.len() == 1 && status.volumes[0].pending_files == 1,
+        "status must expose the outstanding per-file obligation: {:?}",
+        status.volumes
+    );
+    Ok(state)
+}
+
 fn isolated_config(root: &Path, mount: &str) -> Result<AppConfig> {
     let data = root.join("data");
     let mut cfg = AppConfig::default();
@@ -453,6 +536,7 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
     let first = format!("first{nonce}");
     let second = format!("second{nonce}");
     let third = format!("third{nonce}");
+    let deferred_body = format!("deferred{nonce}");
     let guard = format!("guard{nonce}");
     let original = documents.join(format!("{old_name}.txt"));
     let renamed = documents.join(format!("{new_name}.txt"));
@@ -581,6 +665,270 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
         "journal identity unexpectedly changed on the isolated volume"
     );
 
+    // Resolve the edit into a durable job before denying data reads. This makes
+    // the failure originate in the real extractor, after native USN metadata
+    // resolution, instead of depending on a race with the journal reader.
+    pipeline.pause_workers().await?;
+    replace_contents(
+        &renamed,
+        &format!(
+            "{deferred_body} replacement must recover after a sharing violation without a new edit\n"
+        ),
+    )?;
+    let locked_path = canonical_path(&renamed)?;
+    let locked_size = fs::metadata(&renamed)?.len();
+    let blocked_edit = eventually("admit edited file before extraction lock", || {
+        pipeline.ensure_running()?;
+        let state = read_state(&cfg)?;
+        ensure!(
+            state["pending"]["worker"]["jobs"]
+                .as_array()
+                .is_some_and(|jobs| jobs.iter().any(|job| {
+                    job["volume_id"].as_u64() == Some(u64::from(key.volume()))
+                        && job["file_id"].as_u64() == Some(key.file_id())
+                        && job["operation"] == "reconcile"
+                })),
+            "edited fixture has not reached durable worker admission"
+        );
+        Ok(state)
+    })
+    .await?;
+    let blocked_next_usn = blocked_edit["pending"]["next_cursor"]["last_usn"]
+        .as_u64()
+        .context("edited fixture did not come from a journal batch")?;
+    let blocked_previous_usn = volume_state(&blocked_edit, key.volume())?["cursor"]["last_usn"]
+        .as_u64()
+        .context("edited fixture has no previously committed journal cursor")?;
+    ensure!(
+        blocked_next_usn > blocked_previous_usn,
+        "edited fixture did not carry a later journal checkpoint"
+    );
+
+    // CreateFileW sharing flags do not restrict attribute/EA access. Denying
+    // FILE_SHARE_READ while allowing write/delete blocks the worker's data open
+    // but still permits the journal reader's FILE_READ_ATTRIBUTES handle.
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    let read_lock = OpenOptions::new()
+        .read(true)
+        .share_mode((FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .open(&renamed)
+        .context("hold real NTFS fixture handle denying subsequent data reads")?;
+    let denied = fs::File::open(&renamed)
+        .expect_err("native prerequisite failed: a second data reader acquired the locked file");
+    ensure!(
+        denied.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32),
+        "native prerequisite failed: expected ERROR_SHARING_VIOLATION, got {denied:?}"
+    );
+    let attributes = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .open(&renamed)
+        .context("native prerequisite failed: attribute-only access must remain available")?;
+    ensure!(
+        attributes.metadata()?.len() == locked_size,
+        "attribute-only handle does not describe the edited fixture"
+    );
+    drop(attributes);
+    pipeline.resume_workers()?;
+
+    let first_deferred = eventually("durable file deferral releases journal batch", || {
+        let state = deferred_snapshot(&pipeline, key)?;
+        let entry = deferred_file(&state, key)?;
+        ensure!(
+            entry["meta"]["path"]
+                .as_str()
+                .is_some_and(|path| path.eq_ignore_ascii_case(&locked_path))
+                && entry["meta"]["size"].as_u64() == Some(locked_size),
+            "deferred obligation lost the edited file metadata: {entry:?}"
+        );
+        ensure!(
+            volume_state(&state, key.volume())?["cursor"]["last_usn"].as_u64()
+                >= Some(blocked_next_usn),
+            "completed deferral did not acknowledge its journal position"
+        );
+        for term in [&new_name, &third, &deferred_body] {
+            absent(&pipeline.search, term, &MODES)?;
+        }
+        document(
+            &pipeline.search,
+            &keep_name,
+            &guard,
+            &sentinel,
+            Some(sentinel_key),
+        )?;
+        Ok(state)
+    })
+    .await?;
+
+    // A failed extractor must not occupy the sole durable batch indefinitely.
+    // Exercise actual later NTFS creates, edits and deletes while it is locked.
+    let flow_name = format!("flow{nonce}");
+    let flow_first = format!("flowfirst{nonce}");
+    let flow_second = format!("flowsecond{nonce}");
+    let flow_file = documents.join(format!("{flow_name}.txt"));
+    replace_contents(&flow_file, &format!("{flow_first}\n"))?;
+    let flow_key = eventually("journal create continues past deferred extraction", || {
+        deferred_snapshot(&pipeline, key)?;
+        absent(&pipeline.search, &new_name, &MODES)?;
+        document(&pipeline.search, &flow_name, &flow_first, &flow_file, None)
+    })
+    .await?;
+    ensure!(
+        flow_key != key && flow_key != sentinel_key,
+        "fixture identities collided"
+    );
+    replace_contents(
+        &flow_file,
+        &format!("{flow_second} a later unrelated edit\n"),
+    )?;
+    eventually("journal modify continues past deferred extraction", || {
+        deferred_snapshot(&pipeline, key)?;
+        absent(&pipeline.search, &flow_first, &MODES)?;
+        absent(&pipeline.search, &new_name, &MODES)?;
+        document(
+            &pipeline.search,
+            &flow_name,
+            &flow_second,
+            &flow_file,
+            Some(flow_key),
+        )
+    })
+    .await?;
+    fs::remove_file(&flow_file)?;
+    let continued_state = eventually("journal delete continues past deferred extraction", || {
+        let state = deferred_snapshot(&pipeline, key)?;
+        for term in [
+            &flow_name,
+            &flow_first,
+            &flow_second,
+            &new_name,
+            &third,
+            &deferred_body,
+        ] {
+            absent(&pipeline.search, term, &MODES)?;
+        }
+        document(
+            &pipeline.search,
+            &keep_name,
+            &guard,
+            &sentinel,
+            Some(sentinel_key),
+        )?;
+        ensure!(
+            volume_state(&state, key.volume())?["cursor"]["last_usn"].as_u64()
+                > volume_state(&first_deferred, key.volume())?["cursor"]["last_usn"].as_u64(),
+            "journal cursor remained blocked by an unrelated extraction failure"
+        );
+        Ok(state)
+    })
+    .await?;
+    eventually_within(
+        "locked extraction retries without making the volume unavailable",
+        DEFERRED_RECOVERY_DEADLINE,
+        || {
+            let state = deferred_snapshot(&pipeline, key)?;
+            ensure!(
+                deferred_file(&state, key)?["attempts"].as_u64()
+                    > deferred_file(&first_deferred, key)?["attempts"].as_u64(),
+                "locked file did not receive a scheduled retry"
+            );
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )
+        },
+    )
+    .await?;
+
+    // Keep the native handle alive across the service restart. No state, index
+    // document or retry timestamp is seeded or edited by this test.
+    pipeline.stop().await?;
+    let stopped_deferred = read_state(&cfg)?;
+    ensure!(
+        stopped_deferred["pending"].is_null(),
+        "restart interrupted an active batch"
+    );
+    deferred_file(&stopped_deferred, key)?;
+    pipeline = Pipeline::start(&cfg)?;
+    let restarted_deferred = eventually(
+        "restart retains deferred file and unrelated coverage",
+        || {
+            let state = deferred_snapshot(&pipeline, key)?;
+            let before = deferred_file(&stopped_deferred, key)?;
+            let after = deferred_file(&state, key)?;
+            ensure!(
+                state["generation"] == stopped_deferred["generation"]
+                    && after["meta"] == before["meta"]
+                    && after["attempts"].as_u64() >= before["attempts"].as_u64(),
+                "restart discarded or rebuilt the deferred extraction obligation"
+            );
+            let checkpoint = volume_state(&state, key.volume())?;
+            let previous = volume_state(&stopped_deferred, key.volume())?;
+            ensure!(
+                checkpoint["guid"] == previous["guid"]
+                    && checkpoint["cursor"]["journal_id"] == previous["cursor"]["journal_id"]
+                    && checkpoint["cursor"]["last_usn"].as_u64()
+                        >= previous["cursor"]["last_usn"].as_u64(),
+                "restart lost journal progress past the failed file"
+            );
+            for term in [&flow_name, &new_name, &third, &deferred_body] {
+                absent(&pipeline.search, term, &MODES)?;
+            }
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )?;
+            Ok(state)
+        },
+    )
+    .await?;
+    drop(read_lock);
+    let recovered_state = eventually_within(
+        "persisted retry restores fresh content after unlock without another edit",
+        DEFERRED_RECOVERY_DEADLINE,
+        || {
+            pipeline.ensure_ready()?;
+            document(
+                &pipeline.search,
+                &new_name,
+                &deferred_body,
+                &renamed,
+                Some(key),
+            )?;
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )?;
+            for term in [
+                &flow_name,
+                &flow_first,
+                &flow_second,
+                &old_name,
+                &first,
+                &second,
+                &third,
+            ] {
+                absent(&pipeline.search, term, &MODES)?;
+            }
+            let state = read_state(&cfg)?;
+            ensure!(
+                state["generation"] == restarted_deferred["generation"],
+                "retry recovery rebuilt compatible indices"
+            );
+            Ok(state)
+        },
+    )
+    .await?;
+
     fs::remove_file(&renamed)?;
     eventually("journal delete from metadata and content", || {
         pipeline.ensure_ready()?;
@@ -593,7 +941,14 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
             &sentinel,
             Some(sentinel_key),
         )?;
-        for term in [&old_name, &new_name, &first, &second, &third] {
+        for term in [
+            &old_name,
+            &new_name,
+            &first,
+            &second,
+            &third,
+            &deferred_body,
+        ] {
             absent(&pipeline.search, term, &MODES)?;
         }
         Ok(())
@@ -624,7 +979,18 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
             "journal_after": journal_after,
             "initial_checkpoint": initial_volume,
             "final_checkpoint": final_volume,
-            "verified": ["live create", "content replacement", "rename", "durable backpressure", "rescan replay", "restart with offline edit", "delete", "all search modes", "stable identity", "no duplicates"]
+            "deferred_extraction": {
+                "native_error": ERROR_SHARING_VIOLATION.0,
+                "attribute_only_access_verified": true,
+                "admitted_batch": blocked_edit["pending"]["worker"]["id"],
+                "first_obligation": deferred_file(&first_deferred, key)?,
+                "checkpoint_after_unrelated_changes": volume_state(&continued_state, key.volume())?,
+                "unrelated_document_key": flow_key,
+                "restarted_obligation": deferred_file(&restarted_deferred, key)?,
+                "recovered_obligations": recovered_state["deferred"],
+                "recovered_checkpoint": volume_state(&recovered_state, key.volume())?
+            },
+            "verified": ["live create", "content replacement", "rename", "durable backpressure", "rescan replay", "restart with offline edit", "real sharing violation", "durable file deferral", "journal create/modify/delete past failed extraction", "restart with deferred obligation", "scheduled retry after unlock without another edit", "delete", "all search modes", "stable identity", "no duplicates"]
         }))?,
     )?;
     eprintln!(

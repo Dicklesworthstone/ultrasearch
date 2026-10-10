@@ -55,8 +55,9 @@ The service processes one serialized ingestion lane with this ordering:
    worker invalidates obsolete content, applies replacements/deletions, and
    stores an ingestion receipt in the Tantivy commit payload. Each receipt
    contains the durable batch UUID, a fresh physical commit UUID, and a
-   complete/partial marker. Intermediate and failed worker commits are partial;
-   every successful batch ends with a complete receipt. The dispatcher verifies
+   complete/partial marker, and a bounded set of deferred file identities.
+   Intermediate and failed worker commits are partial; every successful batch
+   ends with a complete receipt. The dispatcher verifies
    the complete receipt after a successful exit before acknowledging the batch.
    Reconciliation jobs verify file identity and metadata around
    extraction and read content from the verified open file handle. A pathname
@@ -65,10 +66,12 @@ The service processes one serialized ingestion lane with this ordering:
    handle's actual volume GUID to reject cross-volume junction substitutions.
 3. Require a complete content receipt for the expected batch, then commit
    metadata with a complete receipt for that batch. Extracted files use the
-   worker's committed metadata snapshot.
+   worker's committed metadata snapshot. Deferred files must have no content
+   document, and their metadata is tombstoned as part of the same batch.
 4. Require complete receipts in both indices for the pending batch, persist
-   their exact physical commit UUIDs and the new checkpoint, and clear pending
-   intent, then reveal completed entries. Whole-volume reconciliation remains
+   their exact physical commit UUIDs, the new checkpoint, and any deferred retry
+   obligations, and clear pending intent, then reveal completed entries.
+   Whole-volume reconciliation remains
    hidden until journal catch-up.
 
 The two indices do not form one database transaction. Durable intent and search
@@ -77,8 +80,8 @@ work before later journal records. Deletes and replacements are idempotent, so
 replay does not append another result for the same key or retain obsolete body
 terms. Both search readers reload while holding the visibility read guard.
 
-Worker failure, failed persistence, or backpressure leaves the cursor behind the
-uncompleted batch. The service retries that batch and does not silently drop
+Fatal worker failure, failed persistence, or backpressure leaves the cursor behind
+the uncompleted batch. The service retries that batch and does not silently drop
 it. Actionless records may advance an in-memory cursor without index commits;
 periodic persistence avoids a checkpoint-write feedback loop, and their replay
 after restart is harmless. A state-file lock prevents two service instances
@@ -107,9 +110,14 @@ shared seed batch and retain their individual physical commit identities.
 ## Reconciliation and exclusions
 
 A new index, incompatible index generation/schema, journal gap, or requested
-rescan triggers full-volume reconciliation. Directory rename/deletion and link
+rescan triggers full-volume reconciliation. Directory rename and link/reparse
 changes also trigger it because descendants can change paths without receiving
-individual rename records. The scanner captures the journal head **before**
+individual rename records. Ordinary non-reparse directory deletion is a precise
+tombstone, including records with accumulated create, data, attribute, or close
+reasons. Recursive removal supplies each child's deletion or move records; routine
+temporary-directory cleanup no longer resets a volume. Directory deletion with
+structural/reparse history remains conservative and requires reconciliation.
+The scanner captures the journal head **before**
 MFT enumeration, resets the volume through the worker lane, applies the snapshot,
 and replays changes from that captured position. A journal gap during this work
 requires another reconciliation.
@@ -163,9 +171,12 @@ A file can also become unsupported or too large while queued. For production
 reconciliation jobs, recognized unsupported/size-limit outcomes produce a
 metadata snapshot with empty, marked-truncated content and a warning. Denied
 content reads can use this path only when metadata and identity can still be
-verified independently. Missing files and changed identities invalidate obsolete
-jobs. Unknown extraction/I/O errors and files changing during extraction remain
-failures requiring retry.
+verified independently. Win32 sharing and lock violations never qualify as
+permanent permission-based omissions. Missing paths on a GUID volume require an
+independently verified accessible volume root and a bounded reopen before being
+accepted as obsolete; unavailable or mismatched roots retain a retry obligation.
+Changed identities invalidate obsolete jobs. Unknown extraction/I/O errors and
+files changing during extraction require deferred retry as described below.
 
 Production's SimpleText and Noop backends support extraction from the verified
 handle. Optional backends that require reopening a pathname explicitly report
@@ -177,6 +188,55 @@ Consequently, healthy journal ingestion does not promise that every file has
 full-text content. Inspect worker omission warnings and extraction policy when a
 filename is searchable but its body is absent.
 
+## Deferred extraction without stopping journal progress
+
+A single persistently locked or changing file must not make every volume repeat
+one global failed worker batch. Version 4 service batches distinguish per-file
+reconciliation failures from transaction failures. Filesystem probe failures,
+extractor errors, and snapshot changes defer the affected Reconcile job. The
+worker removes its old content, continues the other jobs, and commits the sorted
+deferred-key set atomically with its final content outcome. Validation, index
+mutation, persistence, and process failures still fail the entire transaction.
+Standalone strict Upsert jobs retain their strict failure behavior.
+
+The service validates that every deferred key belongs to the durable batch,
+verifies that its content was tombstoned, and removes the corresponding metadata.
+The checkpoint atomically retains the file snapshot, attempt count, and next retry
+time together with both physical index commit identities and the journal cursor.
+The file stays absent from all search modes until a later successful replacement;
+obsolete content and metadata are not presented as current results. A crash in
+either commit window replays the pending batch before publishing these obligations.
+
+Retries start after five seconds and back off through 10, 20, 40, 80, and 160
+seconds to a five-minute cap. A backwards wall-clock change cannot postpone an
+obligation indefinitely. After fresh journal work, the service admits at most one
+bounded retry batch of 128 files while content extraction is allowed. Due files
+are ordered by deadline and document identity. A retry has no journal cursor and
+cannot reset a volume; it uses the worker's current verified file snapshot for
+replacement in both indices. Fresh changes supersede older obligations, and
+deletion, exclusion, or a volume reset removes them. Offline and deselected
+volumes retain their saved retries without preventing selected volumes' retries.
+Retries follow successful bounded reads even when more journal records remain,
+so sustained change load cannot starve a recovered file solely by preventing
+full catch-up.
+
+The ledger is bounded to 1,024 files and the state envelope to 32 MiB. Admission
+reserves capacity for the worst possible deferred outcome before any index write,
+including enough serialized headroom to retry an existing file. Oversized retry
+groups are reduced to a fitting prefix. Near capacity, older obligations receive
+priority; a volume whose new batch was rejected for capacity may retry older files
+even while it has journal backlog. Rejection installs no global pending barrier
+and consumes no journal position. A full ledger can still apply backpressure if
+none of its failures recover; it does not discard obligations or claim healthy
+idle operation.
+
+Delete-only, volume-reset, and empty durable batches can dispatch while content
+extraction is paused by idle/load policy. Batches containing extraction continue
+to respect that policy and ordered durable intent. Previously queued legacy
+extraction remains an ordering barrier. Failure to resolve native journal metadata
+is still an explicit volume error; deferred extraction does not manufacture a
+successful native read or conceal a fatal dependency failure.
+
 ## Health and operational recovery
 
 | Condition | Behavior and operator action |
@@ -186,6 +246,8 @@ filename is searchable but its body is absent.
 | Unsupported platform or no configured NTFS volume mounted | Ingestion reports unavailable. There is no active polling fallback. Correct the runtime, mount, or selected-volume configuration. |
 | Journal unavailable or access denied | Check the mounted volume, existing journal, and service account's access. Restore access and let retry/reconciliation proceed; no successful empty read is substituted. |
 | Worker failure, full admission queue, or unwritable output | Retain state and job artifacts. Inspect logs, the worker executable/configuration, permissions, and free space. Restore the dependency; pending work is retried without advancing its checkpoint. |
+| `degraded: N files deferred for extraction retry` | Other journal changes can progress. Pending file/byte totals include the retained obligations. Restore file access or release locks and allow the bounded retry schedule to run; readiness requires no selected-volume obligations. |
+| Deferred extraction capacity reserved | New affected work waits before installing intent or moving its cursor. Due existing obligations receive priority so recovery can release capacity. Persistent failures or paused content admission can continue to apply backpressure. |
 | Invalid/unsupported state or duplicate volume identities | Startup refuses to guess identities or checkpoints. Preserve the failed state and recover a coherent index/state set as described below. |
 
 Before recovery, stop the service and preserve its configuration, both indices,
@@ -205,12 +267,20 @@ procedure above. Retained archives consume disk space.
 Deploy matching service, worker, and client builds. IPC uses an explicit v2
 magic/version/message-kind envelope; old formats are rejected before decoding
 full-reference document responses. Update the UI/CLI and service together.
-Service worker batches use JSON version 3 with a required non-nil batch UUID.
-Workers that cannot persist commit identities reject the new version. The new
-worker still accepts legacy version 1 Upsert-only and version 2 mutation input,
-but those commits are untagged and cannot acknowledge durable service ingestion.
-Deploy the updated service and worker together. Existing v2 checkpoints without
-commit evidence trigger an archived-index rebuild on this upgrade. The
+Service worker batches use JSON version 4 with a required non-nil batch UUID.
+Older workers reject the new version instead of acknowledging deferred work
+without an outcome. The updated worker accepts version 3 strict durable input and
+legacy version 1 Upsert-only/version 2 mutation input; the legacy commits are
+untagged and cannot acknowledge durable service ingestion. Tantivy ingestion
+payload version 2 adds the deferred-key set; readers also accept version 1
+receipts as having no deferred obligations. Partial receipts cannot carry retries.
+
+The state envelope is now version 3, retaining the `ingestion-v2.json` filename so
+existing volume identities stay bound. Valid version 2 state with exact commit
+evidence upgrades in place without a rebuild. An older service rejects the new
+envelope instead of silently dropping its retry ledger. Deploy the updated service
+and worker together. Existing v2 checkpoints without commit evidence still trigger
+an archived-index rebuild. The
 document-key representation and index schema also changed to preserve the
 complete NTFS identity.
 
@@ -296,6 +366,46 @@ C dependencies as well as the Windows Rust code; it did not substitute
 dependency stubs or change tracked dependency versions or feature gates. These
 are compilation results, not native execution results.
 
+### Deferred extraction and incremental cleanup verification
+
+The next implementation pass adds durable worker outcomes, per-file retry
+recovery, bounded retry admission, metadata-only dispatch during content pauses,
+and precise ordinary-directory deletion. The regression coverage includes both
+split-commit restart windows, removal of stale results in all three search modes,
+unrelated-file progress, retry/deletion supersession, stable identities, state
+version upgrades, count and serialized-byte capacity, and scheduler replacement.
+The final worker guard also checks bounded root verification and reopening before
+accepting a missing GUID path as obsolete.
+
+There were **125 distinct passing Linux tests** for the affected packages:
+ntfs-watcher 26, content-index 14, index-worker 17, meta-index 13, and service 55.
+All passed, with no failed or ignored tests in those suites. The Windows-only
+integration target has no runnable tests on Linux. This is 20 additional host
+regressions beyond the preceding 105-test affected-package run; repeated checks
+are not counted as additional tests.
+
+| Gate | Recorded result |
+| --- | --- |
+| Final Linux all-target check and Clippy for `service`, `ntfs-watcher`, `content-index`, `index-worker`, and `meta-index`, with `--locked --offline` and `-D warnings` for Clippy | Both passed against the final source, including the missing-volume guard. |
+| Windows GNU all-target check and strict Clippy for `ntfs-watcher` and `ipc` | Both passed. |
+| Final Windows GNU all-target check and strict Clippy for `service` and `index-worker`, with `service/e2e-windows` | Both passed, including the native sharing-lock/restart test and missing-GUID worker regression. |
+| Workspace `cargo fmt --all -- --check` and Git whitespace checks | Passed. |
+| Whole-workspace Linux check and Clippy | Both attempted and exited 101 in `glib-sys 0.18.1` because `pkg-config` is absent and `glib-2.0 >= 2.56` cannot be resolved. Neither whole-workspace gate passed. |
+| Native Windows execution, installed MSI acceptance, and native performance qualification | Not run; no Windows runtime is available here. |
+
+This pass used the pinned `nightly-2026-08-31` toolchain and locked dependencies,
+with the same host linker/OpenSSL settings and official LLVM-MinGW Windows GNU
+toolchain described above. Tests ran with one build job, one test thread, no
+incremental compilation, and no debug symbols. No tracked dependency versions or
+feature gates were changed. UBS and RCH were unavailable; no result from either
+tool is claimed.
+
+The native sources now include a real data-read sharing violation with unrelated
+work and restart/recovery, a missing GUID root that must become deferred work,
+and recursive directory deletion with a moved-out survivor. The missing-root
+fixture does not mount, unmount, or alter a volume. These Windows-only tests still
+require native execution before acceptance can be claimed.
+
 ## Native NTFS acceptance
 
 Use an **elevated Windows developer PowerShell** with an isolated mounted NTFS
@@ -314,6 +424,7 @@ New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 fsutil usn queryjournal V:
 
 cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc native_ntfs_lifecycle -- --ignored --nocapture --test-threads=1
+cargo test -p index-worker --bin index-worker --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
 cargo test -p service --target x86_64-pc-windows-msvc --features e2e-windows --test ntfs_incremental -- --ignored --nocapture --test-threads=1
 ```
 
@@ -321,12 +432,20 @@ The low-level watcher test uses the Windows temporary directory, hence the
 explicit `TEMP`/`TMP` setting. It checks real create/modify/attribute/rename/delete
 records, GUID paths, identity, and cursor rejection. It also enumerates the
 isolated volume through two-record MFT pulls, verifies the fixture's identity
-and metadata, and replays a change made after the captured baseline head.
+and metadata, and replays a change made after the captured baseline head. Recursive
+directory removal verifies each deleted identity, a moved-out survivor, and replay
+without a full-volume reset.
 The service test uses
 `ULTRASEARCH_NTFS_TEST_ROOT` and `ULTRASEARCH_WORKER_PATH`, creates files after
 baseline completion, and verifies all three search modes, current metadata,
 no duplicates, paused-worker backpressure, forced reconciliation, restart with
-an offline edit, and deletion while a live sentinel remains searchable.
+an offline edit, and deletion while a live sentinel remains searchable. It also
+holds a real Windows sharing lock that blocks data reads while allowing metadata
+access, verifies both-index tombstones and one durable retry obligation, and checks
+unrelated create/edit/delete progress. The obligation must survive a restart with
+the lock still held. After unlocking without another edit, the test permits up to
+360 seconds for the persisted five-minute maximum backoff to restore one current
+result under the original identity. Healthy readiness requires an empty retry list.
 It retains a uniquely named fixture directory and writes
 `data/log/native-ingestion-evidence.json` only after success. Missing prerequisites
 fail an explicitly selected native test; they do not return an early success.

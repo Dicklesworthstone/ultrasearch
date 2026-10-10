@@ -8,11 +8,13 @@ use core_types::config::{AppConfig, ExtractSection};
 use core_types::{FileFlags, FileMeta};
 use parking_lot::Mutex;
 use scheduler::{
-    SchedulerConfig, allow_content_jobs, idle::IdleTracker, metrics::SystemLoadSampler,
+    SchedulerConfig, allow_content_jobs,
+    idle::{IdleSample, IdleTracker},
+    metrics::{SystemLoad, SystemLoadSampler},
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -37,6 +39,7 @@ const MAX_INDEX_BATCH_JOBS: usize = 4096;
 struct ProducerChannel {
     runtime_id: uuid::Uuid,
     sender: mpsc::Sender<Submission>,
+    allow_content: Arc<AtomicBool>,
 }
 
 enum Submission {
@@ -58,6 +61,26 @@ fn submission_sender() -> Option<mpsc::Sender<Submission>> {
         .map(|channel| channel.sender.clone())
 }
 
+/// Opportunistic retries must not be placed ahead of fresh journal work while
+/// extraction is paused. This is an admission hint, never an acknowledgement;
+/// the runtime still applies its current policy before launching a worker.
+pub(crate) fn content_admission_available() -> bool {
+    JOB_SENDER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .as_ref()
+        .is_some_and(|channel| {
+            !channel.sender.is_closed() && channel.allow_content.load(Ordering::Relaxed)
+        })
+}
+
+fn requires_content(batch: &IndexBatch) -> bool {
+    batch
+        .jobs
+        .iter()
+        .any(|job| job.operation != JobOperation::Delete)
+}
+
 /// Runtime wrapper that drives a simple scheduling loop and dispatches content batches.
 pub struct SchedulerRuntime {
     config: SchedulerConfig,
@@ -72,6 +95,7 @@ pub struct SchedulerRuntime {
     live: &'static SchedulerLiveState,
     current_volumes: Vec<String>,
     force_allow_content: bool,
+    allow_content: Arc<AtomicBool>,
 }
 
 impl SchedulerRuntime {
@@ -90,11 +114,13 @@ impl SchedulerRuntime {
         let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
         let (tx, rx) = mpsc::channel(MAX_PENDING_SUBMISSIONS);
         let runtime_id = uuid::Uuid::new_v4();
+        let allow_content = Arc::new(AtomicBool::new(false));
         // Replace a closed runtime's sender on restart. A OnceLock containing
         // the sender itself would permanently retain the first closed channel.
         *JOB_SENDER.get_or_init(|| Mutex::new(None)).lock() = Some(ProducerChannel {
             runtime_id,
             sender: tx,
+            allow_content: Arc::clone(&allow_content),
         });
 
         Self {
@@ -110,6 +136,7 @@ impl SchedulerRuntime {
             live,
             current_volumes: app_cfg.volumes.clone(),
             force_allow_content: false,
+            allow_content,
         }
     }
 
@@ -156,6 +183,7 @@ impl SchedulerRuntime {
     /// Force content jobs to run regardless of idle/load (useful for tests).
     pub fn force_allow_content(&mut self) {
         self.force_allow_content = true;
+        self.allow_content.store(true, Ordering::Relaxed);
     }
 
     fn update_live_counts(&self) {
@@ -222,15 +250,20 @@ impl SchedulerRuntime {
     }
 
     pub async fn tick(&mut self) {
+        let idle_sample = self.idle.sample();
+        let load = self.load.sample();
+        self.tick_with_observation(idle_sample, load).await;
+    }
+
+    // Keep OS observation separate from admission and actual dispatch so policy
+    // regressions can use deterministic inputs without synthesizing worker ACKs.
+    async fn tick_with_observation(&mut self, idle_sample: IdleSample, load: SystemLoad) {
         // Reload config dynamically (from memory cache updated by IPC)
         let app_cfg = core_types::config::get_current_config();
         self.update_config(&app_cfg);
 
         self.receive_submissions();
         self.update_live_counts();
-
-        let idle_sample = self.idle.sample();
-        let load = self.load.sample();
 
         // Update status snapshot counts + active workers.
         let ct = self.pending_jobs();
@@ -250,10 +283,20 @@ impl SchedulerRuntime {
         update_content_remaining(ct as u64, workers);
         update_status_metrics(None);
 
-        // Gate metadata/content on policies; we only have content jobs for now.
+        // Extraction follows idle/load policy. Bounded deletion, reset, and
+        // metadata-only batches do not extract content and must remain usable
+        // while the user is active. Preserve older legacy work as a FIFO barrier.
         let allow_content =
             self.force_allow_content || allow_content_jobs(idle_sample.state, load, &self.config);
-        if !allow_content {
+        self.allow_content.store(allow_content, Ordering::Relaxed);
+        if !allow_content
+            && (self.legacy_retry.is_some()
+                || !self.content_jobs.is_empty()
+                || self
+                    .pending_index
+                    .as_ref()
+                    .is_some_and(|pending| requires_content(&pending.batch)))
+        {
             return;
         }
 
@@ -468,6 +511,61 @@ mod tests {
         }
     }
 
+    struct RestoreConfig(AppConfig);
+
+    impl RestoreConfig {
+        fn install(cfg: &AppConfig) -> anyhow::Result<Self> {
+            let previous = core_types::config::get_current_config();
+            core_types::config::set_current_config(cfg.clone())?;
+            Ok(Self(previous))
+        }
+    }
+
+    impl Drop for RestoreConfig {
+        fn drop(&mut self) {
+            core_types::config::set_current_config(self.0.clone())
+                .expect("restore previously validated test configuration");
+        }
+    }
+
+    fn blocked_dispatch_config() -> anyhow::Result<(AppConfig, String)> {
+        // A genuine filesystem failure proves dispatch was attempted, while
+        // preventing any process launch regardless of the worker environment.
+        // Retain this fixture as failure evidence; never fabricate a success ACK.
+        let root = tempfile::tempdir()?.keep();
+        let jobs_path = root.join("jobs-is-a-regular-file");
+        std::fs::write(&jobs_path, b"scheduler dispatch prerequisite failure\n")?;
+        let expected_error = std::fs::create_dir_all(&jobs_path)
+            .expect_err("regular file must not become a jobs directory")
+            .to_string();
+        let mut cfg = AppConfig::default();
+        cfg.paths.jobs_dir = jobs_path.to_string_lossy().into_owned();
+        cfg.paths.content_index = root.join("content").to_string_lossy().into_owned();
+        cfg.scheduler.power_save_mode = true;
+        Ok((cfg, expected_error))
+    }
+
+    async fn power_tick(runtime: &mut SchedulerRuntime, on_battery: bool) {
+        runtime
+            .tick_with_observation(
+                IdleSample {
+                    state: scheduler::idle::IdleState::DeepIdle,
+                    idle_for: Duration::from_secs(3600),
+                    since_state_change: Duration::from_secs(3600),
+                },
+                SystemLoad {
+                    cpu_percent: 0.0,
+                    mem_used_percent: 10.0,
+                    disk_bytes_per_sec: 0,
+                    disk_busy: false,
+                    sample_duration: Duration::from_secs(1),
+                    on_battery,
+                    game_mode: false,
+                },
+            )
+            .await;
+    }
+
     #[test]
     fn content_jobs_preserve_full_identity_and_skip_reparse_or_offline_files() {
         let key = core_types::DocKey::from_parts(12, 0xfedc_1234_5678_9abc);
@@ -627,6 +725,227 @@ mod tests {
         assert_eq!(second.content_jobs.len(), 1);
         drop(second);
         assert!(!enqueue_content_job(dummy_job()));
+    }
+
+    #[tokio::test]
+    async fn power_save_dispatches_delete_reset_and_empty_batches_without_false_acknowledgement()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let (cfg, expected_error) = blocked_dispatch_config()?;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let delete = JobSpec {
+            operation: JobOperation::Delete,
+            path: PathBuf::new(),
+            ..dummy_job()
+        };
+        for (jobs, reset_volumes) in [
+            (vec![delete], Vec::new()),
+            (Vec::new(), vec![1]),
+            (Vec::new(), Vec::new()),
+        ] {
+            let mut runtime = SchedulerRuntime::new(&cfg);
+            let batch = IndexBatch {
+                id: uuid::Uuid::new_v4(),
+                jobs,
+                reset_volumes,
+            };
+            let mut submission = Box::pin(submit_index_batch(batch, None));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(submission.as_mut().poll(&mut context).is_pending());
+
+            power_tick(&mut runtime, true).await;
+            assert!(
+                !content_admission_available(),
+                "extraction must remain paused"
+            );
+            assert!(
+                runtime.pending_index.is_none(),
+                "cleanup was not dispatched"
+            );
+            assert!(runtime.job_rx.is_empty());
+            let std::task::Poll::Ready(result) = submission.as_mut().poll(&mut context) else {
+                panic!("completed dispatch did not return its acknowledgement");
+            };
+            let error = result.expect_err("failed dispatch must never acknowledge a commit");
+            assert_eq!(error.to_string(), expected_error);
+            assert!(!PathBuf::from(&cfg.paths.content_index).exists());
+            assert!(PathBuf::from(&cfg.paths.jobs_dir).is_file());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn power_save_keeps_reconciliation_pending_until_extraction_is_allowed()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let (mut cfg, expected_error) = blocked_dispatch_config()?;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let reconcile = JobSpec {
+            operation: JobOperation::Reconcile,
+            ..dummy_job()
+        };
+        let delete = JobSpec {
+            operation: JobOperation::Delete,
+            file_id: 2,
+            path: PathBuf::new(),
+            ..dummy_job()
+        };
+        for (jobs, reset_volumes) in [
+            (vec![reconcile.clone()], Vec::new()),
+            (vec![delete, reconcile], vec![1]),
+        ] {
+            cfg.scheduler.power_save_mode = true;
+            core_types::config::set_current_config(cfg.clone())?;
+            let mut runtime = SchedulerRuntime::new(&cfg);
+            let batch = IndexBatch {
+                id: uuid::Uuid::new_v4(),
+                jobs,
+                reset_volumes,
+            };
+            let mut submission = Box::pin(submit_index_batch(batch.clone(), None));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(submission.as_mut().poll(&mut context).is_pending());
+            for _ in 0..2 {
+                power_tick(&mut runtime, true).await;
+                assert!(!content_admission_available());
+                assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
+                assert!(submission.as_mut().poll(&mut context).is_pending());
+            }
+
+            // Changing the real cached setting must affect the very next tick;
+            // the same on-battery observation then permits actual extraction.
+            cfg.scheduler.power_save_mode = false;
+            core_types::config::set_current_config(cfg.clone())?;
+            power_tick(&mut runtime, true).await;
+            assert!(content_admission_available());
+            assert!(runtime.pending_index.is_none());
+            let std::task::Poll::Ready(result) = submission.as_mut().poll(&mut context) else {
+                panic!("resumed dispatch did not return its acknowledgement");
+            };
+            let error = result.expect_err("real dispatch prerequisite fails");
+            assert_eq!(error.to_string(), expected_error);
+            assert!(!PathBuf::from(&cfg.paths.content_index).exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn power_save_never_lets_cleanup_overtake_older_legacy_extraction() -> anyhow::Result<()>
+    {
+        let _guard = TEST_LOCK.lock().await;
+        let (mut cfg, _) = blocked_dispatch_config()?;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        let before = JobSpec {
+            file_id: 10,
+            ..dummy_job()
+        };
+        let after = JobSpec {
+            file_id: 30,
+            ..dummy_job()
+        };
+        assert!(enqueue_content_job(before));
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![JobSpec {
+                operation: JobOperation::Delete,
+                file_id: 20,
+                path: PathBuf::new(),
+                ..dummy_job()
+            }],
+            reset_volumes: Vec::new(),
+        };
+        let mut submission = Box::pin(submit_index_batch(batch.clone(), None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        assert!(enqueue_content_job(after));
+
+        power_tick(&mut runtime, true).await;
+        assert_eq!(runtime.content_jobs.front().unwrap().file_id, 10);
+        assert!(runtime.legacy_retry.is_none());
+        assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
+        assert_eq!(runtime.job_rx.len(), 1);
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+
+        // The older extraction reaches the real dispatcher first and fails.
+        // Its retained retry must remain a barrier when power saving resumes.
+        cfg.scheduler.power_save_mode = false;
+        core_types::config::set_current_config(cfg.clone())?;
+        power_tick(&mut runtime, true).await;
+        let retry = runtime
+            .legacy_retry
+            .as_ref()
+            .expect("failed legacy extraction retained");
+        let retry_id = retry.id;
+        assert_eq!(retry.jobs.len(), 1);
+        assert_eq!(retry.jobs[0].file_id, 10);
+        assert!(runtime.content_jobs.is_empty());
+        assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+
+        cfg.scheduler.power_save_mode = true;
+        core_types::config::set_current_config(cfg.clone())?;
+        for _ in 0..2 {
+            power_tick(&mut runtime, true).await;
+            assert!(!content_admission_available());
+            assert_eq!(runtime.legacy_retry.as_ref().unwrap().id, retry_id);
+            assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
+            assert_eq!(
+                runtime.job_rx.len(),
+                1,
+                "newer legacy job crossed the durable barrier"
+            );
+            assert!(submission.as_mut().poll(&mut context).is_pending());
+        }
+        drop(runtime);
+        let error = submission
+            .await
+            .expect_err("shutdown must not forge a cleanup commit");
+        assert!(error.to_string().contains("stopped before acknowledging"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn content_admission_hint_belongs_only_to_the_current_runtime() -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let mut cfg = AppConfig::default();
+        cfg.scheduler.power_save_mode = true;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut first = SchedulerRuntime::new(&cfg);
+        assert!(!content_admission_available());
+        power_tick(&mut first, false).await;
+        assert!(content_admission_available());
+
+        let mut replacement = SchedulerRuntime::new(&cfg);
+        assert!(
+            !content_admission_available(),
+            "new runtime inherited an old admission hint"
+        );
+        power_tick(&mut first, false).await;
+        assert!(
+            !content_admission_available(),
+            "old runtime changed its replacement's hint"
+        );
+        power_tick(&mut replacement, false).await;
+        assert!(content_admission_available());
+        power_tick(&mut first, true).await;
+        assert!(
+            content_admission_available(),
+            "old runtime paused its replacement"
+        );
+        drop(first);
+        assert!(
+            content_admission_available(),
+            "old shutdown cleared the live replacement"
+        );
+        power_tick(&mut replacement, true).await;
+        assert!(!content_admission_available());
+        drop(replacement);
+        assert!(
+            !content_admission_available(),
+            "closed runtime still admits content"
+        );
+        Ok(())
     }
 
     #[tokio::test]

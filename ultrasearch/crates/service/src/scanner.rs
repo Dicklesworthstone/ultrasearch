@@ -3,7 +3,7 @@
 mod state;
 mod stats;
 
-use crate::scheduler_runtime::submit_index_batch;
+use crate::scheduler_runtime::{content_admission_available, submit_index_batch};
 use crate::status_provider::{
     update_status_ingestion_state, update_status_last_commit, update_status_volumes,
 };
@@ -16,8 +16,8 @@ use ntfs_watcher::{
     discover_volumes, tail_usn_batch_with_config,
 };
 use state::{
-    BATCH_LIMIT, ContentPolicy, MetadataChange, PendingBatch, StateStore, event_changes,
-    pending_for_volume,
+    BATCH_LIMIT, ContentPolicy, DeferredFile, MAX_DEFERRED_FILES, MetadataChange, PendingBatch,
+    StateStore, event_changes, pending_for_volume, validate_deferred_outcome,
 };
 use stats::IndexStatistics;
 use std::collections::BTreeSet;
@@ -208,6 +208,32 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             }
         }
 
+        let mut retried = false;
+        if store
+            .state
+            .deferred
+            .len()
+            .saturating_add(MUTATION_BATCH_LIMIT)
+            > MAX_DEFERRED_FILES
+            && content_admission_available()
+            && let Some(retry) =
+                store.due_retry(&volumes, &cfg, unix_timestamp_secs(), MUTATION_BATCH_LIMIT)
+        {
+            // Reserved capacity leaves the global pending slot available for
+            // old obligations. Under pressure, service these before attempting
+            // new extraction; retries cannot advance the journal cursor.
+            retried = true;
+            let result = match store.begin(retry) {
+                Ok(()) => commit_pending(store, &cfg).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                update_status_ingestion_state(format!("deferred capacity recovery: {error:#}"));
+                publish_status(store, &mut statistics)?;
+                continue;
+            }
+        }
+
         let mut failures: Vec<_> = cfg
             .volumes
             .iter()
@@ -221,26 +247,93 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             })
             .map(|mount| format!("configured volume {mount} is unavailable or not NTFS"))
             .collect();
+        let mut retry_volumes = Vec::new();
         for volume in &volumes {
-            if let Err(error) = process_volume(store, volume, &cfg).await {
-                hide_volume(volume.id);
-                failures.push(format!("volume {}: {error:#}", volume.id));
-                tracing::error!(volume = volume.id, %error, "ingestion deferred; checkpoint retained");
-                if store.state.pending.is_some() {
-                    break;
+            if store.volume(volume.id)?.needs_scan
+                && store
+                    .state
+                    .deferred
+                    .len()
+                    .saturating_add(MUTATION_BATCH_LIMIT)
+                    > MAX_DEFERRED_FILES
+                && ContentPolicy::for_volume(volume, &cfg).enabled
+            {
+                // Preserve incomplete-baseline obligations while capacity is
+                // exhausted; restarting/resetting the MFT here would discard
+                // their backoff and repeat the same failed baseline forever.
+                failures.push(format!(
+                    "volume {} reconciliation waiting for deferred extraction capacity",
+                    volume.id
+                ));
+                continue;
+            }
+            match process_volume(store, volume, &cfg).await {
+                Ok(true) => retry_volumes.push(volume.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    if error.is::<state::DeferredCapacity>() {
+                        // Admission stopped before installing new intent. Old
+                        // obligations must be able to free capacity even while
+                        // this volume still has unread journal records.
+                        retry_volumes.push(volume.clone());
+                    }
+                    hide_volume(volume.id);
+                    failures.push(format!("volume {}: {error:#}", volume.id));
+                    tracing::error!(volume = volume.id, %error, "ingestion deferred; checkpoint retained");
+                    if store.state.pending.is_some() {
+                        break;
+                    }
                 }
             }
         }
+        // Fresh journal events supersede old retry obligations before retries
+        // are considered. Admit at most one bounded retry batch after a valid
+        // read or capacity rejection, while extraction's idle policy permits it.
+        // Waiting for full catch-up would starve retries under continuous churn.
+        if store.state.pending.is_none()
+            && !retried
+            && content_admission_available()
+            && let Some(retry) = store.due_retry(
+                &retry_volumes,
+                &cfg,
+                unix_timestamp_secs(),
+                MUTATION_BATCH_LIMIT,
+            )
+        {
+            let result = match store.begin(retry) {
+                Ok(()) => commit_pending(store, &cfg).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                failures.push(format!("deferred extraction retry: {error:#}"));
+                tracing::error!(%error, "retry batch remains durable; no journal cursor consumed");
+            }
+        }
+        let deferred = store
+            .state
+            .deferred
+            .iter()
+            .filter(|retry| selected.contains(&retry.meta.key.volume()))
+            .count();
         if failures.is_empty() {
             let pending = store
                 .state
                 .volumes
                 .iter()
                 .any(|v| selected.contains(&v.id) && (v.needs_scan || v.catching_up));
-            update_status_ingestion_state(if pending {
-                "catching up with journal"
+            update_status_ingestion_state(if deferred > 0 {
+                format!(
+                    "degraded: {deferred} files deferred for extraction retry; journal {}",
+                    if pending {
+                        "catching up"
+                    } else {
+                        "reads continuing"
+                    }
+                )
+            } else if pending {
+                "catching up with journal".into()
             } else {
-                "watching; last bounded journal read succeeded"
+                "watching; last bounded journal read succeeded".into()
             });
         } else {
             update_status_ingestion_state(format!("degraded: {}", failures.join("; ")));
@@ -286,11 +379,13 @@ fn refresh_content_policy(
     Ok(true)
 }
 
+/// Return whether a bounded journal read succeeded. Retry fairness must not
+/// depend on reaching the journal head; gaps and structural changes return false.
 async fn process_volume(
     store: &mut StateStore,
     volume: &VolumeInfo,
     cfg: &AppConfig,
-) -> Result<()> {
+) -> Result<bool> {
     if store.volume(volume.id)?.needs_scan || store.volume(volume.id)?.cursor.is_none() {
         reconcile_volume(store, volume, cfg).await?;
     }
@@ -312,18 +407,19 @@ async fn process_volume(
             state.catching_up = true;
             store.save()?;
             update_status_ingestion_state(format!("volume {} journal gap; reconciling", volume.id));
+            Ok(false)
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => Err(error.into()),
         Ok(batch) => {
             let events = batch.events;
             let next = batch.cursor;
-            let Some(changes) = resolve_events(&events, cfg)? else {
+            let Some(changes) = resolve_events(&events, cfg, &store.state.deferred)? else {
                 hide_volume(volume.id);
                 let state = store.volume_mut(volume.id)?;
                 state.needs_scan = true;
                 state.catching_up = true;
                 store.save()?;
-                return Ok(());
+                return Ok(false);
             };
             if !changes.is_empty() {
                 // Bound durable JSON even for long paths. The raw read's cursor
@@ -353,9 +449,9 @@ async fn process_volume(
                 }
                 show_volume(volume.id);
             }
+            Ok(true)
         }
     }
-    Ok(())
 }
 
 async fn reconcile_volume(
@@ -439,7 +535,11 @@ where
 
 /// Unknown tombstones and our own output need no index commits. If an indexed
 /// document moves into an excluded root, remove it from both search views.
-fn resolve_events(events: &[FileEvent], cfg: &AppConfig) -> Result<Option<Vec<MetadataChange>>> {
+fn resolve_events(
+    events: &[FileEvent],
+    cfg: &AppConfig,
+    deferred: &[DeferredFile],
+) -> Result<Option<Vec<MetadataChange>>> {
     if events.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -447,7 +547,13 @@ fn resolve_events(events: &[FileEvent], cfg: &AppConfig) -> Result<Option<Vec<Me
     let meta_reader = meta_index::open_reader(&meta)?;
     let content = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
     let content_reader = content_index::open_reader(&content)?;
-    let mut known = std::collections::BTreeMap::new();
+    // A deferred file has already been removed from both indices. Its delete
+    // or exclusion event must still cancel the durable retry; searching only
+    // the live indices would incorrectly discard that event as an unknown key.
+    let mut known: std::collections::BTreeMap<_, _> = deferred
+        .iter()
+        .map(|retry| (retry.meta.key, true))
+        .collect();
     let mut indexed = |key: DocKey| -> Result<bool> {
         if let Some(found) = known.get(&key) {
             return Ok(*found);
@@ -618,11 +724,14 @@ where
 fn apply_metadata(cfg: &AppConfig, batch: &PendingBatch) -> Result<()> {
     let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
     let content = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+    let outcome = content_index::batch_outcome(&content.index)?
+        .context("worker content commit has no outcome receipt")?;
     ensure!(
-        content_index::committed_batch(&content.index)? == Some(batch.worker.id),
+        outcome.receipt.complete && outcome.receipt.batch_id == batch.worker.id,
         "worker did not commit the expected ingestion batch {}",
         batch.worker.id
     );
+    validate_deferred_outcome(batch, &outcome.deferred)?;
     let content_reader = content_index::open_reader(&content)?;
     let mut writer = meta_index::create_writer(
         &index,
@@ -637,6 +746,16 @@ fn apply_metadata(cfg: &AppConfig, batch: &PendingBatch) -> Result<()> {
     for change in &batch.metadata {
         match change {
             MetadataChange::Upsert(meta) => {
+                if outcome.deferred.binary_search(&meta.key).is_ok() {
+                    ensure!(
+                        content_index::read_file_meta(&content, &content_reader, meta.key)?
+                            .is_none(),
+                        "deferred content outcome retained a stale document: {}",
+                        meta.key
+                    );
+                    meta_index::delete_doc(&mut writer, &index.fields, meta.key);
+                    continue;
+                }
                 let operation = batch
                     .worker
                     .jobs
@@ -680,14 +799,35 @@ fn publish_status(store: &StateStore, statistics: &mut IndexStatistics) -> Resul
             .pending
             .as_ref()
             .filter(|batch| batch.volume == volume.id);
+        let deferred: Vec<_> = store
+            .state
+            .deferred
+            .iter()
+            .filter(|retry| retry.meta.key.volume() == volume.id)
+            .filter(|retry| {
+                pending.is_none_or(|batch| {
+                    !batch
+                        .metadata
+                        .iter()
+                        .any(|change| change.key() == retry.meta.key)
+                })
+            })
+            .collect();
         volumes.push(VolumeStatus {
             volume: volume.id,
             indexed_files: count,
             indexed_bytes: bytes,
-            pending_files: pending.map_or(0, |batch| batch.worker.jobs.len() as u64),
-            pending_bytes: pending.map_or(0, |batch| {
-                batch.worker.jobs.iter().map(|job| job.file_size).sum()
-            }),
+            pending_files: pending.map_or(0, |batch| batch.worker.jobs.len() as u64)
+                + deferred.len() as u64,
+            pending_bytes: deferred
+                .iter()
+                .map(|retry| retry.meta.size)
+                .chain(
+                    pending
+                        .into_iter()
+                        .flat_map(|batch| batch.worker.jobs.iter().map(|job| job.file_size)),
+                )
+                .fold(0, u64::saturating_add),
             last_usn: volume.cursor.map(|cursor| cursor.last_usn),
             journal_id: volume.cursor.map(|cursor| cursor.journal_id),
         });
@@ -760,6 +900,15 @@ mod tests {
         batch: &PendingBatch,
         snapshot: Option<(&FileMeta, &str)>,
     ) -> Result<()> {
+        worker_outcome(cfg, batch, &snapshot.into_iter().collect::<Vec<_>>(), &[])
+    }
+
+    fn worker_outcome(
+        cfg: &AppConfig,
+        batch: &PendingBatch,
+        snapshots: &[(&FileMeta, &str)],
+        deferred: &[DocKey],
+    ) -> Result<()> {
         let index = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
         let mut writer = content_index::create_writer(
             &index,
@@ -775,7 +924,8 @@ mod tests {
             let key = DocKey::from_parts(job.volume_id, job.file_id);
             content_index::delete_doc(&mut writer, &index.fields, key);
             if job.operation != JobOperation::Delete
-                && let Some((meta, text)) = snapshot.filter(|(meta, _)| meta.key == key)
+                && let Some((meta, text)) =
+                    snapshots.iter().copied().find(|(meta, _)| meta.key == key)
             {
                 content_index::add_content_doc(
                     &mut writer,
@@ -796,7 +946,7 @@ mod tests {
                 )?;
             }
         }
-        content_index::commit_batch(&mut writer, batch.worker.id)?;
+        content_index::commit_batch_with_deferred(&mut writer, batch.worker.id, deferred)?;
         Ok(())
     }
 
@@ -804,6 +954,252 @@ mod tests {
         apply_metadata(cfg, batch)?;
         store.finish()?;
         show_pending(batch);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_files_leave_no_stale_results_while_other_changes_and_retries_progress() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = VolumeInfo {
+            id: 0,
+            guid_path: "deferred-search-volume".into(),
+            drive_letters: vec!['X'],
+        };
+        store.bind_volume(&mut volume)?;
+        store.volume_mut(volume.id)?.id = 60_010;
+        volume.id = 60_010;
+        let start = JournalCursor {
+            journal_id: 7,
+            last_usn: 100,
+        };
+        store.volume_mut(volume.id)?.cursor = Some(start);
+        store.volume_mut(volume.id)?.needs_scan = false;
+        store.volume_mut(volume.id)?.catching_up = false;
+        store.save()?;
+        show_volume(volume.id);
+        let key = DocKey::from_parts(volume.id, 1);
+        let other_key = DocKey::from_parts(volume.id, 2);
+        let original = meta(key, "blockedreport.txt", 10);
+        let other = meta(other_key, "independentreport.txt", 20);
+        let seed = make_pending(
+            volume.id,
+            vec![
+                MetadataChange::Upsert(original.clone()),
+                MetadataChange::Upsert(other.clone()),
+            ],
+            None,
+            false,
+            &cfg,
+        );
+        store.begin(seed.clone())?;
+        worker_outcome(
+            &cfg,
+            &seed,
+            &[(&original, "staleheldtoken"), (&other, "oldothertoken")],
+            &[],
+        )?;
+        finish(&mut store, &cfg, &seed)?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "staleheldtoken", SearchMode::Content).total,
+            1
+        );
+
+        let changed = meta(key, "blockedreport.txt", 30);
+        let other_changed = meta(other_key, "independentreport.txt", 40);
+        let mixed = make_pending(
+            volume.id,
+            vec![
+                MetadataChange::Upsert(changed.clone()),
+                MetadataChange::Upsert(other_changed.clone()),
+            ],
+            Some(JournalCursor {
+                last_usn: 200,
+                ..start
+            }),
+            false,
+            &cfg,
+        );
+        store.begin(mixed.clone())?;
+        hide_pending(&mixed);
+        worker_outcome(&cfg, &mixed, &[(&other_changed, "freshothertoken")], &[key])?;
+        assert_eq!(store.volume(volume.id)?.cursor, Some(start));
+        drop(store);
+        let mut store = StateStore::open(&cfg)?;
+        assert_eq!(
+            store.state.pending.as_ref().unwrap().worker.id,
+            mixed.worker.id
+        );
+        worker_outcome(&cfg, &mixed, &[(&other_changed, "freshothertoken")], &[key])?;
+        finish(&mut store, &cfg, &mixed)?;
+        assert_eq!(store.volume(volume.id)?.cursor.unwrap().last_usn, 200);
+        assert_eq!(store.state.deferred.len(), 1);
+        assert_eq!(store.state.deferred[0].meta, changed);
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            assert_eq!(search(&handler, "blockedreport", mode).total, 0);
+            assert_eq!(search(&handler, "staleheldtoken", mode).total, 0);
+            let result = search(&handler, "independentreport", mode);
+            assert_eq!(result.total, 1);
+            assert_eq!(result.hits[0].key, other_key);
+            assert_eq!(result.hits[0].size, Some(40));
+        }
+        assert_eq!(
+            search(&handler, "freshothertoken", SearchMode::Content).total,
+            1
+        );
+        assert_eq!(
+            search(&handler, "oldothertoken", SearchMode::Content).total,
+            0
+        );
+
+        drop(store);
+        let mut store = StateStore::open(&cfg)?;
+        assert!(store.state.pending.is_none());
+        assert!(store.state.retired_indices.is_empty());
+        let retry = store
+            .due_retry(
+                std::slice::from_ref(&volume),
+                &cfg,
+                store.state.deferred[0].retry_at,
+                128,
+            )
+            .unwrap();
+        store.begin(retry.clone())?;
+        hide_pending(&retry);
+        // The worker's later snapshot is authoritative in both indices, even
+        // if this retry's durable observation predates a rename or another edit.
+        let recovered = meta(key, "recoveredreport.txt", 90);
+        worker_outcome(&cfg, &retry, &[(&recovered, "recoveredbodytoken")], &[])?;
+        finish(&mut store, &cfg, &retry)?;
+        assert!(store.state.deferred.is_empty());
+        assert_eq!(store.volume(volume.id)?.cursor.unwrap().last_usn, 200);
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            let result = search(&handler, "recoveredreport", mode);
+            assert_eq!(result.total, 1);
+            assert_eq!(result.hits[0].key, key);
+            assert_eq!(result.hits[0].size, Some(90));
+            assert_eq!(result.hits[0].path, recovered.path);
+            assert_eq!(search(&handler, "blockedreport", mode).total, 0);
+        }
+        assert_eq!(
+            search(&handler, "recoveredbodytoken", SearchMode::Content).total,
+            1
+        );
+
+        let blocked = make_pending(
+            volume.id,
+            vec![
+                MetadataChange::Upsert(recovered),
+                MetadataChange::Upsert(other_changed),
+            ],
+            Some(JournalCursor {
+                last_usn: 300,
+                ..start
+            }),
+            false,
+            &cfg,
+        );
+        store.begin(blocked.clone())?;
+        worker_outcome(&cfg, &blocked, &[], &[key, other_key])?;
+        finish(&mut store, &cfg, &blocked)?;
+        // Both keys have already been tombstoned. Their subsequent deletion or
+        // exclusion must still cancel the saved obligations, not look unknown.
+        let changes = resolve_events(
+            &[
+                FileEvent::Deleted(key),
+                FileEvent::Excluded {
+                    doc: other_key,
+                    is_dir: false,
+                },
+            ],
+            &cfg,
+            &store.state.deferred,
+        )?
+        .unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                MetadataChange::Delete(key),
+                MetadataChange::Delete(other_key)
+            ]
+        );
+        let deleted = make_pending(
+            volume.id,
+            changes,
+            Some(JournalCursor {
+                last_usn: 400,
+                ..start
+            }),
+            false,
+            &cfg,
+        );
+        assert!(
+            deleted
+                .worker
+                .jobs
+                .iter()
+                .all(|job| job.operation == JobOperation::Delete)
+        );
+        store.begin(deleted.clone())?;
+        worker_commit(&cfg, &deleted, None)?;
+        finish(&mut store, &cfg, &deleted)?;
+        assert!(store.state.deferred.is_empty());
+        assert!(store.due_retry(&[volume], &cfg, i64::MAX, 128).is_none());
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            assert_eq!(search(&handler, "recoveredreport", mode).total, 0);
+            assert_eq!(search(&handler, "independentreport", mode).total, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_receipt_cannot_acknowledge_content_that_was_not_tombstoned() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = VolumeInfo {
+            id: 0,
+            guid_path: "invalid-deferred-view".into(),
+            drive_letters: vec!['X'],
+        };
+        store.bind_volume(&mut volume)?;
+        let key = DocKey::from_parts(volume.id, 91);
+        let file = meta(key, "staleview.txt", 90);
+        let batch = make_pending(
+            volume.id,
+            vec![MetadataChange::Upsert(file.clone())],
+            Some(JournalCursor {
+                journal_id: 31,
+                last_usn: 500,
+            }),
+            false,
+            &cfg,
+        );
+        store.begin(batch.clone())?;
+        worker_outcome(&cfg, &batch, &[(&file, "forbiddenstalebody")], &[key])?;
+        let error = apply_metadata(&cfg, &batch).unwrap_err();
+        assert!(error.to_string().contains("retained a stale document"));
+        assert!(store.finish().is_err());
+        assert!(store.state.pending.is_some());
+        assert!(store.volume(volume.id)?.cursor.is_none());
         Ok(())
     }
 
@@ -1439,7 +1835,7 @@ mod tests {
 
         let deletion = make_pending(
             volume.id,
-            resolve_events(&[FileEvent::Deleted(key)], &cfg)?.unwrap(),
+            resolve_events(&[FileEvent::Deleted(key)], &cfg, &[])?.unwrap(),
             Some(JournalCursor {
                 last_usn: 500,
                 ..start
@@ -1460,7 +1856,7 @@ mod tests {
         }
         assert_eq!(store.volume(volume.id)?.cursor.unwrap().last_usn, 500);
         assert!(
-            resolve_events(&[FileEvent::Deleted(key)], &cfg)?
+            resolve_events(&[FileEvent::Deleted(key)], &cfg, &[])?
                 .unwrap()
                 .is_empty()
         );
@@ -1498,7 +1894,7 @@ mod tests {
             is_dir: false,
         }];
         assert_eq!(
-            resolve_events(&excluded, &cfg)?.unwrap(),
+            resolve_events(&excluded, &cfg, &[])?.unwrap(),
             vec![MetadataChange::Delete(key)]
         );
         assert!(
@@ -1507,7 +1903,8 @@ mod tests {
                     doc: DocKey::from_parts(17, 92),
                     is_dir: false
                 }],
-                &cfg
+                &cfg,
+                &[]
             )?
             .unwrap()
             .is_empty()
@@ -1518,7 +1915,8 @@ mod tests {
                     doc: key,
                     is_dir: true
                 }],
-                &cfg
+                &cfg,
+                &[]
             )?
             .is_none()
         );

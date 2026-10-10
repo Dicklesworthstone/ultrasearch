@@ -205,7 +205,7 @@ mod e2e_windows_tests {
             "failed batch must remain available for recovery"
         );
         let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        ensure!(batch["version"] == 3, "retained batch version changed");
+        ensure!(batch["version"] == 4, "retained batch version changed");
         let batch_id: Uuid = serde_json::from_value(batch["id"].clone())?;
         ensure!(!batch_id.is_nil(), "retained batch identity is missing");
         let jobs = batch["jobs"].as_array().context("retained jobs missing")?;
@@ -303,7 +303,7 @@ mod e2e_windows_tests {
             "mixed failed batch must remain recoverable"
         );
         let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        ensure!(batch["version"] == 3, "retained batch version changed");
+        ensure!(batch["version"] == 4, "retained batch version changed");
         let batch_id: Uuid = serde_json::from_value(batch["id"].clone())?;
         ensure!(!batch_id.is_nil(), "retained batch identity is missing");
         ensure!(

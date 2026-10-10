@@ -13,6 +13,7 @@ use content_index::{ContentIndex, IndexWriter, WriterConfig};
 use core_types::DocKey;
 use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::{env, fs};
 use tracing::{info, warn};
@@ -206,25 +207,41 @@ fn process_batch(
 ) -> Result<()> {
     validate_job_file(&batch)?;
     let batch_id = batch.id;
+    let allow_deferral = batch.version == 4;
     let mut pending = 0usize;
     let mut failed_jobs = 0usize;
+    let mut deferred = BTreeSet::new();
 
     for volume in batch.reset_volumes {
         content_index::delete_volume(writer, &index.fields, volume);
         pending += 1;
         if args.commit_every > 0 && pending >= args.commit_every {
-            commit_worker_batch(writer, batch_id, false)?;
+            commit_worker_batch(writer, batch_id, false, &[])?;
             pending = 0;
         }
     }
     for job in batch.jobs {
-        if let Err(err) = process_job(stack, index, writer, job, args) {
-            failed_jobs += 1;
-            warn!("job failed: {err}");
+        let key = DocKey::from_parts(job.volume_id, job.file_id);
+        let reconcile = job.operation == JobOperation::Reconcile;
+        match process_job(stack, index, writer, job, args) {
+            Ok(()) => {
+                // Later successful reconciliation or deletion supersedes a
+                // failed observation of the same identity in this batch.
+                deferred.remove(&key);
+            }
+            Err(error) if allow_deferral && reconcile && error.is::<DeferredFileFailure>() => {
+                deferred.insert(key);
+                warn!(%key, error = %format!("{error:#}"),
+                    "file extraction deferred; tombstone and retry obligation will commit together");
+            }
+            Err(error) => {
+                failed_jobs += 1;
+                warn!("job failed: {error:#}");
+            }
         }
         pending += 1;
         if args.commit_every > 0 && pending >= args.commit_every {
-            commit_worker_batch(writer, batch_id, false)?;
+            commit_worker_batch(writer, batch_id, false, &[])?;
             pending = 0;
         }
     }
@@ -232,7 +249,8 @@ fn process_batch(
     // after a periodic commit consumed the last action or the batch was empty.
     // Failed attempts must never leave completion evidence for their subset.
     if pending > 0 || (batch_id.is_some() && failed_jobs == 0) {
-        commit_worker_batch(writer, batch_id, failed_jobs == 0)?;
+        let deferred: Vec<_> = deferred.into_iter().collect();
+        commit_worker_batch(writer, batch_id, failed_jobs == 0, &deferred)?;
     }
 
     if failed_jobs > 0 {
@@ -243,10 +261,15 @@ fn process_batch(
     Ok(())
 }
 
-fn commit_worker_batch(writer: &mut IndexWriter, id: Option<Uuid>, complete: bool) -> Result<()> {
+fn commit_worker_batch(
+    writer: &mut IndexWriter,
+    id: Option<Uuid>,
+    complete: bool,
+    deferred: &[DocKey],
+) -> Result<()> {
     match id {
         Some(id) if complete => {
-            content_index::commit_batch(writer, id)?;
+            content_index::commit_batch_with_deferred(writer, id, deferred)?;
         }
         Some(id) => {
             content_index::commit_partial_batch(writer, id)?;
@@ -313,14 +336,14 @@ fn load_jobs(job_file: &PathBuf) -> Result<JobFile> {
 
 fn validate_job_file(batch: &JobFile) -> Result<()> {
     anyhow::ensure!(
-        matches!(batch.version, 1..=3),
+        matches!(batch.version, 1..=4),
         "unsupported job file version {}",
         batch.version
     );
-    if batch.version == 3 {
+    if batch.version >= 3 {
         anyhow::ensure!(
             batch.id.is_some_and(|id| !id.is_nil()),
-            "job file version 3 requires a nonnil batch id"
+            "job file version 3 or newer requires a nonnil batch id"
         );
     } else {
         anyhow::ensure!(
@@ -332,14 +355,25 @@ fn validate_job_file(batch: &JobFile) -> Result<()> {
             "job file contains no jobs or volume resets"
         );
     }
-    // Old binaries ignore unknown JSON fields. New durable transactions use
-    // version 3 so a v2 worker rejects work it cannot stamp before mutating it.
+    // Version 4 permits completed batches with durable file-level omissions.
+    // Older workers reject it rather than silently losing those obligations.
     if batch.version == 1 {
         anyhow::ensure!(
             batch.reset_volumes.is_empty(),
             "volume resets require job file version 2"
         );
         validate_legacy_jobs(&batch.jobs)?;
+    }
+    let mut reconcile_keys = BTreeSet::new();
+    for job in &batch.jobs {
+        validate_job(job)?;
+        if batch.version == 4 && job.operation == JobOperation::Reconcile {
+            reconcile_keys.insert(DocKey::from_parts(job.volume_id, job.file_id));
+            anyhow::ensure!(
+                reconcile_keys.len() <= content_index::MAX_DEFERRED_KEYS,
+                "job batch exceeds the maximum number of deferrable identities"
+            );
+        }
     }
     Ok(())
 }
@@ -352,6 +386,29 @@ fn validate_legacy_jobs(jobs: &[JobSpec]) -> Result<()> {
     Ok(())
 }
 
+fn validate_job(job: &JobSpec) -> Result<()> {
+    if job.operation != JobOperation::Delete {
+        anyhow::ensure!(
+            !job.path.as_os_str().is_empty(),
+            "job path must not be empty"
+        );
+        anyhow::ensure!(job.path.to_str().is_some(), "path is not valid UTF-8");
+    }
+    Ok(())
+}
+
+/// Only errors from filesystem probing, extraction, or a changing snapshot
+/// carry this context. Validation, index mutations, commit and process errors
+/// remain batch failures and must never become acknowledged omissions.
+#[derive(Debug)]
+struct DeferredFileFailure;
+
+impl std::fmt::Display for DeferredFileFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("file requires deferred extraction")
+    }
+}
+
 fn process_job(
     stack: &ExtractorStack,
     index: &content_index::ContentIndex,
@@ -359,6 +416,7 @@ fn process_job(
     job: JobSpec,
     args: &Args,
 ) -> Result<()> {
+    validate_job(&job)?;
     let doc_key = DocKey::from_parts(job.volume_id, job.file_id);
 
     // Invalidating first prevents stale text from surviving failed extraction.
@@ -436,7 +494,7 @@ fn process_job(
                     "content omitted; reconciling metadata and clearing obsolete text");
                 omitted_content(doc_key)
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.context(DeferredFileFailure)),
         }
     } else {
         warn!(key = %doc_key, path = %job.path.display(),
@@ -451,11 +509,13 @@ fn process_job(
         );
         return Ok(());
     };
-    anyhow::ensure!(
-        before.matches(&after),
-        "file changed during extraction; retry required: {}",
-        job.path.display()
-    );
+    if !before.matches(&after) {
+        return Err(anyhow::anyhow!(
+            "file changed during extraction; retry required: {}",
+            job.path.display()
+        )
+        .context(DeferredFileFailure));
+    }
     let lang = out.lang.clone();
     let truncated = out.truncated;
     let bytes_processed = out.bytes_processed;
@@ -543,12 +603,12 @@ impl FileSnapshot {
 /// `None` is an obsolete job. A denied data read may still yield an independently
 /// verified metadata snapshot for Reconcile; all unknown IO errors remain failures.
 fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
-    let (file, content_readable) = match fs::File::open(&job.path) {
+    let (file, content_readable) = match open_job_path(job, || fs::File::open(&job.path))? {
         Ok(file) => (Some(file), true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error)
             if job.operation == JobOperation::Reconcile
-                && error.kind() == std::io::ErrorKind::PermissionDenied =>
+                && allows_metadata_only_omission(&error) =>
         {
             #[cfg(windows)]
             let file = {
@@ -556,17 +616,20 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
                 use windows::Win32::Storage::FileSystem::{
                     FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
                 };
-                match fs::OpenOptions::new()
-                    .access_mode(FILE_READ_ATTRIBUTES.0)
-                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
-                    .open(&job.path)
-                {
+                match open_job_path(job, || {
+                    fs::OpenOptions::new()
+                        .access_mode(FILE_READ_ATTRIBUTES.0)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+                        .open(&job.path)
+                })? {
                     Ok(file) => Some(file),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                     Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("cannot verify metadata identity: {}", job.path.display())
-                        });
+                        return Err(error)
+                            .with_context(|| {
+                                format!("cannot verify metadata identity: {}", job.path.display())
+                            })
+                            .context(DeferredFileFailure);
                     }
                 }
             };
@@ -575,20 +638,23 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
             (file, false)
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("cannot open file: {}", job.path.display()));
+            return Err(error)
+                .with_context(|| format!("cannot open file: {}", job.path.display()))
+                .context(DeferredFileFailure);
         }
     };
     let metadata = file
         .as_ref()
         .map_or_else(|| fs::metadata(&job.path), fs::File::metadata)
-        .with_context(|| format!("cannot read metadata: {}", job.path.display()))?;
+        .with_context(|| format!("cannot read metadata: {}", job.path.display()))
+        .context(DeferredFileFailure)?;
     if !metadata.is_file() {
         return Ok(None);
     }
     #[cfg(windows)]
     let identity = {
         let file = file.as_ref().context("metadata handle missing")?;
-        let identity = file_identity(file)?;
+        let identity = file_identity(file).context(DeferredFileFailure)?;
         if identity.reference_number != job.file_id {
             return Ok(None);
         }
@@ -597,7 +663,7 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
         {
             // A GUID-anchored pathname can still cross volumes through a
             // junction. FRNs are only unique within their actual volume.
-            let resolved = final_guid_path(file)?;
+            let resolved = final_guid_path(file).context(DeferredFileFailure)?;
             if !volume_guid_root(&resolved)
                 .is_some_and(|actual_root| actual_root.eq_ignore_ascii_case(expected_root))
             {
@@ -608,7 +674,8 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
     };
     let modified = metadata
         .modified()
-        .with_context(|| format!("cannot read modification time: {}", job.path.display()))?;
+        .with_context(|| format!("cannot read modification time: {}", job.path.display()))
+        .context(DeferredFileFailure)?;
     Ok(Some(FileSnapshot {
         file,
         metadata,
@@ -617,6 +684,87 @@ fn probe_job_file(job: &JobSpec) -> Result<Option<FileSnapshot>> {
         #[cfg(windows)]
         identity,
     }))
+}
+
+/// Keep ordinary open errors available to the metadata-only policy, but do not
+/// confuse a disappeared GUID volume with an obsolete file. Only a missing path
+/// requires the extra root probe and one bounded re-open of that same path.
+fn open_job_path(
+    job: &JobSpec,
+    open: impl Fn() -> std::io::Result<fs::File>,
+) -> Result<std::io::Result<fs::File>> {
+    let first = open();
+    #[cfg(windows)]
+    if job.operation == JobOperation::Reconcile
+        && let Some(root) = job.path.to_str().and_then(volume_guid_root)
+    {
+        return retry_missing_with_verified_root(first, || verify_volume_root(root), open);
+    }
+    #[cfg(not(windows))]
+    let _ = job;
+    Ok(first)
+}
+
+#[cfg(any(windows, test))]
+fn retry_missing_with_verified_root<T, Guard>(
+    first: std::io::Result<T>,
+    verify_root: impl FnOnce() -> Result<Guard>,
+    reopen: impl FnOnce() -> std::io::Result<T>,
+) -> Result<std::io::Result<T>> {
+    if !first
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(first);
+    }
+    let _root = verify_root().context(DeferredFileFailure)?;
+    // The volume may have returned between the first failure and this probe.
+    // Hold its verified root handle while re-opening the original file once.
+    Ok(reopen())
+}
+
+#[cfg(windows)]
+fn verify_volume_root(root: &str) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
+
+    // The trailing slash selects the directory, not a raw volume handle; this
+    // asks only for attributes and does not require raw-disk privileges.
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(root)
+        .with_context(|| format!("cannot verify volume root: {root}"))?;
+    anyhow::ensure!(
+        file.metadata()?.is_dir(),
+        "volume root is not a directory: {root}"
+    );
+    let resolved = final_guid_path(&file)?;
+    anyhow::ensure!(
+        volume_guid_root(&resolved).is_some_and(|actual| actual.eq_ignore_ascii_case(root)),
+        "volume root identity changed: {root}"
+    );
+    Ok(file)
+}
+
+fn allows_metadata_only_omission(error: &std::io::Error) -> bool {
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+        // A sharing/byte-range lock can disappear without a security or content
+        // journal event. Keep its retry obligation even if a Rust version maps
+        // the Win32 code to PermissionDenied and attribute-only access works.
+        if [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION]
+            .iter()
+            .any(|code| error.raw_os_error() == Some(code.0 as i32))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(windows)]
@@ -766,6 +914,7 @@ fn file_flags(meta: &fs::Metadata) -> core_types::FileFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use content_extractor::Extractor;
     use tantivy::Term;
     use tantivy::collector::Count;
     use tantivy::query::TermQuery;
@@ -819,6 +968,455 @@ mod tests {
             reset_volumes: Vec::new(),
             jobs,
         }
+    }
+
+    fn deferrable_batch(jobs: Vec<JobSpec>) -> JobFile {
+        JobFile {
+            version: 4,
+            ..durable_batch(jobs)
+        }
+    }
+
+    /// Inject a repeatable read failure for one actual file while letting the
+    /// production verified-handle extractor read every other file normally.
+    struct FailingFileExtractor {
+        key: DocKey,
+        remaining: std::sync::Mutex<usize>,
+    }
+
+    impl FailingFileExtractor {
+        fn check(&self, key: DocKey) -> std::result::Result<(), content_extractor::ExtractError> {
+            let mut remaining = self.remaining.lock().expect("fault counter lock");
+            if key == self.key && *remaining > 0 {
+                *remaining -= 1;
+                return Err(content_extractor::ExtractError::Failed(
+                    "file read is temporarily blocked".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl content_extractor::Extractor for FailingFileExtractor {
+        fn name(&self) -> &'static str {
+            "deferred-file-regression"
+        }
+        fn supports(&self, _: &ExtractContext) -> bool {
+            true
+        }
+        fn extract(
+            &self,
+            ctx: &ExtractContext,
+            key: DocKey,
+        ) -> std::result::Result<content_extractor::ExtractedContent, content_extractor::ExtractError>
+        {
+            self.check(key)?;
+            content_extractor::SimpleTextExtractor.extract(ctx, key)
+        }
+        fn extract_file(
+            &self,
+            ctx: &ExtractContext,
+            key: DocKey,
+            file: &fs::File,
+        ) -> std::result::Result<content_extractor::ExtractedContent, content_extractor::ExtractError>
+        {
+            self.check(key)?;
+            content_extractor::SimpleTextExtractor.extract_file(ctx, key, file)
+        }
+    }
+
+    fn failing_file_stack(key: DocKey, failures: usize) -> ExtractorStack {
+        ExtractorStack::new(vec![Box::new(FailingFileExtractor {
+            key,
+            remaining: std::sync::Mutex::new(failures),
+        })])
+    }
+
+    #[test]
+    fn deferred_file_allows_other_replacements_and_recovers_without_stale_replay() -> Result<()> {
+        for commit_every in [0, 1] {
+            let dir = tempfile::tempdir()?;
+            let blocked_path = dir.path().join("blocked.txt");
+            let available_path = dir.path().join("available.txt");
+            let deleted_path = dir.path().join("deleted.txt");
+            fs::write(&blocked_path, "blockedobsolete")?;
+            fs::write(&available_path, "availableobsolete")?;
+            fs::write(&deleted_path, "deletedobsolete")?;
+            let blocked_job = job_for(blocked_path.clone())?;
+            let available_job = job_for(available_path.clone())?;
+            let deleted_job = job_for(deleted_path)?;
+            #[cfg(not(windows))]
+            let (available_job, mut deleted_job) = {
+                let mut available_job = available_job;
+                let mut deleted_job = deleted_job;
+                available_job.file_id += 1;
+                deleted_job.file_id += 2;
+                (available_job, deleted_job)
+            };
+            #[cfg(windows)]
+            let mut deleted_job = deleted_job;
+            let blocked_key = DocKey::from_parts(blocked_job.volume_id, blocked_job.file_id);
+            let index_path = dir.path().join("content");
+            let index = content_index::open_or_create(&index_path)?;
+            let config = WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            };
+            let mut writer = content_index::create_writer(&index, &config)?;
+            let stack = ExtractorStack::with_defaults();
+            let mut args = args();
+            args.commit_every = commit_every;
+            process_batch(
+                &stack,
+                &index,
+                &mut writer,
+                durable_batch(vec![
+                    blocked_job.clone(),
+                    available_job.clone(),
+                    deleted_job.clone(),
+                ]),
+                &args,
+            )?;
+            fs::write(&blocked_path, "blockedreplacement")?;
+            fs::write(&available_path, "availablereplacement")?;
+            deleted_job.operation = JobOperation::Delete;
+            deleted_job.path = PathBuf::new();
+            let pending = deferrable_batch(vec![blocked_job.clone(), available_job, deleted_job]);
+            let failing = failing_file_stack(blocked_key, usize::MAX);
+            process_batch(&failing, &index, &mut writer, pending.clone(), &args)?;
+            let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+            assert!(outcome.receipt.complete);
+            assert_eq!(Some(outcome.receipt.batch_id), pending.id);
+            assert_eq!(outcome.deferred, vec![blocked_key]);
+            for obsolete in ["blockedobsolete", "availableobsolete", "deletedobsolete"] {
+                assert_eq!(content_matches(&index, obsolete)?, 0);
+            }
+            assert_eq!(content_matches(&index, "blockedreplacement")?, 0);
+            assert_eq!(content_matches(&index, "availablereplacement")?, 1);
+            drop(writer);
+            drop(index);
+
+            // A restart sees the same tombstone and obligation atomically.
+            let index = content_index::open_or_create(&index_path)?;
+            assert_eq!(
+                content_index::batch_outcome(&index.index)?,
+                Some(outcome.clone())
+            );
+            let mut writer = content_index::create_writer(&index, &config)?;
+            process_batch(&failing, &index, &mut writer, pending, &args)?;
+            let replayed = content_index::batch_outcome(&index.index)?.unwrap();
+            assert_eq!(replayed.deferred, vec![blocked_key]);
+            assert_ne!(replayed.receipt.commit_id, outcome.receipt.commit_id);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 1);
+
+            let retry = deferrable_batch(vec![blocked_job.clone()]);
+            process_batch(&stack, &index, &mut writer, retry.clone(), &args)?;
+            assert!(
+                content_index::batch_outcome(&index.index)?
+                    .unwrap()
+                    .deferred
+                    .is_empty()
+            );
+            process_batch(&stack, &index, &mut writer, retry, &args)?;
+            assert_eq!(content_matches(&index, "blockedreplacement")?, 1);
+            assert_eq!(content_matches(&index, "blockedobsolete")?, 0);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+            let mut deletion = blocked_job;
+            deletion.operation = JobOperation::Delete;
+            deletion.path = PathBuf::new();
+            let deleted = deferrable_batch(vec![deletion]);
+            process_batch(&stack, &index, &mut writer, deleted.clone(), &args)?;
+            process_batch(&stack, &index, &mut writer, deleted, &args)?;
+            assert!(
+                content_index::batch_outcome(&index.index)?
+                    .unwrap()
+                    .deferred
+                    .is_empty()
+            );
+            assert_eq!(content_matches(&index, "blockedreplacement")?, 0);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn later_success_or_delete_supersedes_deferral_within_the_same_batch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("superseded.txt");
+        fs::write(&path, "supersededword")?;
+        let job = job_for(path)?;
+        let key = DocKey::from_parts(job.volume_id, job.file_id);
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let args = args();
+        process_batch(
+            &failing_file_stack(key, 1),
+            &index,
+            &mut writer,
+            deferrable_batch(vec![job.clone(), job.clone()]),
+            &args,
+        )?;
+        assert!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred
+                .is_empty()
+        );
+        assert_eq!(content_matches(&index, "supersededword")?, 1);
+        let mut deletion = job.clone();
+        deletion.operation = JobOperation::Delete;
+        deletion.path = PathBuf::new();
+        process_batch(
+            &failing_file_stack(key, 1),
+            &index,
+            &mut writer,
+            deferrable_batch(vec![job, deletion]),
+            &args,
+        )?;
+        assert!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred
+                .is_empty()
+        );
+        assert_eq!(content_matches(&index, "supersededword")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn validation_and_strict_job_failures_never_publish_a_deferred_complete() -> Result<()> {
+        for commit_every in [0, 1] {
+            let dir = tempfile::tempdir()?;
+            let first_path = dir.path().join("first.txt");
+            let strict_path = dir.path().join("strict.txt");
+            fs::write(&first_path, "originalfirst")?;
+            fs::write(&strict_path, "originalstrict")?;
+            let first = job_for(first_path.clone())?;
+            let mut strict = job_for(strict_path.clone())?;
+            #[cfg(not(windows))]
+            {
+                strict.file_id += 1;
+            }
+            strict.operation = JobOperation::Upsert;
+            let first_key = DocKey::from_parts(first.volume_id, first.file_id);
+            let index = content_index::create_in_ram()?;
+            let mut writer = content_index::create_writer(
+                &index,
+                &WriterConfig {
+                    heap_size_bytes: 20_000_000,
+                    num_threads: 1,
+                },
+            )?;
+            let mut args = args();
+            args.commit_every = commit_every;
+            let batch = deferrable_batch(vec![first.clone(), strict]);
+            process_batch(
+                &ExtractorStack::with_defaults(),
+                &index,
+                &mut writer,
+                batch.clone(),
+                &args,
+            )?;
+            let completed = content_index::batch_outcome(&index.index)?.unwrap();
+            fs::write(&first_path, "replacementfirst")?;
+            let mut invalid = first;
+            invalid.path = PathBuf::new();
+            let invalid_batch = deferrable_batch(vec![invalid]);
+            let error = process_batch(
+                &ExtractorStack::with_defaults(),
+                &index,
+                &mut writer,
+                invalid_batch,
+                &args,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("path must not be empty"));
+            assert!(!error.is::<DeferredFileFailure>());
+            assert_eq!(
+                content_index::batch_outcome(&index.index)?,
+                Some(completed.clone())
+            );
+            assert_eq!(content_matches(&index, "originalfirst")?, 1);
+
+            // A deferrable read plus a strict job failure revokes completion
+            // from an earlier successful attempt of this very same batch.
+            fs::rename(&strict_path, dir.path().join("retained.txt"))?;
+            let error = process_batch(
+                &failing_file_stack(first_key, 1),
+                &index,
+                &mut writer,
+                batch,
+                &args,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("1 failed job"));
+            let partial = content_index::batch_outcome(&index.index)?.unwrap();
+            assert!(!partial.receipt.complete);
+            assert!(partial.deferred.is_empty());
+            assert_eq!(partial.receipt.batch_id, completed.receipt.batch_id);
+            assert_ne!(partial.receipt.commit_id, completed.receipt.commit_id);
+            assert_eq!(content_index::committed_batch(&index.index)?, None);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changed_snapshot_is_deferred_and_retry_indexes_only_the_current_content() -> Result<()> {
+        struct AppendingExtractor;
+        impl Extractor for AppendingExtractor {
+            fn name(&self) -> &'static str {
+                "snapshot-drift-regression"
+            }
+            fn supports(&self, _: &ExtractContext) -> bool {
+                true
+            }
+            fn extract(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+            ) -> std::result::Result<
+                content_extractor::ExtractedContent,
+                content_extractor::ExtractError,
+            > {
+                let file = fs::File::open(ctx.path)
+                    .map_err(|error| content_extractor::ExtractError::Failed(error.to_string()))?;
+                self.extract_file(ctx, key, &file)
+            }
+            fn extract_file(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+                file: &fs::File,
+            ) -> std::result::Result<
+                content_extractor::ExtractedContent,
+                content_extractor::ExtractError,
+            > {
+                use std::io::Write;
+                let extracted =
+                    content_extractor::SimpleTextExtractor.extract_file(ctx, key, file)?;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(ctx.path)
+                    .and_then(|mut writer| writer.write_all(b" appendedafterread"))
+                    .map_err(|error| content_extractor::ExtractError::Failed(error.to_string()))?;
+                Ok(extracted)
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("changing.txt");
+        fs::write(&path, "stableoriginal")?;
+        let job = job_for(path.clone())?;
+        let key = DocKey::from_parts(job.volume_id, job.file_id);
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let args = args();
+        let normal = ExtractorStack::with_defaults();
+        process_batch(
+            &normal,
+            &index,
+            &mut writer,
+            durable_batch(vec![job.clone()]),
+            &args,
+        )?;
+        fs::write(&path, "currentword")?;
+        let pending = deferrable_batch(vec![job.clone()]);
+        process_batch(
+            &ExtractorStack::new(vec![Box::new(AppendingExtractor)]),
+            &index,
+            &mut writer,
+            pending,
+            &args,
+        )?;
+        let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+        assert!(outcome.receipt.complete);
+        assert_eq!(outcome.deferred, vec![key]);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 0);
+        process_batch(
+            &normal,
+            &index,
+            &mut writer,
+            deferrable_batch(vec![job]),
+            &args,
+        )?;
+        assert!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred
+                .is_empty()
+        );
+        assert_eq!(content_matches(&index, "stableoriginal")?, 0);
+        assert_eq!(content_matches(&index, "currentword")?, 1);
+        assert_eq!(content_matches(&index, "appendedafterread")?, 1);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sharing_violation_defers_one_file_and_recovers_after_unlock() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir()?;
+        let blocked_path = dir.path().join("locked.txt");
+        let available_path = dir.path().join("available.txt");
+        fs::write(&blocked_path, "lockedobsolete")?;
+        fs::write(&available_path, "availableword")?;
+        let blocked = job_for(blocked_path.clone())?;
+        let available = job_for(available_path)?;
+        let key = DocKey::from_parts(blocked.volume_id, blocked.file_id);
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let args = args();
+        let stack = ExtractorStack::with_defaults();
+        process_batch(
+            &stack,
+            &index,
+            &mut writer,
+            durable_batch(vec![blocked.clone()]),
+            &args,
+        )?;
+        fs::write(&blocked_path, "lockedreplacement")?;
+        let exclusive = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&blocked_path)?;
+        let pending = deferrable_batch(vec![blocked, available]);
+        process_batch(&stack, &index, &mut writer, pending.clone(), &args)?;
+        let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+        assert_eq!(outcome.deferred, vec![key]);
+        assert!(outcome.receipt.complete);
+        assert_eq!(content_matches(&index, "lockedobsolete")?, 0);
+        assert_eq!(content_matches(&index, "lockedreplacement")?, 0);
+        assert_eq!(content_matches(&index, "availableword")?, 1);
+        drop(exclusive);
+        process_batch(&stack, &index, &mut writer, pending, &args)?;
+        assert!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred
+                .is_empty()
+        );
+        assert_eq!(content_matches(&index, "lockedreplacement")?, 1);
+        assert_eq!(content_matches(&index, "availableword")?, 1);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+        Ok(())
     }
 
     #[test]
@@ -1013,6 +1611,10 @@ mod tests {
         let path = dir.path().join("original.txt");
         fs::write(&path, "obsoleteword")?;
         let mut job = job_for(path.clone())?;
+        #[cfg(windows)]
+        {
+            job.path = PathBuf::from(final_guid_path(&fs::File::open(&path)?)?);
+        }
         let index = content_index::create_in_ram()?;
         let mut writer = content_index::create_writer(
             &index,
@@ -1032,6 +1634,142 @@ mod tests {
         job.operation = JobOperation::Upsert;
         let error = process_job(&stack, &index, &mut writer, job, &args).unwrap_err();
         assert!(format!("{error:#}").contains("file missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_file_verifies_volume_and_reopens_once_before_becoming_obsolete() -> Result<()> {
+        use std::cell::Cell;
+        use std::io::{Error, ErrorKind};
+
+        let root_checks = Cell::new(0);
+        let reopens = Cell::new(0);
+        let unavailable = retry_missing_with_verified_root::<usize, ()>(
+            Err(Error::from(ErrorKind::NotFound)),
+            || {
+                root_checks.set(root_checks.get() + 1);
+                Err(Error::from(ErrorKind::NotFound).into())
+            },
+            || {
+                reopens.set(reopens.get() + 1);
+                Ok(17)
+            },
+        )
+        .unwrap_err();
+        assert!(unavailable.is::<DeferredFileFailure>());
+        assert_eq!(root_checks.get(), 1);
+        assert_eq!(reopens.get(), 0);
+
+        struct RootLease<'a>(&'a Cell<bool>);
+        impl Drop for RootLease<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let held = Cell::new(false);
+        root_checks.set(0);
+        let recovered = retry_missing_with_verified_root(
+            Err::<usize, _>(Error::from(ErrorKind::NotFound)),
+            || {
+                root_checks.set(root_checks.get() + 1);
+                held.set(true);
+                Ok(RootLease(&held))
+            },
+            || {
+                assert!(
+                    held.get(),
+                    "verified root must remain open during the second file open"
+                );
+                reopens.set(reopens.get() + 1);
+                Ok(17)
+            },
+        )??;
+        assert_eq!(recovered, 17);
+        assert_eq!(root_checks.get(), 1);
+        assert_eq!(reopens.get(), 1);
+        assert!(!held.get());
+
+        let absent = retry_missing_with_verified_root::<usize, ()>(
+            Err(Error::from(ErrorKind::NotFound)),
+            || Ok(()),
+            || Err(Error::from(ErrorKind::NotFound)),
+        )?;
+        assert_eq!(absent.unwrap_err().kind(), ErrorKind::NotFound);
+        let denied = retry_missing_with_verified_root::<usize, ()>(
+            Err(Error::from(ErrorKind::PermissionDenied)),
+            || panic!("ordinary open errors do not need another volume probe"),
+            || panic!("ordinary open errors do not reopen the file"),
+        )?;
+        assert_eq!(denied.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_missing_guid_volume_is_deferred_and_recovers_without_a_new_event() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("volume.txt");
+        fs::write(&path, "retainedvolumecontent")?;
+        let mut available = job_for(path.clone())?;
+        available.path = PathBuf::from(final_guid_path(&fs::File::open(&path)?)?);
+        let key = DocKey::from_parts(available.volume_id, available.file_id);
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let stack = ExtractorStack::with_defaults();
+        let args = args();
+        process_batch(
+            &stack,
+            &index,
+            &mut writer,
+            durable_batch(vec![available.clone()]),
+            &args,
+        )?;
+        assert_eq!(content_matches(&index, "retainedvolumecontent")?, 1);
+
+        // A fresh random GUID has no mounted volume. This probes the real
+        // Windows namespace without creating, dismounting or changing a drive.
+        let mut unavailable = available.clone();
+        unavailable.path = PathBuf::from(format!(r"\\?\Volume{{{}}}\volume.txt", Uuid::new_v4()));
+        assert_eq!(
+            fs::File::open(&unavailable.path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let pending = deferrable_batch(vec![unavailable]);
+        process_batch(&stack, &index, &mut writer, pending.clone(), &args)?;
+        let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+        assert!(outcome.receipt.complete);
+        assert_eq!(Some(outcome.receipt.batch_id), pending.id);
+        assert_eq!(outcome.deferred, vec![key]);
+        assert_eq!(content_matches(&index, "retainedvolumecontent")?, 0);
+
+        process_batch(&stack, &index, &mut writer, pending, &args)?;
+        assert_eq!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred,
+            vec![key]
+        );
+        process_batch(
+            &stack,
+            &index,
+            &mut writer,
+            deferrable_batch(vec![available]),
+            &args,
+        )?;
+        assert!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred
+                .is_empty()
+        );
+        assert_eq!(content_matches(&index, "retainedvolumecontent")?, 1);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 1);
         Ok(())
     }
 
@@ -1228,12 +1966,12 @@ mod tests {
             br#"[{"volume_id":7,"file_id":42,"path":"legacy.txt"}]"#,
         )?;
         assert_eq!(load_jobs(&path)?.jobs[0].operation, JobOperation::Upsert);
-        fs::write(&path, br#"{"version":4,"jobs":[]}"#)?;
+        fs::write(&path, br#"{"version":5,"jobs":[]}"#)?;
         assert!(
             load_jobs(&path)
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported job file version 4")
+                .contains("unsupported job file version 5")
         );
         Ok(())
     }
@@ -1246,6 +1984,9 @@ mod tests {
             serde_json::json!({"version":3,"jobs":[]}),
             serde_json::json!({"version":3,"id":null,"jobs":[]}),
             serde_json::json!({"version":3,"id":Uuid::nil(),"jobs":[]}),
+            serde_json::json!({"version":4,"jobs":[]}),
+            serde_json::json!({"version":4,"id":null,"jobs":[]}),
+            serde_json::json!({"version":4,"id":Uuid::nil(),"jobs":[]}),
         ] {
             fs::write(&path, serde_json::to_vec(&invalid)?)?;
             assert!(
@@ -1279,6 +2020,33 @@ mod tests {
         let batch = load_jobs(&path)?;
         assert_eq!(batch.id, Some(id));
         assert!(batch.jobs.is_empty());
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"version":4,"id":id,"jobs":[]}))?,
+        )?;
+        let batch = load_jobs(&path)?;
+        assert_eq!(batch.version, 4);
+        assert_eq!(batch.id, Some(id));
+        let jobs = (0..=content_index::MAX_DEFERRED_KEYS)
+            .map(|position| JobSpec {
+                volume_id: 7,
+                file_id: position as u64,
+                path: PathBuf::from("bounded.txt"),
+                operation: JobOperation::Reconcile,
+                max_bytes: None,
+                max_chars: None,
+                file_size: 0,
+            })
+            .collect();
+        let mut excessive = deferrable_batch(jobs);
+        assert!(
+            validate_job_file(&excessive)
+                .unwrap_err()
+                .to_string()
+                .contains("deferrable identities")
+        );
+        excessive.jobs.pop();
+        validate_job_file(&excessive)?;
         fs::write(&path, br#"{"version":2,"reset_volumes":[7]}"#)?;
         let legacy = load_jobs(&path)?;
         assert_eq!(legacy.id, None);

@@ -435,11 +435,14 @@ mod journal {
     pub(super) const REASON_DELETE: u32 = 0x0000_0200;
     pub(super) const REASON_RENAME_OLD: u32 = 0x0000_1000;
     pub(super) const REASON_RENAME_NEW: u32 = 0x0000_2000;
+    pub(super) const REASON_HARD_LINK: u32 = 0x0001_0000;
+    pub(super) const REASON_REPARSE: u32 = 0x0010_0000;
     pub(super) const REASON_CONTENT: u32 = 0x0020_0077;
     pub(super) const REASON_ATTRIBUTES: u32 = 0x001F_CC00;
     #[cfg(test)]
     pub(super) const REASON_CLOSE: u32 = 0x8000_0000;
     pub(super) const ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    pub(super) const ATTRIBUTE_REPARSE: u32 = 0x0000_0400;
 
     pub(super) fn excluded_path(path: &str, exclusions: &[String]) -> bool {
         let path = path.replace('/', "\\").to_lowercase();
@@ -610,13 +613,21 @@ mod journal {
         let doc = DocKey::from_parts(volume, record.frn);
         let directory = record.attributes & ATTRIBUTE_DIRECTORY != 0;
         if directory
-            && record.reason & (REASON_RENAME_OLD | REASON_RENAME_NEW | REASON_DELETE | 0x0011_0000)
+            && (record.reason
+                & (REASON_RENAME_OLD | REASON_RENAME_NEW | REASON_HARD_LINK | REASON_REPARSE)
                 != 0
+                || (record.reason & REASON_DELETE != 0
+                    && record.attributes & ATTRIBUTE_REPARSE != 0))
         {
             return Ok(Some(FileEvent::RescanRequired { doc }));
         }
         // Reasons accumulate until close. Deletion wins over create/modify in
         // a combined record; a historical create must never resurrect a file.
+        // Ordinary directory removal deletes an empty directory. Recursive
+        // removal produces each child's own deletion/move records, so the
+        // directory's tombstone must not reset an otherwise valid volume scan.
+        // Keep structural/reparse histories conservative in the branch above.
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw
         if record.reason & REASON_DELETE != 0 {
             return Ok(Some(FileEvent::Deleted(doc)));
         }
@@ -1941,12 +1952,117 @@ mod tests {
     }
 
     #[test]
-    fn directory_changes_require_descendant_reconciliation() {
+    fn ordinary_directory_deletion_is_precise_with_accumulated_reasons() {
+        for reason in [
+            journal::REASON_DELETE,
+            journal::REASON_DELETE | journal::REASON_CREATE,
+            journal::REASON_DELETE | journal::REASON_CLOSE,
+            journal::REASON_DELETE | journal::REASON_CREATE | 0x8000 | 1 | journal::REASON_CLOSE,
+        ] {
+            let mut change = record(128, 0xFFFF_0000_0000_0030, reason, "removed-directory");
+            change.attributes = journal::ATTRIBUTE_DIRECTORY | 0x20;
+            assert_eq!(
+                journal::event_from_record(42, &change, || panic!("a tombstone needs no path"))
+                    .unwrap(),
+                Some(FileEvent::Deleted(DocKey::from_parts(42, change.frn)))
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_recursive_deletion_replays_with_bounded_progress_and_preserves_moved_files() {
+        let root_frn = 0x0003_0000_0000_0030;
+        let nested_frn = 0x0004_0000_0000_0031;
+        let deleted_frn = 0x0007_0000_0000_0032;
+        let moved_frn = 0x0009_0000_0000_0033;
+        let replacement_frn = 0x0005_0000_0000_0030;
+        let mut old_name = record(128, moved_frn, journal::REASON_RENAME_OLD, "survivor.txt");
+        old_name.parent_frn = nested_frn;
+        let new_name = record(256, moved_frn, journal::REASON_RENAME_NEW, "survived.txt");
+        let mut deleted = record(384, deleted_frn, journal::REASON_DELETE, "deleted.txt");
+        deleted.parent_frn = nested_frn;
+        let mut nested = record(512, nested_frn, journal::REASON_DELETE, "nested");
+        nested.parent_frn = root_frn;
+        nested.attributes = journal::ATTRIBUTE_DIRECTORY;
+        let mut root = record(640, root_frn, journal::REASON_DELETE, "removed-tree");
+        root.attributes = journal::ATTRIBUTE_DIRECTORY;
+        let mut replacement = record(768, replacement_frn, journal::REASON_CREATE, "new-tree");
+        replacement.attributes = journal::ATTRIBUTE_DIRECTORY;
+        let moved_meta = resolved_meta(&new_name);
+        let mut replacement_meta = resolved_meta(&replacement);
+        replacement_meta.flags = FileFlags::IS_DIR;
+        let records = [old_name, new_name, deleted, nested, root, replacement];
+        let expected = vec![
+            FileEvent::Renamed {
+                from: DocKey::from_parts(42, moved_frn),
+                to: moved_meta.clone(),
+            },
+            FileEvent::Deleted(DocKey::from_parts(42, deleted_frn)),
+            FileEvent::Deleted(DocKey::from_parts(42, nested_frn)),
+            FileEvent::Deleted(DocKey::from_parts(42, root_frn)),
+            FileEvent::Created(replacement_meta.clone()),
+        ];
+
+        // A one-record budget splits the rename pair and yields an actionless
+        // first tick. Replaying each partition must preserve the same events,
+        // including different generations of the removed directory's MFT slot.
+        for budget in [1, 2, 3] {
+            for _ in 0..2 {
+                let mut position = cursor(128);
+                let mut consumed = 0;
+                let mut events = Vec::new();
+                while consumed < records.len() {
+                    let (batch, next) = journal::parse_batch(
+                        &encoded_batch(896, &records[consumed..]),
+                        position,
+                        budget,
+                    )
+                    .unwrap();
+                    assert!(batch.len() <= budget);
+                    assert!(next.last_usn > position.last_usn);
+                    assert_eq!(next.journal_id, position.journal_id);
+                    consumed += batch.len();
+                    for record in batch {
+                        let event = journal::event_from_record(42, &record, || {
+                            if record.frn == moved_frn {
+                                Ok(Some(moved_meta.clone()))
+                            } else if record.frn == replacement_frn {
+                                Ok(Some(replacement_meta.clone()))
+                            } else {
+                                panic!("deleted files and directories must not require resolution")
+                            }
+                        })
+                        .unwrap();
+                        events.extend(event);
+                    }
+                    position = next;
+                }
+                assert_eq!(position, cursor(896));
+                assert_eq!(events, expected);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, FileEvent::RescanRequired { .. }))
+                );
+                assert!(!events.contains(&FileEvent::Deleted(moved_meta.key)));
+                assert!(!events.contains(&FileEvent::Deleted(replacement_meta.key)));
+                assert_eq!(
+                    journal::parse_batch(&encoded_batch(896, &[]), position, budget).unwrap(),
+                    (Vec::new(), position)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_structural_changes_still_require_descendant_reconciliation() {
         for reason in [
             journal::REASON_RENAME_OLD,
             journal::REASON_RENAME_NEW,
-            journal::REASON_DELETE,
-            0x100000,
+            journal::REASON_HARD_LINK,
+            journal::REASON_REPARSE,
+            journal::REASON_DELETE | journal::REASON_RENAME_NEW,
+            journal::REASON_DELETE | journal::REASON_REPARSE,
         ] {
             let mut change = record(100, 10, reason, "directory");
             change.attributes = journal::ATTRIBUTE_DIRECTORY;
@@ -1958,6 +2074,15 @@ mod tests {
                 })
             );
         }
+        let mut reparse_delete = record(100, 10, journal::REASON_DELETE, "junction");
+        reparse_delete.attributes = journal::ATTRIBUTE_DIRECTORY | journal::ATTRIBUTE_REPARSE;
+        assert_eq!(
+            journal::event_from_record(42, &reparse_delete, || panic!("requires reconciliation"))
+                .unwrap(),
+            Some(FileEvent::RescanRequired {
+                doc: DocKey::from_parts(42, 10)
+            })
+        );
     }
 
     #[test]
@@ -2034,6 +2159,58 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
+        }
+
+        fn read_to_head(volume: &VolumeInfo, position: &mut JournalCursor) -> Vec<FileEvent> {
+            let head = query_journal(volume).expect("native journal head must be available");
+            assert_eq!(head.journal_id, position.journal_id);
+            assert!(head.last_usn >= position.last_usn);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let config = ReaderConfig {
+                chunk_size: 4096,
+                max_records_per_tick: 2,
+                ..ReaderConfig::default()
+            };
+            let mut observed = Vec::new();
+            while position.last_usn < head.last_usn {
+                let before = *position;
+                let batch = tail_usn_batch_with_config(volume, before, &config)
+                    .expect("bounded native journal read must succeed");
+                assert!(batch.events.len() <= config.max_records_per_tick);
+                assert_eq!(batch.cursor.journal_id, before.journal_id);
+                assert!(batch.cursor.last_usn >= before.last_usn);
+                observed.extend(batch.events);
+                *position = batch.cursor;
+                assert!(
+                    Instant::now() < deadline,
+                    "native journal did not reach its observed head"
+                );
+                if *position == before {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            observed
+        }
+
+        fn created_key(events: &[FileEvent], path: &std::path::Path) -> DocKey {
+            let expected_path = canonical_path(path).expect("fixture must have a GUID path");
+            let keys: std::collections::BTreeSet<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    FileEvent::Created(meta)
+                        if meta.path.as_deref() == Some(expected_path.as_str()) =>
+                    {
+                        Some(meta.key)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                keys.len(),
+                1,
+                "fixture create records must preserve one full identity: {expected_path}"
+            );
+            *keys.first().unwrap()
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -2168,6 +2345,88 @@ mod tests {
             &volume,
             &mut position,
             |event| matches!(event, FileEvent::Deleted(doc) if *doc == key),
+        );
+
+        // Recursive directory deletion must remain incremental. Move one child
+        // out first: deleting its former ancestors must not remove that stable
+        // file identity or turn routine directory tombstones into volume resets.
+        let tree = dir.path().join("removed-tree");
+        let nested = tree.join("nested");
+        let deep = nested.join("deep");
+        let gone = deep.join("removed-child.txt");
+        let sibling = tree.join("removed-sibling.txt");
+        let moving = nested.join("surviving-child.txt");
+        let survived = dir.path().join("surviving-child.txt");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(&gone, b"delete this nested file").unwrap();
+        std::fs::write(&sibling, b"delete this sibling").unwrap();
+        std::fs::write(&moving, b"survives the ancestor deletion").unwrap();
+        let created = read_to_head(&volume, &mut position);
+        let [
+            tree_key,
+            nested_key,
+            deep_key,
+            gone_key,
+            sibling_key,
+            moved_key,
+        ] = [&tree, &nested, &deep, &gone, &sibling, &moving]
+            .map(|path| created_key(&created, path));
+        let deleted_keys = std::collections::BTreeSet::from([
+            tree_key,
+            nested_key,
+            deep_key,
+            gone_key,
+            sibling_key,
+        ]);
+        assert_eq!(deleted_keys.len(), 5);
+        assert!(!deleted_keys.contains(&moved_key));
+        let before_deletion = position;
+        std::fs::rename(&moving, &survived).unwrap();
+        std::fs::remove_dir_all(&tree).unwrap();
+        let expected_survivor_path = canonical_path(&survived).unwrap();
+        let deleted = read_to_head(&volume, &mut position);
+        assert!(position.last_usn > before_deletion.last_usn);
+        let mut replay_position = before_deletion;
+        let replayed = read_to_head(&volume, &mut replay_position);
+        assert!(replay_position.last_usn >= position.last_usn);
+        for events in [&deleted, &replayed] {
+            let mut observed_deletions = std::collections::BTreeSet::new();
+            let mut moved = false;
+            for event in events {
+                match event {
+                    FileEvent::Deleted(doc) => {
+                        assert_ne!(
+                            *doc, moved_key,
+                            "moved child must survive its former ancestors"
+                        );
+                        if deleted_keys.contains(doc) {
+                            observed_deletions.insert(*doc);
+                        }
+                    }
+                    FileEvent::RescanRequired { doc } => {
+                        assert!(
+                            !deleted_keys.contains(doc),
+                            "ordinary directory deletion must not reset the volume"
+                        );
+                    }
+                    FileEvent::Renamed { from, to } if *from == moved_key => {
+                        assert_eq!(to.key, moved_key);
+                        assert_eq!(to.path.as_deref(), Some(expected_survivor_path.as_str()));
+                        moved = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(observed_deletions, deleted_keys);
+            assert!(
+                moved,
+                "the moved child must retain its rename event and identity"
+            );
+        }
+        assert!(!tree.exists());
+        assert_eq!(
+            std::fs::read(&survived).unwrap(),
+            b"survives the ancestor deletion"
         );
 
         let wrong_identity = JournalCursor {

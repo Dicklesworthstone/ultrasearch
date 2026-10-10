@@ -121,9 +121,9 @@ impl JobDispatcher {
         let job_file_path = self.jobs_dir.join(format!("job_{}.json", batch_id));
 
         let batch = JobBatch {
-            // Earlier workers cannot write commit receipts. They must reject
-            // this envelope before falsely acknowledging journal coverage.
-            version: 3,
+            // Version 4 workers can atomically record deferred file obligations.
+            // Earlier workers must reject this envelope before acknowledging it.
+            version: 4,
             id: batch_id,
             jobs: work.jobs.clone(),
             reset_volumes: work.reset_volumes.clone(),
@@ -451,7 +451,7 @@ mod tests {
             format!("job_{}.json", batch.id)
         );
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        assert_eq!(saved["version"], serde_json::json!(3));
+        assert_eq!(saved["version"], serde_json::json!(4));
         assert_eq!(saved["id"], serde_json::json!(batch.id));
         assert_eq!(saved["reset_volumes"], serde_json::json!([3]));
         assert_eq!(saved["jobs"], serde_json::json!([]));
@@ -478,7 +478,7 @@ mod tests {
         assert!(error.to_string().contains("worker binary missing"));
         let path = dispatcher.jobs_dir.join(format!("job_{}.json", batch.id));
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-        assert_eq!(saved["version"], serde_json::json!(3));
+        assert_eq!(saved["version"], serde_json::json!(4));
         assert_eq!(saved["id"], serde_json::json!(batch.id));
         assert_eq!(saved["jobs"], serde_json::json!([]));
         assert_eq!(saved["reset_volumes"], serde_json::json!([]));
@@ -507,6 +507,14 @@ mod tests {
         content_index::commit_partial_batch(&mut writer, requested)?;
         assert!(validate_worker_commit(&path, requested).is_err());
         content_index::commit_batch(&mut writer, requested)?;
+        validate_worker_commit(&path, requested)?;
+        // Deferrals are durable output, not a process failure. Their membership
+        // in the pending intent is checked by the service before checkpointing.
+        content_index::commit_batch_with_deferred(
+            &mut writer,
+            requested,
+            &[core_types::DocKey::from_parts(7, 42)],
+        )?;
         validate_worker_commit(&path, requested)?;
         // An external plain commit no longer attests to this batch, even if its
         // previously stamped ingestion-generation sidecar was left untouched.
