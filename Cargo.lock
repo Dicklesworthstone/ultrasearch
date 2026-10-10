@@ -1406,6 +1406,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3633,6 +3634,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "windows 0.52.0",
 ]
 

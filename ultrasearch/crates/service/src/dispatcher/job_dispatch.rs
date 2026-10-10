@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use core_types::config::AppConfig;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task;
 use tracing::{error, info};
@@ -10,6 +11,18 @@ use tracing::{error, info};
 // A failed or hung extractor must eventually release the single writer lane.
 const MAX_WORKER_DURATION: Duration = Duration::from_secs(5 * 60);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+// Runtime replacement must not create a second writer lane while a cancelled
+// dispatch still owns a detached blocking child. The permit moves with that
+// child and covers both legacy and durable batches across scheduler instances.
+static WORKER_LANE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+async fn acquire_worker_lane() -> Result<tokio::sync::OwnedSemaphorePermit> {
+    Arc::clone(WORKER_LANE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))))
+        .acquire_owned()
+        .await
+        .context("index worker lane is closed")
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +61,7 @@ pub struct IndexBatch {
 #[derive(Debug, Serialize)]
 struct JobBatch {
     version: u32,
+    id: uuid::Uuid,
     jobs: Vec<JobSpec>,
     reset_volumes: Vec<u16>,
 }
@@ -82,38 +96,40 @@ impl JobDispatcher {
     }
 
     pub async fn spawn_batch(&self, jobs: Vec<JobSpec>) -> Result<()> {
-        self.spawn_index_batch(&IndexBatch {
-            id: uuid::Uuid::new_v4(),
-            jobs,
-            reset_volumes: Vec::new(),
-        })
+        self.spawn_index_batch(
+            &IndexBatch {
+                id: uuid::Uuid::new_v4(),
+                jobs,
+                reset_volumes: Vec::new(),
+            },
+            None,
+        )
         .await
     }
 
     /// Run a batch to a successful worker commit before acknowledging it.
     /// Reusing the identifier also reuses the failure artifact on every retry.
-    pub async fn spawn_index_batch(&self, work: &IndexBatch) -> Result<()> {
-        if work.jobs.is_empty() && work.reset_volumes.is_empty() {
-            return Ok(());
-        }
-
-        if !self.jobs_dir.exists() {
-            tokio::fs::create_dir_all(&self.jobs_dir).await?;
-        }
+    pub async fn spawn_index_batch(
+        &self,
+        work: &IndexBatch,
+        mutation_lease: Option<Arc<std::fs::File>>,
+    ) -> Result<()> {
+        anyhow::ensure!(!work.id.is_nil(), "worker batch identity must not be nil");
+        let worker_lane = acquire_worker_lane().await?;
 
         let batch_id = work.id;
         let job_file_path = self.jobs_dir.join(format!("job_{}.json", batch_id));
 
         let batch = JobBatch {
-            // Version 1 workers ignore operation/reset fields. They must reject
-            // this envelope before an old writer can mutate the new index.
-            version: 2,
+            // Earlier workers cannot write commit receipts. They must reject
+            // this envelope before falsely acknowledging journal coverage.
+            version: 3,
+            id: batch_id,
             jobs: work.jobs.clone(),
             reset_volumes: work.reset_volumes.clone(),
         };
 
         let json = serde_json::to_string_pretty(&batch)?;
-        tokio::fs::write(&job_file_path, json).await?;
 
         info!(
             "Spawning worker for batch {} ({} jobs) using worker_path={}",
@@ -123,11 +139,17 @@ impl JobDispatcher {
         );
 
         let worker_path = self.worker_path.clone();
+        let jobs_dir_for_spawn = self.jobs_dir.clone();
         let job_file_for_spawn = job_file_path.clone();
         let index_dir_for_spawn = self.index_dir.clone();
         let index_dir_for_log = index_dir_for_spawn.clone();
 
         let status = task::spawn_blocking(move || -> anyhow::Result<ExitStatus> {
+            // File writes and cleanup share the blocking owner's lifetime.
+            // Cancelling an async filesystem wrapper could otherwise detach
+            // a late write/removal that races the next same-ID retry artifact.
+            std::fs::create_dir_all(&jobs_dir_for_spawn)?;
+            std::fs::write(&job_file_for_spawn, json)?;
             if !worker_path.exists() {
                 error!("worker binary missing at {}", worker_path.display());
                 anyhow::bail!("worker binary missing at {}", worker_path.display());
@@ -154,6 +176,8 @@ impl JobDispatcher {
 
             let mut child = WorkerChild {
                 child: command.spawn().context("failed to spawn worker process")?,
+                _mutation_lease: mutation_lease,
+                _worker_lane: Some(worker_lane),
             };
 
             #[cfg(target_os = "windows")]
@@ -174,7 +198,21 @@ impl JobDispatcher {
                 resume_worker_thread(child.child.id())?;
             }
 
-            child.wait_for_exit(MAX_WORKER_DURATION)
+            let status = child.wait_for_exit(MAX_WORKER_DURATION)?;
+            if status.success() {
+                // An empty batch also needs a real receipt. Neither successful
+                // exit alone nor a receipt left by a failed attempt is an ACK.
+                validate_worker_commit(&index_dir_for_spawn, batch_id).with_context(|| {
+                    format!(
+                        "worker batch {batch_id} exited successfully without its committed receipt; retained job file {}",
+                        job_file_for_spawn.display()
+                    )
+                })?;
+                // Best-effort cleanup remains inside the owner of the reaped
+                // child and its permit; a later retry cannot overtake it.
+                std::fs::remove_file(&job_file_for_spawn).ok();
+            }
+            Ok(status)
         })
         .await??;
 
@@ -183,7 +221,6 @@ impl JobDispatcher {
                 "Worker batch {} completed successfully (status={})",
                 batch_id, status
             );
-            tokio::fs::remove_file(job_file_path).await.ok();
         } else {
             error!(
                 "Worker batch {} failed with status: {} (job_file={}, index_dir={})",
@@ -202,8 +239,25 @@ impl JobDispatcher {
     }
 }
 
+fn validate_worker_commit(index_dir: &Path, batch_id: uuid::Uuid) -> Result<()> {
+    // Do not create an index here: an absent committed index is a failed ACK.
+    let index = tantivy::Index::open_in_dir(index_dir)?;
+    content_index::validate_schema(&index)?;
+    let committed = content_index::committed_batch(&index)?;
+    anyhow::ensure!(
+        committed == Some(batch_id),
+        "content index receipt {committed:?} does not match worker batch {batch_id}"
+    );
+    Ok(())
+}
+
 struct WorkerChild {
     child: Child,
+    // A cancelled async dispatcher cannot cancel an already running blocking
+    // task. Keep session ownership until this child has exited or been reaped,
+    // so another ingestion session cannot start behind a detached old writer.
+    _mutation_lease: Option<Arc<std::fs::File>>,
+    _worker_lane: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl WorkerChild {
@@ -331,6 +385,8 @@ mod tests {
         // integration test. A zero deadline makes the outcome deterministic.
         let mut child = WorkerChild {
             child: std::process::Command::new("sleep").arg("30").spawn()?,
+            _mutation_lease: None,
+            _worker_lane: None,
         };
         let error = child.wait_for_exit(Duration::ZERO).unwrap_err();
         assert!(error.to_string().contains("deadline"));
@@ -381,7 +437,10 @@ mod tests {
             reset_volumes: vec![3],
         };
         for _ in 0..2 {
-            let error = dispatcher.spawn_index_batch(&batch).await.unwrap_err();
+            let error = dispatcher
+                .spawn_index_batch(&batch, None)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("worker binary missing"));
         }
         let files =
@@ -392,9 +451,135 @@ mod tests {
             format!("job_{}.json", batch.id)
         );
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        assert_eq!(saved["version"], serde_json::json!(2));
+        assert_eq!(saved["version"], serde_json::json!(3));
+        assert_eq!(saved["id"], serde_json::json!(batch.id));
         assert_eq!(saved["reset_volumes"], serde_json::json!([3]));
         assert_eq!(saved["jobs"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_durable_batch_requires_a_worker_and_retains_its_identity() -> Result<()> {
+        let root = tempfile::tempdir()?.keep();
+        let dispatcher = JobDispatcher {
+            worker_path: root.join("missing-index-worker"),
+            jobs_dir: root.join("jobs"),
+            index_dir: root.join("content"),
+        };
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: Vec::new(),
+            reset_volumes: Vec::new(),
+        };
+        let error = dispatcher
+            .spawn_index_batch(&batch, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("worker binary missing"));
+        let path = dispatcher.jobs_dir.join(format!("job_{}.json", batch.id));
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(saved["version"], serde_json::json!(3));
+        assert_eq!(saved["id"], serde_json::json!(batch.id));
+        assert_eq!(saved["jobs"], serde_json::json!([]));
+        assert_eq!(saved["reset_volumes"], serde_json::json!([]));
+        assert!(!dispatcher.index_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn acknowledgement_requires_the_actual_matching_committed_index() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("content");
+        let requested = uuid::Uuid::new_v4();
+        assert!(validate_worker_commit(&path, requested).is_err());
+        assert!(!path.exists(), "ACK validation must not create an index");
+        let index = content_index::open_or_create(&path)?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &content_index::WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        assert!(validate_worker_commit(&path, requested).is_err());
+        content_index::commit_batch(&mut writer, uuid::Uuid::new_v4())?;
+        assert!(validate_worker_commit(&path, requested).is_err());
+        content_index::commit_partial_batch(&mut writer, requested)?;
+        assert!(validate_worker_commit(&path, requested).is_err());
+        content_index::commit_batch(&mut writer, requested)?;
+        validate_worker_commit(&path, requested)?;
+        // An external plain commit no longer attests to this batch, even if its
+        // previously stamped ingestion-generation sidecar was left untouched.
+        writer.commit()?;
+        assert!(validate_worker_commit(&path, requested).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_owner_blocks_new_sessions_and_worker_successors_until_reaped() -> Result<()>
+    {
+        // This is a process/lock ownership regression, not a simulated worker
+        // or NTFS integration test. Channels place cancellation after the real
+        // blocking child owner has acquired the lease, without timing sleeps.
+        let root = tempfile::tempdir()?;
+        let lock_path = root.path().join("ingestion.lock");
+        let lease = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)?,
+        );
+        lease.try_lock()?;
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let worker_lane = acquire_worker_lane().await?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            task::spawn_blocking(move || -> Result<()> {
+                let mut child = WorkerChild {
+                    child: std::process::Command::new("cat")
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()?,
+                    _mutation_lease: Some(lease),
+                    _worker_lane: Some(worker_lane),
+                };
+                let _ = started_tx.send(());
+                release_rx.recv()?;
+                let error = child.wait_for_exit(Duration::ZERO).unwrap_err();
+                assert!(error.to_string().contains("deadline"));
+                drop(child);
+                let _ = finished_tx.send(());
+                Ok(())
+            })
+            .await?
+        });
+        started_rx.await?;
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        assert!(
+            contender.try_lock().is_err(),
+            "detached child must retain the session lock"
+        );
+        let mut successor = Box::pin(acquire_worker_lane());
+        {
+            use std::future::Future;
+            use std::task::{Context, Waker};
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(
+                successor.as_mut().poll(&mut context).is_pending(),
+                "a replacement scheduler must wait for the old child owner"
+            );
+        }
+        release_tx.send(())?;
+        finished_rx.await?;
+        let _successor_permit = successor.await?;
+        contender.try_lock()?;
         Ok(())
     }
 }

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -83,9 +84,11 @@ enum JobOperation {
     Delete,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct JobFile {
     version: u32,
+    #[serde(default)]
+    id: Option<Uuid>,
     #[serde(default)]
     reset_volumes: Vec<u16>,
     #[serde(default)]
@@ -157,26 +160,10 @@ fn main() -> Result<()> {
     // Open index writer once for the run.
     let index: ContentIndex = content_index::open_or_create(&args.index_dir)?;
     let mut writer: IndexWriter = content_index::create_writer(&index, &WriterConfig::default())?;
-    let mut pending = 0usize;
-    let mut failed_jobs = 0usize;
 
     if let Some(job_file) = args.job_file.clone() {
         let batch = load_jobs(&job_file)?;
-        for volume in batch.reset_volumes {
-            content_index::delete_volume(&mut writer, &index.fields, volume);
-            pending += 1;
-        }
-        for job in batch.jobs {
-            if let Err(err) = process_job(&stack, &index, &mut writer, job, &args) {
-                failed_jobs += 1;
-                warn!("job failed: {err}");
-            }
-            pending += 1;
-            if args.commit_every > 0 && pending >= args.commit_every {
-                writer.commit()?;
-                pending = 0;
-            }
-        }
+        process_batch(&stack, &index, &mut writer, batch, &args)?;
     } else {
         let path = args
             .path
@@ -200,21 +187,76 @@ fn main() -> Result<()> {
         };
 
         process_job(&stack, &index, &mut writer, single, &args)?;
-        pending += 1;
-    }
-
-    if pending > 0 {
         writer.commit()?;
     }
 
-    // Preserve successfully indexed documents, but let the dispatcher retain
-    // the batch whenever an item failed instead of retiring unfinished work.
+    Ok(())
+}
+
+/// Apply one durable intent. Partial commits carry incomplete receipts; a
+/// successful attempt always publishes a fresh completed receipt. Callers must
+/// replay every retained intent, including previously completed attempts whose
+/// acknowledgement or cross-index checkpoint was interrupted.
+fn process_batch(
+    stack: &ExtractorStack,
+    index: &ContentIndex,
+    writer: &mut IndexWriter,
+    batch: JobFile,
+    args: &Args,
+) -> Result<()> {
+    validate_job_file(&batch)?;
+    let batch_id = batch.id;
+    let mut pending = 0usize;
+    let mut failed_jobs = 0usize;
+
+    for volume in batch.reset_volumes {
+        content_index::delete_volume(writer, &index.fields, volume);
+        pending += 1;
+        if args.commit_every > 0 && pending >= args.commit_every {
+            commit_worker_batch(writer, batch_id, false)?;
+            pending = 0;
+        }
+    }
+    for job in batch.jobs {
+        if let Err(err) = process_job(stack, index, writer, job, args) {
+            failed_jobs += 1;
+            warn!("job failed: {err}");
+        }
+        pending += 1;
+        if args.commit_every > 0 && pending >= args.commit_every {
+            commit_worker_batch(writer, batch_id, false)?;
+            pending = 0;
+        }
+    }
+    // Successful durable attempts always publish a final complete receipt, even
+    // after a periodic commit consumed the last action or the batch was empty.
+    // Failed attempts must never leave completion evidence for their subset.
+    if pending > 0 || (batch_id.is_some() && failed_jobs == 0) {
+        commit_worker_batch(writer, batch_id, failed_jobs == 0)?;
+    }
+
     if failed_jobs > 0 {
         anyhow::bail!(
             "batch contained {failed_jobs} failed job(s); successful jobs were committed"
         );
     }
+    Ok(())
+}
 
+fn commit_worker_batch(writer: &mut IndexWriter, id: Option<Uuid>, complete: bool) -> Result<()> {
+    match id {
+        Some(id) if complete => {
+            content_index::commit_batch(writer, id)?;
+        }
+        Some(id) => {
+            content_index::commit_partial_batch(writer, id)?;
+        }
+        None => {
+            // A standalone legacy writer cannot attest to journal coverage.
+            // Plain commits intentionally clear an existing ingestion receipt.
+            writer.commit()?;
+        }
+    }
     Ok(())
 }
 
@@ -246,22 +288,7 @@ fn load_jobs(job_file: &PathBuf) -> Result<JobFile> {
     // Prefer structured batch; fall back to legacy array for compatibility.
     match serde_json::from_reader::<_, JobFile>(&file) {
         Ok(batch) => {
-            if batch.version != 1 && batch.version != 2 {
-                anyhow::bail!("unsupported job file version {}", batch.version);
-            }
-            // An old worker ignores unknown JSON fields. The dispatcher sends
-            // version 2 so old binaries reject reconciliation/deletion work
-            // instead of falsely acknowledging append-only upserts.
-            if batch.version == 1 {
-                anyhow::ensure!(
-                    batch.reset_volumes.is_empty(),
-                    "volume resets require job file version 2"
-                );
-                validate_legacy_jobs(&batch.jobs)?;
-            }
-            if batch.jobs.is_empty() && batch.reset_volumes.is_empty() {
-                anyhow::bail!("job file contains no jobs or volume resets");
-            }
+            validate_job_file(&batch)?;
             Ok(batch)
         }
         Err(_) => {
@@ -276,11 +303,45 @@ fn load_jobs(job_file: &PathBuf) -> Result<JobFile> {
             validate_legacy_jobs(&jobs)?;
             Ok(JobFile {
                 version: 1,
+                id: None,
                 reset_volumes: Vec::new(),
                 jobs,
             })
         }
     }
+}
+
+fn validate_job_file(batch: &JobFile) -> Result<()> {
+    anyhow::ensure!(
+        matches!(batch.version, 1..=3),
+        "unsupported job file version {}",
+        batch.version
+    );
+    if batch.version == 3 {
+        anyhow::ensure!(
+            batch.id.is_some_and(|id| !id.is_nil()),
+            "job file version 3 requires a nonnil batch id"
+        );
+    } else {
+        anyhow::ensure!(
+            batch.id.is_none(),
+            "batch commit receipts require job file version 3"
+        );
+        anyhow::ensure!(
+            !batch.jobs.is_empty() || !batch.reset_volumes.is_empty(),
+            "job file contains no jobs or volume resets"
+        );
+    }
+    // Old binaries ignore unknown JSON fields. New durable transactions use
+    // version 3 so a v2 worker rejects work it cannot stamp before mutating it.
+    if batch.version == 1 {
+        anyhow::ensure!(
+            batch.reset_volumes.is_empty(),
+            "volume resets require job file version 2"
+        );
+        validate_legacy_jobs(&batch.jobs)?;
+    }
+    Ok(())
 }
 
 fn validate_legacy_jobs(jobs: &[JobSpec]) -> Result<()> {
@@ -751,6 +812,151 @@ mod tests {
         Ok(reader.searcher().search(&query, &Count)?)
     }
 
+    fn durable_batch(jobs: Vec<JobSpec>) -> JobFile {
+        JobFile {
+            version: 3,
+            id: Some(Uuid::new_v4()),
+            reset_volumes: Vec::new(),
+            jobs,
+        }
+    }
+
+    #[test]
+    fn empty_and_reset_batches_commit_durable_receipts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("reset.txt");
+        fs::write(&path, "obsoleteword")?;
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let stack = ExtractorStack::with_defaults();
+        let mut args = args();
+        let empty = durable_batch(Vec::new());
+        process_batch(&stack, &index, &mut writer, empty.clone(), &args)?;
+        assert_eq!(content_index::committed_batch(&index.index)?, empty.id);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 0);
+
+        let created = durable_batch(vec![job_for(path)?]);
+        process_batch(&stack, &index, &mut writer, created.clone(), &args)?;
+        assert_eq!(content_index::committed_batch(&index.index)?, created.id);
+        assert_eq!(content_matches(&index, "obsoleteword")?, 1);
+
+        let mut reset = durable_batch(Vec::new());
+        reset.reset_volumes = vec![7];
+        args.commit_every = 1;
+        process_batch(&stack, &index, &mut writer, reset.clone(), &args)?;
+        assert_eq!(content_index::committed_batch(&index.index)?, reset.id);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 0);
+        process_batch(&stack, &index, &mut writer, reset.clone(), &args)?;
+        assert_eq!(content_index::committed_batch(&index.index)?, reset.id);
+
+        // A later empty transaction must advance the receipt even when an
+        // earlier reset already left the index without segments.
+        let after_reset = durable_batch(Vec::new());
+        process_batch(&stack, &index, &mut writer, after_reset.clone(), &args)?;
+        assert_eq!(
+            content_index::committed_batch(&index.index)?,
+            after_reset.id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_batch_receipt_is_not_success_and_replay_replaces_documents() -> Result<()> {
+        for commit_every in [0, 1] {
+            let dir = tempfile::tempdir()?;
+            let first_path = dir.path().join("first.txt");
+            let retry_path = dir.path().join("retry.txt");
+            let held_path = dir.path().join("retained.txt");
+            fs::write(&first_path, "firstobsolete")?;
+            fs::write(&retry_path, "retryobsolete")?;
+            let first_job = job_for(first_path.clone())?;
+            let mut retry_job = job_for(retry_path.clone())?;
+            #[cfg(not(windows))]
+            {
+                retry_job.file_id = first_job.file_id + 1;
+            }
+            retry_job.operation = JobOperation::Upsert;
+            let index = content_index::create_in_ram()?;
+            let mut writer = content_index::create_writer(
+                &index,
+                &WriterConfig {
+                    heap_size_bytes: 20_000_000,
+                    num_threads: 1,
+                },
+            )?;
+            let stack = ExtractorStack::with_defaults();
+            let mut args = args();
+            let original = durable_batch(vec![first_job.clone(), retry_job.clone()]);
+            process_batch(&stack, &index, &mut writer, original, &args)?;
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+
+            fs::write(&first_path, "firstreplacement")?;
+            fs::rename(&retry_path, &held_path)?;
+            let pending = durable_batch(vec![first_job, retry_job]);
+            // Each partial commit must carry the pending identity. The worker must
+            // still fail rather than promoting this receipt to an acknowledgement.
+            args.commit_every = commit_every;
+            let error =
+                process_batch(&stack, &index, &mut writer, pending.clone(), &args).unwrap_err();
+            assert!(error.to_string().contains("1 failed job"));
+            assert_eq!(content_index::committed_batch(&index.index)?, None);
+            let partial = content_index::batch_receipt(&index.index)?.unwrap();
+            assert_eq!(Some(partial.batch_id), pending.id);
+            assert!(!partial.complete);
+            assert_eq!(content_matches(&index, "firstobsolete")?, 0);
+            assert_eq!(content_matches(&index, "retryobsolete")?, 0);
+            assert_eq!(content_matches(&index, "firstreplacement")?, 1);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 1);
+
+            fs::rename(&held_path, &retry_path)?;
+            fs::write(&retry_path, "retryreplacement")?;
+            process_batch(&stack, &index, &mut writer, pending.clone(), &args)?;
+            let completed = content_index::batch_receipt(&index.index)?.unwrap();
+            assert!(completed.complete);
+            assert_ne!(completed.commit_id, partial.commit_id);
+            // The service can still have this batch pending after both indexes
+            // completed. Failure during replay must revoke the old completion.
+            fs::rename(&retry_path, &held_path)?;
+            assert!(process_batch(&stack, &index, &mut writer, pending.clone(), &args).is_err());
+            assert_eq!(content_index::committed_batch(&index.index)?, None);
+            let retried_partial = content_index::batch_receipt(&index.index)?.unwrap();
+            assert_eq!(retried_partial.batch_id, completed.batch_id);
+            assert!(!retried_partial.complete);
+            assert_ne!(retried_partial.commit_id, completed.commit_id);
+            fs::rename(&held_path, &retry_path)?;
+            process_batch(&stack, &index, &mut writer, pending.clone(), &args)?;
+            assert_eq!(content_index::committed_batch(&index.index)?, pending.id);
+            let replayed = content_index::batch_receipt(&index.index)?.unwrap();
+            assert!(replayed.complete);
+            assert_ne!(replayed.commit_id, completed.commit_id);
+            assert_eq!(content_matches(&index, "firstreplacement")?, 1);
+            assert_eq!(content_matches(&index, "retryreplacement")?, 1);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+
+            let deletes = durable_batch(
+                pending
+                    .jobs
+                    .into_iter()
+                    .map(|mut job| {
+                        job.operation = JobOperation::Delete;
+                        job.path = PathBuf::new();
+                        job
+                    })
+                    .collect(),
+            );
+            process_batch(&stack, &index, &mut writer, deletes.clone(), &args)?;
+            assert_eq!(content_index::committed_batch(&index.index)?, deletes.id);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 0);
+        }
+        Ok(())
+    }
+
     #[test]
     fn worker_replay_modify_rename_and_delete_real_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1022,13 +1228,77 @@ mod tests {
             br#"[{"volume_id":7,"file_id":42,"path":"legacy.txt"}]"#,
         )?;
         assert_eq!(load_jobs(&path)?.jobs[0].operation, JobOperation::Upsert);
-        fs::write(&path, br#"{"version":3,"jobs":[]}"#)?;
+        fs::write(&path, br#"{"version":4,"jobs":[]}"#)?;
         assert!(
             load_jobs(&path)
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported job file version 3")
+                .contains("unsupported job file version 4")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_receipts_require_version_three_and_a_nonnil_batch_id() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("jobs.json");
+        for invalid in [
+            serde_json::json!({"version":3,"jobs":[]}),
+            serde_json::json!({"version":3,"id":null,"jobs":[]}),
+            serde_json::json!({"version":3,"id":Uuid::nil(),"jobs":[]}),
+        ] {
+            fs::write(&path, serde_json::to_vec(&invalid)?)?;
+            assert!(
+                load_jobs(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("nonnil batch id")
+            );
+        }
+        let id = Uuid::new_v4();
+        for version in [1, 2] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version":version,
+                    "id":id,
+                    "jobs":[{"volume_id":7,"file_id":42,"path":"legacy.txt"}]
+                }))?,
+            )?;
+            assert!(
+                load_jobs(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("version 3")
+            );
+        }
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"version":3,"id":id,"jobs":[]}))?,
+        )?;
+        let batch = load_jobs(&path)?;
+        assert_eq!(batch.id, Some(id));
+        assert!(batch.jobs.is_empty());
+        fs::write(&path, br#"{"version":2,"reset_volumes":[7]}"#)?;
+        let legacy = load_jobs(&path)?;
+        assert_eq!(legacy.id, None);
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        content_index::commit_batch(&mut writer, id)?;
+        process_batch(
+            &ExtractorStack::with_defaults(),
+            &index,
+            &mut writer,
+            legacy,
+            &args(),
+        )?;
+        assert_eq!(content_index::committed_batch(&index.index)?, None);
         Ok(())
     }
 

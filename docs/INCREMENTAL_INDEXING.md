@@ -53,15 +53,23 @@ The service processes one serialized ingestion lane with this ordering:
    mutation. Durable mutation batches contain at most 128 changes.
 2. Wait for bounded scheduler admission and a successful real worker exit. The
    worker invalidates obsolete content, applies replacements/deletions, and
-   commits. Reconciliation jobs verify file identity and metadata around
+   stores an ingestion receipt in the Tantivy commit payload. Each receipt
+   contains the durable batch UUID, a fresh physical commit UUID, and a
+   complete/partial marker. Intermediate and failed worker commits are partial;
+   every successful batch ends with a complete receipt. The dispatcher verifies
+   the complete receipt after a successful exit before acknowledging the batch.
+   Reconciliation jobs verify file identity and metadata around
    extraction and read content from the verified open file handle. A pathname
    swapped away and back cannot supply another file's contents. Windows checks
    the full FRN and volume serial; for production GUID paths it also resolves the
    handle's actual volume GUID to reject cross-volume junction substitutions.
-3. Commit metadata. Extracted files use the worker's committed metadata snapshot,
-   rather than metadata observed before waiting for admission.
-4. Persist the new checkpoint and clear pending intent, then reveal completed
-   entries. Whole-volume reconciliation remains hidden until journal catch-up.
+3. Require a complete content receipt for the expected batch, then commit
+   metadata with a complete receipt for that batch. Extracted files use the
+   worker's committed metadata snapshot.
+4. Require complete receipts in both indices for the pending batch, persist
+   their exact physical commit UUIDs and the new checkpoint, and clear pending
+   intent, then reveal completed entries. Whole-volume reconciliation remains
+   hidden until journal catch-up.
 
 The two indices do not form one database transaction. Durable intent and search
 visibility cover the interval between their commits. A restart replays pending
@@ -74,7 +82,27 @@ uncompleted batch. The service retries that batch and does not silently drop
 it. Actionless records may advance an in-memory cursor without index commits;
 periodic persistence avoids a checkpoint-write feedback loop, and their replay
 after restart is harmless. A state-file lock prevents two service instances
-from owning the same ingestion state.
+from owning the same ingestion state. Admitted workers and blocking metadata
+writes retain a shared lease on that lock until they actually finish, including
+when their async caller is cancelled. A restarted scanner cannot overtake a
+write that outlived its original task. Worker dispatch also shares one execution
+permit across scheduler instances. A detached child retains that permit until
+it has exited and been reaped, so replacing only the scheduler cannot run a retry
+or later batch ahead of an old worker.
+
+On startup, both index receipts are checked against the exact completed commit
+UUIDs and any pending batch. With pending work, the reachable content/metadata
+pairs are completed/completed, pending/completed, and pending/pending. Pending
+content may be partial; metadata must have a complete receipt. Every pending
+batch is replayed, even if both indices already contain complete receipts for
+it. A receipt cannot replace successful worker execution during replay.
+
+The reverse completed/pending pair, unrelated or missing receipts, and older
+state without commit evidence require preserved-index reconciliation. Checking
+physical commit UUIDs also detects an older partial or complete attempt of the
+same batch restored underneath a newer checkpoint. The batch UUID alone cannot
+distinguish those attempts. New empty indices receive complete receipts for a
+shared seed batch and retain their individual physical commit identities.
 
 ## Reconciliation and exclusions
 
@@ -86,10 +114,20 @@ MFT enumeration, resets the volume through the worker lane, applies the snapshot
 and replays changes from that captured position. A journal gap during this work
 requires another reconciliation.
 
-Reconciliation currently materializes the volume's metadata snapshot and can be
-expensive on large volumes. The affected volume is hidden during rebuilding and
-catch-up. The bounded journal-read limit is not a claim of bounded total MFT
-snapshot memory or a maximum end-to-end catch-up time.
+Reconciliation pulls bounded MFT batches. One scanner retains a 256 KiB raw
+buffer and resolves at most 128 raw records per pull, including excluded or
+disappeared entries. The service commits the current mutation batch before
+requesting the next one; paused worker admission cannot accumulate an entire
+volume snapshot in memory. An empty batch represents bounded progress and does
+not end the scan. Each pull and native EOF revalidate the original journal
+cursor, so a journal that wraps during a worker pause invalidates the scan.
+
+Reader/worker failures and cancellation keep the incomplete-scan marker and any
+pending intent durable. Only a successful native EOF completes the baseline,
+and the volume remains hidden until journal catch-up. Index writers, extraction,
+and individual path lengths still contribute to memory use. Large volumes and
+sustained churn can take substantial time; bounded batches do not establish a
+maximum end-to-end catch-up time.
 
 Metadata/content indices, state, jobs, logging directories, an existing semantic
 index directory, and retained migration archives are excluded using canonical
@@ -158,7 +196,7 @@ the service perform initial reconciliation; keep the old data for diagnosis
 outside the selected indexing scope. Do not hand-edit USNs or volume IDs, or
 clear/reset the NTFS journal to repair an index/checkpoint problem.
 
-Schema or generation mismatch preserves readable existing index directories as
+Schema, generation, or commit-identity mismatch preserves readable existing index directories as
 siblings named with `before-ingestion-v2-<uuid>`, records/excludes those archives,
 creates new index-generation markers, and invalidates old cursors for rebuilding.
 Corrupt unreadable indices may instead fail startup and require the recovery
@@ -167,10 +205,14 @@ procedure above. Retained archives consume disk space.
 Deploy matching service, worker, and client builds. IPC uses an explicit v2
 magic/version/message-kind envelope; old formats are rejected before decoding
 full-reference document responses. Update the UI/CLI and service together.
-Service worker batches use JSON version 2 so an old worker cannot silently accept
-and ignore Delete/Reconcile/reset operations. The new worker still accepts legacy
-version 1 Upsert-only input. The document-key representation and index schema also
-changed to preserve the complete NTFS identity.
+Service worker batches use JSON version 3 with a required non-nil batch UUID.
+Workers that cannot persist commit identities reject the new version. The new
+worker still accepts legacy version 1 Upsert-only and version 2 mutation input,
+but those commits are untagged and cannot acknowledge durable service ingestion.
+Deploy the updated service and worker together. Existing v2 checkpoints without
+commit evidence trigger an archived-index rebuild on this upgrade. The
+document-key representation and index schema also changed to preserve the
+complete NTFS identity.
 
 ## Deterministic regressions and quality gates
 
@@ -192,9 +234,10 @@ full file references, replacement/deletion, partial commits and restart,
 metadata-only policy, exclusions, and scheduler admission/restart. They can
 validate deterministic processing without establishing native journal behavior.
 
-### Verification recorded for this change
+### Verification of the initial implementation
 
-Verification on 2026-10-10 used the pinned `nightly-2026-08-31` toolchain.
+Verification of commit `b767a0a07539c45b6ea78b4cd6d6493a8a49c993` on
+2026-10-10 used the pinned `nightly-2026-08-31` toolchain.
 There were **131 distinct passing Linux tests**: core-types 15,
 core-serialization 5, content-extractor 15, index-worker 9, meta-index 13,
 content-index 7, IPC 17, ntfs-watcher 18, service 31, and feature-enabled
@@ -217,6 +260,41 @@ and omitted debug symbols. System OpenSSL headers/libraries were selected
 explicitly. Windows checks used the repository's Windows target flags.
 The environment did not provide UBS or RCH; no results from those tools are
 claimed.
+
+### Bounded baseline and commit-recovery verification
+
+The follow-up changes use the same pinned toolchain and locked dependencies.
+The source adds regressions for bounded MFT pulls, filtered progress versus EOF,
+commit-before-next-pull backpressure, cancelled baselines, reader failure,
+partial worker receipts, restored attempts of the same batch, exact checkpoint
+commit identities, and ingestion lock ownership after async cancellation.
+The child cancellation regression also checks that a successor waits for the
+shared worker execution permit until the original child has been reaped.
+
+There were **105 distinct passing Linux tests** for the five affected packages:
+ntfs-watcher 24, content-index 12, index-worker 12, meta-index 13, and service 44.
+This includes 27 added regressions. Unchanged packages from the initial
+131-test run retain their separately recorded verification above.
+
+| Gate | Recorded result |
+| --- | --- |
+| Linux all-target check for `service`, `ntfs-watcher`, `content-index`, `index-worker`, and `meta-index`, with `--locked --offline` | Passed without source diagnostics, including the new test targets. |
+| Linux tests for the five affected packages | All 105 passed, including the final dispatcher cancellation and successor-ordering regression. The Windows-only integration target ran zero tests on Linux. |
+| Linux Clippy, all targets of the five affected packages, with `--locked --offline -- -D warnings` | Passed without diagnostics after the final dispatcher change. |
+| Windows GNU all-target check and Clippy for `ntfs-watcher` and `ipc`, with `--locked --offline` and `-D warnings` for Clippy | Both passed without diagnostics, including the native MFT reader and Windows test code. |
+| Windows GNU all-target check and Clippy for `service` and `index-worker`, with `service/e2e-windows`, `--locked --offline`, and `-D warnings` for Clippy | Both passed after the final Windows test cleanup, including production Windows service/worker code and the native integration test target. |
+| Workspace `cargo fmt --all -- --check` and staged Git whitespace checks | Passed. |
+| Whole-workspace Linux check and Clippy | Both attempted against the final source and stopped in UI dependency `glib-sys 0.18.1`: the `pkg-config` command needed to locate `glib-2.0 >= 2.56` is absent. Both exited 101; neither gate passed. |
+| Native NTFS and service lifecycle execution | Not run; no Windows runtime is available in this environment. |
+
+The follow-up Windows checks used `x86_64-pc-windows-gnu`, the pinned Rust
+toolchain and target standard library, and the official LLVM-MinGW 20261006
+MSVCRT Linux x86-64 bundle (Clang 23.1.3), with target-specific compiler,
+archiver, and linker variables and `RUSTFLAGS='-Z threads=1'`. Host OpenSSL
+paths were unset for the cross commands. The broader check compiled the Windows
+C dependencies as well as the Windows Rust code; it did not substitute
+dependency stubs or change tracked dependency versions or feature gates. These
+are compilation results, not native execution results.
 
 ## Native NTFS acceptance
 
@@ -241,7 +319,10 @@ cargo test -p service --target x86_64-pc-windows-msvc --features e2e-windows --t
 
 The low-level watcher test uses the Windows temporary directory, hence the
 explicit `TEMP`/`TMP` setting. It checks real create/modify/attribute/rename/delete
-records, GUID paths, identity, and cursor rejection. The service test uses
+records, GUID paths, identity, and cursor rejection. It also enumerates the
+isolated volume through two-record MFT pulls, verifies the fixture's identity
+and metadata, and replays a change made after the captured baseline head.
+The service test uses
 `ULTRASEARCH_NTFS_TEST_ROOT` and `ULTRASEARCH_WORKER_PATH`, creates files after
 baseline completion, and verifies all three search modes, current metadata,
 no duplicates, paused-worker backpressure, forced reconciliation, restart with
@@ -259,10 +340,13 @@ cargo check -p service --features e2e-windows --test ntfs_incremental --target x
 ```
 
 **Validation limitation:** this implementation work was performed in a Linux
-environment. Windows-target all-targets checks for `ntfs-watcher` and `ipc`
-passed. The broader Windows service/worker/e2e check stopped in `zstd-sys` because
-the MSVC native toolchain, including `lib.exe`, is unavailable; it did not reach
-the service or worker's Windows Rust code.
+environment. The follow-up Windows GNU all-target checks and strict Clippy
+passed for the watcher, IPC, service, worker, and native integration test target.
+The initial broader Windows MSVC attempt
+stopped in `zstd-sys` because the MSVC native toolchain, including `lib.exe`, is
+unavailable. The subsequent GNU check reached and checked the service and
+worker's Windows Rust code, but does not establish an MSVC build or Windows
+runtime acceptance.
 
 No successful native Windows journal or native service lifecycle run has been
 established there. Windows-gated tests are absent from Linux test runs;

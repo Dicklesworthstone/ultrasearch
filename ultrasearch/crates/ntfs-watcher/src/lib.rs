@@ -104,6 +104,40 @@ pub struct JournalBatch {
     pub caught_up: bool,
 }
 
+/// A pull-based baseline scan bound to one volume handle and journal incarnation.
+/// The caller must apply each returned batch before requesting another one and
+/// keep the volume hidden until enumeration and journal catch-up both complete.
+#[derive(Debug)]
+pub struct MftScan {
+    cursor: JournalCursor,
+    #[cfg(windows)]
+    native: native::MftScan,
+}
+
+impl MftScan {
+    /// The journal head captured before the first MFT read. Replay from this
+    /// position after the complete baseline has been committed.
+    pub fn journal_cursor(&self) -> JournalCursor {
+        self.cursor
+    }
+
+    /// Consume at most the configured number of raw MFT records, issuing no
+    /// more than one fixed-size kernel read. An empty `Some` batch is progress
+    /// through excluded or disappeared files; only `None` means validated EOF.
+    ///
+    /// Errors invalidate this scan. Start a new reconciliation rather than
+    /// treating an error or cancellation as successful partial enumeration.
+    #[cfg(windows)]
+    pub fn next_batch(&mut self) -> Result<Option<Vec<FileMeta>>, NtfsError> {
+        self.native.next_batch(self.cursor)
+    }
+
+    #[cfg(not(windows))]
+    pub fn next_batch(&mut self) -> Result<Option<Vec<FileMeta>>, NtfsError> {
+        Err(NtfsError::NotSupported)
+    }
+}
+
 /// Errors that can surface while interacting with NTFS / USN APIs.
 #[derive(Debug, Error)]
 pub enum NtfsError {
@@ -126,7 +160,7 @@ pub trait NtfsWatcher {
     /// Discover NTFS volumes.
     fn discover_volumes(&self) -> Result<Vec<VolumeInfo>, NtfsError>;
 
-    /// Enumerate the MFT and stream file metadata snapshots.
+    /// Return an in-memory MFT fixture. Production enumeration uses `MftScan`.
     fn enumerate_mft(&self, volume: &VolumeInfo) -> Result<Vec<FileMeta>, NtfsError>;
 
     /// Tail the USN journal starting at the given cursor.
@@ -269,30 +303,24 @@ pub fn open_volume_handle(
     Ok(owned)
 }
 
-/// Enumerate the MFT for a given volume and emit file metadata snapshots.
-///
-/// Baseline enumeration and journal reads open the same volume GUID. Metadata
-/// is resolved by full file reference number using the same volume handle.
-pub fn enumerate_mft(volume: &VolumeInfo) -> Result<Vec<FileMeta>, NtfsError> {
-    enumerate_mft_with_config(volume, &ReaderConfig::default())
-}
-
-/// Enumerate a baseline while excluding the service's own changing outputs.
+/// Begin a bounded baseline scan, capturing the journal head on the same GUID
+/// handle before any MFT enumeration. No file metadata is materialized here.
 #[cfg(windows)]
-pub fn enumerate_mft_with_config(
-    volume: &VolumeInfo,
-    config: &ReaderConfig,
-) -> Result<Vec<FileMeta>, NtfsError> {
+pub fn begin_mft_scan(volume: &VolumeInfo, config: &ReaderConfig) -> Result<MftScan, NtfsError> {
     config.validate()?;
     let handle = open_volume_handle(volume)?;
-    native::enumerate(&handle, volume.id, config)
+    let state = native::query_state(&handle)?;
+    Ok(MftScan {
+        cursor: JournalCursor {
+            last_usn: state.next_usn,
+            journal_id: state.journal_id,
+        },
+        native: native::MftScan::new(handle, volume.id, config.clone()),
+    })
 }
 
 #[cfg(not(windows))]
-pub fn enumerate_mft_with_config(
-    _volume: &VolumeInfo,
-    _config: &ReaderConfig,
-) -> Result<Vec<FileMeta>, NtfsError> {
+pub fn begin_mft_scan(_volume: &VolumeInfo, _config: &ReaderConfig) -> Result<MftScan, NtfsError> {
     Err(NtfsError::NotSupported)
 }
 
@@ -624,6 +652,159 @@ mod journal {
     }
 }
 
+#[cfg(any(windows, test))]
+mod mft {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Page {
+        bytes: Vec<u8>,
+        offset: usize,
+        next_start: u64,
+    }
+
+    impl Page {
+        fn new(bytes: Vec<u8>, start: u64) -> Result<Self, NtfsError> {
+            let header = bytes
+                .get(..8)
+                .ok_or_else(|| NtfsError::Mft("missing next MFT position".into()))?;
+            let next_start = u64::from_le_bytes(
+                header
+                    .try_into()
+                    .map_err(|_| NtfsError::Mft("invalid next MFT position".into()))?,
+            );
+            if next_start <= start {
+                return Err(NtfsError::Mft("MFT enumeration made no progress".into()));
+            }
+            // This header is an opaque enumeration ordinal, not a document
+            // identity. Never derive a DocKey from it or replace full FRNs.
+            Ok(Self {
+                bytes,
+                offset: 8,
+                next_start,
+            })
+        }
+    }
+
+    fn parse_record(bytes: &[u8]) -> Result<(journal::Record, usize), NtfsError> {
+        journal::parse_record(bytes)
+            .map_err(|error| NtfsError::Mft(format!("invalid MFT record: {error}")))
+    }
+
+    /// Validate partial IOCTL output completely before retaining its next
+    /// ordinal. MFT records are not ordered by their last-change USN or by the
+    /// sequence bits in their full file references.
+    pub(super) fn validate_partial_output(bytes: &[u8], start: u64) -> Result<(), NtfsError> {
+        if bytes.len() <= 8 {
+            return Err(NtfsError::Mft(
+                "overflow returned no complete MFT records".into(),
+            ));
+        }
+        let header = u64::from_le_bytes(
+            bytes[..8]
+                .try_into()
+                .map_err(|_| NtfsError::Mft("invalid next MFT position".into()))?,
+        );
+        if header <= start {
+            return Err(NtfsError::Mft("MFT enumeration made no progress".into()));
+        }
+        let mut offset = 8;
+        while offset < bytes.len() {
+            let (_, length) = parse_record(&bytes[offset..])?;
+            offset += length;
+        }
+        Ok(())
+    }
+
+    /// Holds only one bounded raw page. Pulling the next batch never reads
+    /// ahead of the current page or resolves beyond the raw-record budget.
+    #[derive(Debug, Default)]
+    pub(super) struct State {
+        next_start: u64,
+        page: Option<Page>,
+        finished: bool,
+        failed: bool,
+    }
+
+    impl State {
+        pub(super) fn poison(&mut self) {
+            self.failed = true;
+        }
+
+        pub(super) fn next_batch(
+            &mut self,
+            volume: VolumeId,
+            config: &ReaderConfig,
+            read: impl FnOnce(u64) -> Result<Option<Vec<u8>>, NtfsError>,
+            resolve: impl FnMut(&journal::Record) -> Result<Option<FileMeta>, NtfsError>,
+        ) -> Result<Option<Vec<FileMeta>>, NtfsError> {
+            if self.failed {
+                return Err(NtfsError::Mft(
+                    "scan failed; a new baseline is required".into(),
+                ));
+            }
+            let result = self.advance(volume, config, read, resolve);
+            if result.is_err() {
+                self.poison();
+            }
+            result
+        }
+
+        fn advance(
+            &mut self,
+            volume: VolumeId,
+            config: &ReaderConfig,
+            read: impl FnOnce(u64) -> Result<Option<Vec<u8>>, NtfsError>,
+            mut resolve: impl FnMut(&journal::Record) -> Result<Option<FileMeta>, NtfsError>,
+        ) -> Result<Option<Vec<FileMeta>>, NtfsError> {
+            config.validate()?;
+            if self.finished {
+                return Ok(None);
+            }
+            if self.page.is_none() {
+                let Some(bytes) = read(self.next_start)? else {
+                    self.finished = true;
+                    return Ok(None);
+                };
+                if bytes.len() > config.chunk_size {
+                    return Err(NtfsError::Mft("MFT output exceeds its fixed buffer".into()));
+                }
+                self.page = Some(Page::new(bytes, self.next_start)?);
+            }
+            let page = self
+                .page
+                .as_mut()
+                .ok_or_else(|| NtfsError::Mft("MFT page is missing".into()))?;
+            let mut out = Vec::new();
+            let mut consumed = 0;
+            while page.offset < page.bytes.len() && consumed < config.max_records_per_tick {
+                let (record, length) = parse_record(&page.bytes[page.offset..])?;
+                if let Some(meta) = resolve(&record)? {
+                    if meta.key != DocKey::from_parts(volume, record.frn) || meta.volume != volume {
+                        return Err(NtfsError::Mft(
+                            "resolved metadata identity does not match MFT record".into(),
+                        ));
+                    }
+                    if !meta
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| journal::excluded_path(path, &config.exclude_paths))
+                    {
+                        out.push(meta);
+                    }
+                }
+                page.offset += length;
+                consumed += 1;
+            }
+            if page.offset == page.bytes.len() {
+                self.next_start = page.next_start;
+                self.page = None;
+            }
+            Ok(Some(out))
+        }
+    }
+}
+
 #[cfg(windows)]
 mod native {
     use super::journal::{JournalState, Record};
@@ -783,68 +964,101 @@ mod native {
         Ok(buffer)
     }
 
-    pub(super) fn enumerate(
-        handle: &OwnedHandle,
+    #[derive(Debug)]
+    pub(super) struct MftScan {
+        handle: OwnedHandle,
         volume: VolumeId,
-        config: &ReaderConfig,
-    ) -> Result<Vec<FileMeta>, NtfsError> {
-        let mut request = MFT_ENUM_DATA_V0 {
-            StartFileReferenceNumber: 0,
+        config: ReaderConfig,
+        state: mft::State,
+    }
+
+    impl MftScan {
+        pub(super) fn new(handle: OwnedHandle, volume: VolumeId, config: ReaderConfig) -> Self {
+            Self {
+                handle,
+                volume,
+                config,
+                state: mft::State::default(),
+            }
+        }
+
+        pub(super) fn next_batch(
+            &mut self,
+            cursor: JournalCursor,
+        ) -> Result<Option<Vec<FileMeta>>, NtfsError> {
+            let handle = &self.handle;
+            let config = &self.config;
+            let volume = self.volume;
+            let result = (|| {
+                // Slow worker admission can outlive journal retention. Check
+                // the original pre-scan head on every pull, including EOF, so
+                // an invalid baseline is never published as complete.
+                journal::validate_cursor(cursor, query_state(handle)?)?;
+                let batch = self.state.next_batch(
+                    volume,
+                    config,
+                    |start| read_mft_batch(handle, start, config.chunk_size),
+                    |record| resolve_metadata(handle, volume, record),
+                )?;
+                journal::validate_cursor(cursor, query_state(handle)?)?;
+                Ok(batch)
+            })();
+            if result.is_err() {
+                self.state.poison();
+            }
+            result
+        }
+    }
+
+    fn read_mft_batch(
+        handle: &OwnedHandle,
+        start: u64,
+        chunk_size: usize,
+    ) -> Result<Option<Vec<u8>>, NtfsError> {
+        let request = MFT_ENUM_DATA_V0 {
+            // Use the opaque ordinal returned by the previous completed page.
+            // https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-mft_enum_data_v0
+            StartFileReferenceNumber: start,
             LowUsn: 0,
             HighUsn: i64::MAX,
         };
-        let mut buffer = vec![0u8; config.chunk_size];
-        let mut out = Vec::new();
-        loop {
-            let mut returned = 0;
-            // SAFETY: valid owned volume handle, initialized request, and
-            // live output allocation, with exact byte counts for each.
-            let result = unsafe {
-                DeviceIoControl(
-                    raw(handle),
-                    FSCTL_ENUM_USN_DATA,
-                    Some((&request as *const MFT_ENUM_DATA_V0).cast()),
-                    size_of::<MFT_ENUM_DATA_V0>() as u32,
-                    Some(buffer.as_mut_ptr().cast()),
-                    buffer.len() as u32,
-                    Some(&mut returned),
-                    None,
-                )
-            };
-            if let Err(error) = result {
-                if error.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) {
-                    break;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut returned = 0;
+        // SAFETY: valid owned volume handle, initialized request, and live
+        // output allocation, with exact byte counts for each.
+        let result = unsafe {
+            DeviceIoControl(
+                raw(handle),
+                FSCTL_ENUM_USN_DATA,
+                Some((&request as *const MFT_ENUM_DATA_V0).cast()),
+                size_of::<MFT_ENUM_DATA_V0>() as u32,
+                Some(buffer.as_mut_ptr().cast()),
+                buffer.len() as u32,
+                Some(&mut returned),
+                None,
+            )
+        };
+        let partial = match result {
+            Ok(()) => false,
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) => {
+                if returned != 0 {
+                    return Err(NtfsError::Mft("unexpected MFT output at EOF".into()));
                 }
+                return Ok(None);
+            }
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_MORE_DATA.0) => true,
+            Err(error) => {
                 return Err(NtfsError::Mft(format!("FSCTL_ENUM_USN_DATA: {error}")));
             }
-            let data = buffer
-                .get(..returned as usize)
-                .filter(|bytes| bytes.len() >= 8)
-                .ok_or_else(|| NtfsError::Mft("invalid MFT byte count".into()))?;
-            let next = u64::from_le_bytes(
-                data[..8]
-                    .try_into()
-                    .map_err(|_| NtfsError::Mft("missing next MFT reference".into()))?,
-            );
-            if next <= request.StartFileReferenceNumber {
-                return Err(NtfsError::Mft("MFT enumeration made no progress".into()));
-            }
-            let mut offset = 8;
-            while offset < data.len() {
-                let (record, length) = journal::parse_record(&data[offset..])?;
-                if let Some(meta) = resolve_metadata(handle, volume, &record)?
-                    && !meta
-                        .path
-                        .as_deref()
-                        .is_some_and(|path| journal::excluded_path(path, &config.exclude_paths))
-                {
-                    out.push(meta);
-                }
-                offset += length;
-            }
-            request.StartFileReferenceNumber = next;
+        };
+        if returned as usize > buffer.len() {
+            return Err(NtfsError::Mft("invalid MFT byte count".into()));
         }
-        Ok(out)
+        buffer.truncate(returned as usize);
+        if partial {
+            mft::validate_partial_output(&buffer, start)?;
+        }
+        Ok(Some(buffer))
     }
 
     pub(super) fn excluded_event(
@@ -1222,6 +1436,271 @@ mod tests {
     }
 
     #[test]
+    fn mft_pulls_bound_raw_work_and_retain_the_unread_page() {
+        let config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 2,
+            exclude_paths: vec![r"C:\fixtures\excluded.txt".into()],
+        };
+        let records = [
+            record(900, 0x4321_0000_0000_0020, 0, "first.txt"),
+            record(100, 0x0123_0000_0000_0021, 0, "excluded.txt"),
+            record(800, 0x1234_0000_0000_0022, 0, "gone.txt"),
+            record(200, 0x0001_0000_0000_0023, 0, "last.txt"),
+        ];
+        let mut scan = mft::State::default();
+        let mut resolved = Vec::new();
+        let first = scan
+            .next_batch(
+                42,
+                &config,
+                |start| {
+                    assert_eq!(start, 0);
+                    Ok(Some(encoded_batch(36, &records)))
+                },
+                |record| {
+                    resolved.push(record.frn);
+                    Ok(Some(resolved_meta(record)))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, [records[0].frn, records[1].frn]);
+        assert_eq!(first, [resolved_meta(&records[0])]);
+
+        // No second IOCTL and no metadata look-ahead are permitted while the
+        // first caller has not pulled the unconsumed raw suffix.
+        let last = scan
+            .next_batch(
+                42,
+                &config,
+                |_| panic!("the buffered page must be consumed before another kernel read"),
+                |record| {
+                    resolved.push(record.frn);
+                    Ok((record.name != "gone.txt").then(|| resolved_meta(record)))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(last, [resolved_meta(&records[3])]);
+        assert_eq!(resolved, records.map(|record| record.frn));
+        assert_eq!(first[0].key.file_id(), 0x4321_0000_0000_0020);
+        assert!(
+            scan.next_batch(
+                42,
+                &config,
+                |start| {
+                    // This is the kernel's ordinal, not a masked file key or
+                    // the USN of the last consumed MFT record.
+                    assert_eq!(start, 36);
+                    Ok(None)
+                },
+                |_| panic!("EOF resolves no metadata"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            scan.next_batch(
+                42,
+                &config,
+                |_| panic!("a completed scan does not issue more reads"),
+                |_| panic!("a completed scan resolves no metadata"),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mft_empty_filtered_pages_are_progress_and_not_eof() {
+        let config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 1,
+            ..ReaderConfig::default()
+        };
+        let mut scan = mft::State::default();
+        let empty = scan
+            .next_batch(
+                42,
+                &config,
+                |_| Ok(Some(encoded_batch(5, &[]))),
+                |_| panic!("header-only page resolves no metadata"),
+            )
+            .unwrap();
+        assert_eq!(empty, Some(Vec::new()));
+        let missing = record(100, 0x0100_0000_0000_0010, 0, "disappeared.txt");
+        let skipped = scan
+            .next_batch(
+                42,
+                &config,
+                |start| {
+                    assert_eq!(start, 5);
+                    Ok(Some(encoded_batch(17, &[missing])))
+                },
+                |_| Ok(None),
+            )
+            .unwrap();
+        assert_eq!(skipped, Some(Vec::new()));
+        assert!(
+            scan.next_batch(
+                42,
+                &config,
+                |start| {
+                    assert_eq!(start, 17);
+                    Ok(None)
+                },
+                |_| panic!("EOF resolves no metadata"),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mft_malformed_and_oversized_pages_invalidate_the_scan() {
+        let config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 1,
+            ..ReaderConfig::default()
+        };
+        let entry = record(100, 11, 0, "a.txt");
+        let mut truncated = encoded_batch(12, &[entry]);
+        truncated.pop();
+        for invalid in [
+            vec![],
+            vec![0; 7],
+            encoded_batch(0, &[]),
+            vec![0; 4097],
+            truncated,
+        ] {
+            let mut scan = mft::State::default();
+            assert!(
+                scan.next_batch(
+                    42,
+                    &config,
+                    |_| Ok(Some(invalid)),
+                    |record| { Ok(Some(resolved_meta(record))) }
+                )
+                .is_err()
+            );
+            assert!(
+                scan.next_batch(
+                    42,
+                    &config,
+                    |_| panic!("invalid scan must not read again"),
+                    |_| panic!("invalid scan must not resolve again"),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mft_failure_after_a_committed_prefix_never_becomes_completion() {
+        let config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 1,
+            ..ReaderConfig::default()
+        };
+        let entries = [
+            record(100, 11, 0, "first.txt"),
+            record(200, 12, 0, "broken.txt"),
+        ];
+        let mut truncated = encoded_batch(13, &entries);
+        truncated.pop();
+        let mut scan = mft::State::default();
+        assert_eq!(
+            scan.next_batch(
+                42,
+                &config,
+                |_| Ok(Some(truncated)),
+                |record| { Ok(Some(resolved_meta(record))) }
+            )
+            .unwrap(),
+            Some(vec![resolved_meta(&entries[0])])
+        );
+        assert!(
+            scan.next_batch(
+                42,
+                &config,
+                |_| panic!("the invalid suffix remains buffered"),
+                |_| panic!("truncated record must fail before metadata resolution"),
+            )
+            .is_err()
+        );
+        assert!(
+            scan.next_batch(42, &config, |_| Ok(None), |_| Ok(None))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mft_resolution_and_journal_failures_cannot_acknowledge_eof() {
+        let config = ReaderConfig::default();
+        let entry = record(100, 0x0100_0000_0000_0010, 0, "a.txt");
+        for wrong_volume in [false, true] {
+            let mut scan = mft::State::default();
+            let mut wrong = resolved_meta(&entry);
+            if wrong_volume {
+                wrong.volume += 1;
+            } else {
+                wrong.key = DocKey::from_parts(42, entry.frn + 1);
+            }
+            assert!(
+                scan.next_batch(
+                    42,
+                    &config,
+                    |_| Ok(Some(encoded_batch(17, std::slice::from_ref(&entry)))),
+                    |_| Ok(Some(wrong.clone())),
+                )
+                .is_err()
+            );
+            assert!(
+                scan.next_batch(42, &config, |_| Ok(None), |_| Ok(None))
+                    .is_err()
+            );
+        }
+        let mut scan = mft::State::default();
+        assert!(matches!(
+            scan.next_batch(42, &config, |_| Err(NtfsError::GapDetected), |_| Ok(None)),
+            Err(NtfsError::GapDetected)
+        ));
+        assert!(
+            scan.next_batch(42, &config, |_| Ok(None), |_| Ok(None))
+                .is_err()
+        );
+
+        // A failed post-read journal validation also overrides a provisional
+        // EOF. This is the native wrapper's failure path after a journal reset.
+        let mut scan = mft::State::default();
+        assert!(
+            scan.next_batch(42, &config, |_| Ok(None), |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        scan.poison();
+        assert!(
+            scan.next_batch(42, &config, |_| Ok(None), |_| Ok(None))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mft_partial_output_validates_complete_records_without_usn_order_assumptions() {
+        let records = [
+            record(900, 0x4321_0000_0000_0020, 0, "first.txt"),
+            record(100, 0x0123_0000_0000_0021, 0, "last.txt"),
+        ];
+        let bytes = encoded_batch(34, &records);
+        mft::validate_partial_output(&bytes, 0).unwrap();
+        assert!(mft::validate_partial_output(&bytes[..bytes.len() - 1], 0).is_err());
+        assert!(mft::validate_partial_output(&bytes[..7], 0).is_err());
+        assert!(mft::validate_partial_output(&encoded_batch(34, &[]), 0).is_err());
+        assert!(mft::validate_partial_output(&bytes, 34).is_err());
+    }
+
+    #[test]
     fn validates_journal_identity_wrap_and_future_cursor() {
         let state = journal::JournalState {
             journal_id: 7,
@@ -1502,7 +1981,7 @@ mod tests {
         };
         assert!(matches!(discover_volumes(), Err(NtfsError::NotSupported)));
         assert!(matches!(
-            enumerate_mft(&volume),
+            begin_mft_scan(&volume, &ReaderConfig::default()),
             Err(NtfsError::NotSupported)
         ));
         assert!(matches!(
@@ -1516,13 +1995,14 @@ mod tests {
     }
 
     /// Run explicitly on an elevated Windows host whose temp directory is on
-    /// NTFS with an existing USN journal:
+    /// an isolated NTFS volume with an existing USN journal. This test also
+    /// enumerates the whole volume through the bounded MFT reader:
     /// `cargo test -p ntfs-watcher native_ntfs_lifecycle -- --ignored --nocapture`
     /// A missing journal, insufficient privileges, or unsupported filesystem
     /// is a test failure, never a reported native success via an early return.
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires elevated Windows, an NTFS temp volume, and an enabled USN journal"]
+    #[ignore = "requires elevated Windows, an isolated NTFS temp volume, and an enabled USN journal"]
     fn native_ntfs_lifecycle() {
         use std::io::Write;
         use std::time::{Duration, Instant};
@@ -1616,7 +2096,51 @@ mod tests {
         assert!(meta.created > 0 && meta.modified > 0);
         let key = meta.key;
 
+        let excluded = dir.path().join("excluded-output");
+        std::fs::create_dir(&excluded).unwrap();
+        std::fs::write(excluded.join("ignored.txt"), b"not indexed").unwrap();
+        let scan_config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 2,
+            exclude_paths: vec![canonical_path(&excluded).unwrap()],
+        };
+        let mut scan = begin_mft_scan(&volume, &scan_config)
+            .expect("native MFT scan must capture its pre-enumeration journal head");
+        let baseline_cursor = scan.journal_cursor();
+        assert_eq!(baseline_cursor.journal_id, position.journal_id);
+
+        // The file changes after journal capture but before any enumeration.
+        // Its MFT snapshot and subsequent journal replay must keep the key.
         std::fs::write(&old_path, b"after, with a different length").unwrap();
+        let scan_deadline = Instant::now() + Duration::from_secs(120);
+        let mut found = 0;
+        while let Some(batch) = scan
+            .next_batch()
+            .expect("native MFT page and original journal cursor must remain valid")
+        {
+            assert!(batch.len() <= scan_config.max_records_per_tick);
+            for entry in batch {
+                assert_eq!(entry.key.volume(), volume.id);
+                assert!(!journal::excluded_path(
+                    entry.path.as_deref().expect("GUID path"),
+                    &scan_config.exclude_paths,
+                ));
+                if entry.key == key {
+                    found += 1;
+                    assert_eq!(entry.path.as_deref(), Some(expected_old_path.as_str()));
+                    assert_eq!(entry.size, 30);
+                }
+            }
+            assert!(
+                Instant::now() < scan_deadline,
+                "bounded native MFT test requires a small isolated NTFS volume"
+            );
+        }
+        assert_eq!(
+            found, 1,
+            "native MFT enumeration must find the fixture exactly once"
+        );
+        position = baseline_cursor;
         wait_for(
             &volume,
             &mut position,

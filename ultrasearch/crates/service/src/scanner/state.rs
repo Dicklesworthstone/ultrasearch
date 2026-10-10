@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::dispatcher::job_dispatch::{IndexBatch, JobOperation, JobSpec};
@@ -89,13 +90,21 @@ pub(super) struct Checkpoints {
     content_path: String,
     #[serde(default)]
     pub retired_indices: Vec<String>,
+    /// Last fully acknowledged durable batch and its exact physical commits.
+    /// Older state without this evidence must rebuild before trusting its USN.
+    #[serde(default)]
+    pub completed_batch: Option<Uuid>,
+    #[serde(default)]
+    pub meta_commit: Option<Uuid>,
+    #[serde(default)]
+    pub content_commit: Option<Uuid>,
     pub volumes: Vec<VolumeCheckpoint>,
     pub pending: Option<PendingBatch>,
 }
 
 pub(super) struct StateStore {
     path: PathBuf,
-    _lock: File,
+    _lock: Arc<File>,
     pub state: Checkpoints,
 }
 
@@ -134,6 +143,8 @@ impl StateStore {
         let mut rebuild = previous.as_ref().is_none_or(|state| {
             state.meta_path != cfg.paths.meta_index || state.content_path != cfg.paths.content_index
         });
+        let mut meta_batch = None;
+        let mut content_batch = None;
         for (index_path, is_content) in [
             (&cfg.paths.meta_index, false),
             (&cfg.paths.content_index, true),
@@ -150,6 +161,14 @@ impl StateStore {
                 if schema_valid.is_err() {
                     rebuild = true;
                 }
+                match content_index::batch_receipt(&index) {
+                    Ok(batch) if is_content => content_batch = batch,
+                    Ok(batch) => meta_batch = batch,
+                    Err(error) => {
+                        tracing::warn!(path = %index_path.display(), %error, "invalid ingestion commit payload; reconciliation required");
+                        rebuild = true;
+                    }
+                }
             } else {
                 rebuild = true;
             }
@@ -160,6 +179,17 @@ impl StateStore {
                 rebuild = true;
             }
         }
+        if previous
+            .as_ref()
+            .is_some_and(|state| !index_commits_match(state, meta_batch, content_batch))
+        {
+            tracing::warn!(
+                ?meta_batch,
+                ?content_batch,
+                "index commits do not match durable ingestion state; reconciliation required"
+            );
+            rebuild = true;
+        }
 
         let mut state = previous.unwrap_or_else(|| Checkpoints {
             version: STATE_VERSION,
@@ -167,6 +197,9 @@ impl StateStore {
             meta_path: cfg.paths.meta_index.clone(),
             content_path: cfg.paths.content_index.clone(),
             retired_indices: Vec::new(),
+            completed_batch: None,
+            meta_commit: None,
+            content_commit: None,
             volumes: Vec::new(),
             pending: None,
         });
@@ -186,8 +219,44 @@ impl StateStore {
                 }
                 fs::create_dir_all(index_path)?;
             }
-            meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
-            content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+            // Both empty indices receive complete receipts for one seed batch,
+            // each with its own physical commit identity. Static generation
+            // markers alone cannot detect an older same-generation backup
+            // restored underneath a newer journal checkpoint.
+            let seed = Uuid::new_v4();
+            {
+                let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+                let mut writer = meta_index::create_writer(
+                    &index,
+                    &meta_index::WriterConfig {
+                        heap_size_bytes: 32 * 1024 * 1024,
+                        num_threads: 1,
+                    },
+                )?;
+                content_index::commit_batch(&mut writer, seed)?;
+                state.meta_commit = Some(
+                    content_index::batch_receipt(&index.index)?
+                        .context("metadata seed commit has no receipt")?
+                        .commit_id,
+                );
+            }
+            {
+                let index = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+                let mut writer = content_index::create_writer(
+                    &index,
+                    &content_index::WriterConfig {
+                        heap_size_bytes: 32 * 1024 * 1024,
+                        num_threads: 1,
+                    },
+                )?;
+                content_index::commit_batch(&mut writer, seed)?;
+                state.content_commit = Some(
+                    content_index::batch_receipt(&index.index)?
+                        .context("content seed commit has no receipt")?
+                        .commit_id,
+                );
+            }
+            state.completed_batch = Some(seed);
             state.meta_path = cfg.paths.meta_index.clone();
             state.content_path = cfg.paths.content_index.clone();
             state.pending = None;
@@ -205,7 +274,7 @@ impl StateStore {
         }
         let store = Self {
             path,
-            _lock: lock,
+            _lock: Arc::new(lock),
             state,
         };
         store.save()?;
@@ -220,6 +289,12 @@ impl StateStore {
             "ingestion state exceeds size limit"
         );
         atomic_write(&self.path, &bytes)
+    }
+
+    /// Blocking mutations can outlive their async caller. A lease keeps the
+    /// same locked file handle open until the final mutation owner exits.
+    pub fn mutation_lease(&self) -> Arc<File> {
+        Arc::clone(&self._lock)
     }
 
     /// IDs are persisted by GUID and never reassigned when drive discovery changes.
@@ -293,6 +368,19 @@ impl StateStore {
     /// old on-disk intent available to replay, including its original batch ID.
     pub fn finish(&mut self) -> Result<()> {
         let pending = self.state.pending.as_ref().context("no pending batch")?;
+        let mut receipts = Vec::with_capacity(2);
+        for path in [&self.state.meta_path, &self.state.content_path] {
+            let index = tantivy::Index::open_in_dir(path)?;
+            let receipt = content_index::batch_receipt(&index)?
+                .with_context(|| format!("index {path} has no ingestion commit receipt"))?;
+            ensure!(
+                receipt.complete && receipt.batch_id == pending.worker.id,
+                "index {} has not committed pending ingestion batch {}",
+                path,
+                pending.worker.id
+            );
+            receipts.push(receipt);
+        }
         let mut completed = self.state.clone();
         if let Some(cursor) = pending.next_cursor {
             let volume = completed
@@ -302,12 +390,50 @@ impl StateStore {
                 .context("unknown volume identity")?;
             volume.cursor = Some(cursor);
         }
+        completed.completed_batch = Some(pending.worker.id);
+        completed.meta_commit = Some(receipts[0].commit_id);
+        completed.content_commit = Some(receipts[1].commit_id);
         completed.pending = None;
         let bytes = serde_json::to_vec(&completed)?;
         atomic_write(&self.path, &bytes)?;
         self.state = completed;
         Ok(())
     }
+}
+
+/// The normal split-commit states are C/C, P/C, and P/P (content/metadata).
+/// Metadata P with content C cannot be produced by the ordered commit lane;
+/// accepting it would conceal a restored or independently modified index.
+fn index_commits_match(
+    state: &Checkpoints,
+    meta: Option<content_index::BatchReceipt>,
+    content: Option<content_index::BatchReceipt>,
+) -> bool {
+    let Some(completed) = state.completed_batch.filter(|id| !id.is_nil()) else {
+        return false;
+    };
+    let Some(meta_commit) = state.meta_commit else {
+        return false;
+    };
+    let Some(content_commit) = state.content_commit else {
+        return false;
+    };
+    let meta_completed = meta.is_some_and(|receipt| {
+        receipt.complete && receipt.batch_id == completed && receipt.commit_id == meta_commit
+    });
+    let content_completed = content.is_some_and(|receipt| {
+        receipt.complete && receipt.batch_id == completed && receipt.commit_id == content_commit
+    });
+    if meta_completed && content_completed {
+        return true;
+    }
+    state.pending.as_ref().is_some_and(|pending| {
+        content.is_some_and(|receipt| receipt.batch_id == pending.worker.id)
+            && (meta_completed
+                || meta.is_some_and(|receipt| {
+                    receipt.complete && receipt.batch_id == pending.worker.id
+                }))
+    })
 }
 
 fn validate_state(state: &Checkpoints) -> Result<()> {
@@ -324,6 +450,10 @@ fn validate_state(state: &Checkpoints) -> Result<()> {
         );
     }
     if let Some(batch) = &state.pending {
+        ensure!(
+            !batch.worker.id.is_nil(),
+            "pending batch has a nil identity"
+        );
         ensure!(
             ids.contains(&batch.volume),
             "pending batch has unknown volume"
@@ -546,6 +676,31 @@ mod tests {
         )
     }
 
+    fn commit_marker(path: &str, batch: Uuid) -> Result<()> {
+        let index = tantivy::Index::open_in_dir(path)?;
+        let mut writer = index.writer_with_num_threads(1, 20_000_000)?;
+        content_index::commit_batch(&mut writer, batch)?;
+        Ok(())
+    }
+
+    fn copy_index_snapshot(source: &Path, target: &Path) -> Result<()> {
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let destination = target.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_index_snapshot(&entry.path(), &destination)?;
+            } else {
+                ensure!(
+                    entry.file_type()?.is_file(),
+                    "unexpected snapshot file type"
+                );
+                fs::copy(entry.path(), destination)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn content_selection_distinguishes_automatic_and_explicit_metadata_only_volumes() -> Result<()>
     {
@@ -642,13 +797,311 @@ mod tests {
         assert_eq!(pending.worker.id, batch_id);
         assert_eq!(pending.worker.jobs[0].file_id, key.file_id());
         assert_eq!(pending.metadata[0].key(), key);
-        // finish is the commit acknowledgement boundary; reopening before it
-        // deliberately cannot turn admitted or partially committed work into a cursor.
+        // An admitted job or a content-only commit is not a completed batch.
+        assert!(replay.finish().is_err());
+        commit_marker(&cfg.paths.content_index, batch_id)?;
+        assert!(replay.finish().is_err());
+        assert_eq!(replay.volume(vol.id)?.cursor, Some(start));
+        commit_marker(&cfg.paths.meta_index, batch_id)?;
         replay.finish()?;
         drop(replay);
         let completed = StateStore::open(&cfg)?;
         assert!(completed.state.pending.is_none());
         assert_eq!(completed.volume(vol.id)?.cursor, Some(next));
+        assert_eq!(completed.state.completed_batch, Some(batch_id));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_commit_tokens_preserve_only_reachable_split_commit_states() -> Result<()> {
+        for (content_pending, meta_pending, preserve) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (false, true, false),
+        ] {
+            let root = tempfile::tempdir()?;
+            let cfg = config(root.path());
+            let mut store = StateStore::open(&cfg)?;
+            let mut vol = volume("split-commit-volume");
+            store.bind_volume(&mut vol)?;
+            let previous = JournalCursor {
+                journal_id: 41,
+                last_usn: 100,
+            };
+            store.volume_mut(vol.id)?.cursor = Some(previous);
+            store.volume_mut(vol.id)?.needs_scan = false;
+            let pending = make_pending(
+                vol.id,
+                Vec::new(),
+                Some(JournalCursor {
+                    last_usn: 200,
+                    ..previous
+                }),
+                true,
+                &cfg,
+            );
+            let pending_id = pending.worker.id;
+            let generation = store.state.generation;
+            store.begin(pending)?;
+            if content_pending {
+                commit_marker(&cfg.paths.content_index, pending_id)?;
+            }
+            if meta_pending {
+                commit_marker(&cfg.paths.meta_index, pending_id)?;
+            }
+            drop(store);
+            let recovered = StateStore::open(&cfg)?;
+            if preserve {
+                assert_eq!(recovered.state.generation, generation);
+                assert_eq!(recovered.volume(vol.id)?.cursor, Some(previous));
+                assert_eq!(
+                    recovered.state.pending.as_ref().unwrap().worker.id,
+                    pending_id
+                );
+                // Even P/P is replayed: its commit payload cannot stand in for
+                // a successful worker acknowledgement and durable checkpoint.
+            } else {
+                assert_ne!(recovered.state.generation, generation);
+                assert!(recovered.state.pending.is_none());
+                assert!(recovered.volume(vol.id)?.cursor.is_none());
+                assert!(recovered.volume(vol.id)?.needs_scan);
+                assert_eq!(recovered.state.retired_indices.len(), 2);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn same_generation_index_restore_cannot_keep_a_newer_journal_checkpoint() -> Result<()> {
+        for restore_content in [true, false] {
+            let root = tempfile::tempdir()?;
+            let cfg = config(root.path());
+            let mut store = StateStore::open(&cfg)?;
+            let mut vol = volume("restored-index-volume");
+            store.bind_volume(&mut vol)?;
+            let key = DocKey::from_parts(vol.id, 0xabcd_0000_0000_1234);
+            let old = meta(key, "deleted-before-restore.txt", 10);
+            let indexed = make_pending(
+                vol.id,
+                vec![MetadataChange::Upsert(old.clone())],
+                Some(JournalCursor {
+                    journal_id: 29,
+                    last_usn: 100,
+                }),
+                false,
+                &cfg,
+            );
+            store.begin(indexed.clone())?;
+            {
+                let index = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+                let mut writer = content_index::create_writer(
+                    &index,
+                    &content_index::WriterConfig {
+                        heap_size_bytes: 20_000_000,
+                        num_threads: 1,
+                    },
+                )?;
+                content_index::add_content_doc(
+                    &mut writer,
+                    &index.fields,
+                    &content_index::ContentDoc {
+                        key,
+                        volume: vol.id,
+                        name: Some(old.name.clone()),
+                        path: old.path.clone(),
+                        ext: old.ext.clone(),
+                        size: old.size,
+                        created: old.created,
+                        modified: old.modified,
+                        flags: u64::from(old.flags.bits()),
+                        content_lang: None,
+                        content: "obsolete restored content".into(),
+                    },
+                )?;
+                content_index::commit_batch(&mut writer, indexed.worker.id)?;
+            }
+            super::super::apply_metadata(&cfg, &indexed)?;
+            store.finish()?;
+            store.volume_mut(vol.id)?.needs_scan = false;
+            store.save()?;
+            let generation = store.state.generation;
+            let restored_path = if restore_content {
+                Path::new(&cfg.paths.content_index)
+            } else {
+                Path::new(&cfg.paths.meta_index)
+            };
+            let backup = root.path().join("older-index-snapshot");
+            copy_index_snapshot(restored_path, &backup)?;
+
+            let deletion = make_pending(
+                vol.id,
+                vec![MetadataChange::Delete(key)],
+                Some(JournalCursor {
+                    journal_id: 29,
+                    last_usn: 200,
+                }),
+                false,
+                &cfg,
+            );
+            store.begin(deletion.clone())?;
+            {
+                let index = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+                let mut writer = content_index::create_writer(
+                    &index,
+                    &content_index::WriterConfig {
+                        heap_size_bytes: 20_000_000,
+                        num_threads: 1,
+                    },
+                )?;
+                content_index::delete_doc(&mut writer, &index.fields, key);
+                content_index::commit_batch(&mut writer, deletion.worker.id)?;
+            }
+            super::super::apply_metadata(&cfg, &deletion)?;
+            store.finish()?;
+            drop(store);
+            fs::rename(restored_path, root.path().join("newer-index-preserved"))?;
+            fs::rename(&backup, restored_path)?;
+            // The restored index is valid and has the same generation marker,
+            // but still contains the document whose deletion was checkpointed.
+            assert_eq!(
+                fs::read_to_string(restored_path.join("ingestion-generation"))?,
+                generation.to_string()
+            );
+            let restored = tantivy::Index::open_in_dir(restored_path)?;
+            let reader = restored.reader()?;
+            assert_eq!(reader.searcher().num_docs(), 1);
+            drop(reader);
+            drop(restored);
+
+            let rebuilt = StateStore::open(&cfg)?;
+            assert_ne!(rebuilt.state.generation, generation);
+            assert_eq!(rebuilt.volume(vol.id)?.id, vol.id);
+            assert!(rebuilt.volume(vol.id)?.cursor.is_none());
+            assert!(rebuilt.volume(vol.id)?.needs_scan);
+            assert_eq!(rebuilt.state.retired_indices.len(), 2);
+            for path in [&cfg.paths.meta_index, &cfg.paths.content_index] {
+                let index = tantivy::Index::open_in_dir(path)?;
+                let reader = index.reader()?;
+                assert_eq!(reader.searcher().num_docs(), 0);
+                assert_eq!(
+                    content_index::committed_batch(&index)?,
+                    rebuilt.state.completed_batch
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restored_attempt_of_the_same_batch_cannot_impersonate_its_completed_commit() -> Result<()> {
+        for partial in [true, false] {
+            let root = tempfile::tempdir()?;
+            let cfg = config(root.path());
+            let mut store = StateStore::open(&cfg)?;
+            let mut vol = volume("same-batch-restored-attempt");
+            store.bind_volume(&mut vol)?;
+            let pending = make_pending(
+                vol.id,
+                Vec::new(),
+                Some(JournalCursor {
+                    journal_id: 51,
+                    last_usn: 200,
+                }),
+                true,
+                &cfg,
+            );
+            store.begin(pending.clone())?;
+            {
+                let index = tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+                let mut writer = index.writer_with_num_threads(1, 20_000_000)?;
+                if partial {
+                    content_index::commit_partial_batch(&mut writer, pending.worker.id)?;
+                } else {
+                    content_index::commit_batch(&mut writer, pending.worker.id)?;
+                }
+            }
+            let snapshot = root.path().join("earlier-attempt-preserved");
+            copy_index_snapshot(Path::new(&cfg.paths.content_index), &snapshot)?;
+            // A later successful retry has the same durable batch identity,
+            // but a different physical commit identity. The checkpoint binds
+            // to that exact completed attempt, not just its work description.
+            commit_marker(&cfg.paths.content_index, pending.worker.id)?;
+            commit_marker(&cfg.paths.meta_index, pending.worker.id)?;
+            store.finish()?;
+            let finished_receipt = store.state.content_commit;
+            drop(store);
+            fs::rename(
+                &cfg.paths.content_index,
+                root.path().join("finished-attempt-preserved"),
+            )?;
+            fs::rename(&snapshot, &cfg.paths.content_index)?;
+            let old = tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+            let receipt = content_index::batch_receipt(&old)?.unwrap();
+            assert_eq!(receipt.batch_id, pending.worker.id);
+            assert_ne!(Some(receipt.commit_id), finished_receipt);
+            assert_eq!(receipt.complete, !partial);
+            drop(old);
+            let rebuilt = StateStore::open(&cfg)?;
+            assert!(rebuilt.volume(vol.id)?.cursor.is_none());
+            assert!(rebuilt.volume(vol.id)?.needs_scan);
+            assert!(rebuilt.state.pending.is_none());
+            assert_eq!(rebuilt.state.retired_indices.len(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_worker_receipt_is_recoverable_only_while_its_batch_remains_pending() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut vol = volume("partial-worker-replay");
+        store.bind_volume(&mut vol)?;
+        let pending = make_pending(vol.id, Vec::new(), None, true, &cfg);
+        store.begin(pending.clone())?;
+        // A replay can start after metadata committed P but before state saved.
+        commit_marker(&cfg.paths.content_index, pending.worker.id)?;
+        commit_marker(&cfg.paths.meta_index, pending.worker.id)?;
+        {
+            let index = tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+            let mut writer = index.writer_with_num_threads(1, 20_000_000)?;
+            content_index::commit_partial_batch(&mut writer, pending.worker.id)?;
+        }
+        let generation = store.state.generation;
+        assert!(store.finish().is_err());
+        drop(store);
+        let recovered = StateStore::open(&cfg)?;
+        assert_eq!(recovered.state.generation, generation);
+        assert_eq!(
+            recovered.state.pending.as_ref().unwrap().worker.id,
+            pending.worker.id
+        );
+        assert!(recovered.state.retired_indices.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_state_without_commit_evidence_rebuilds_instead_of_assuming_coverage() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut vol = volume("untagged-old-state");
+        store.bind_volume(&mut vol)?;
+        store.volume_mut(vol.id)?.cursor = Some(JournalCursor {
+            journal_id: 9,
+            last_usn: 500,
+        });
+        store.volume_mut(vol.id)?.needs_scan = false;
+        let mut legacy = serde_json::to_value(&store.state)?;
+        legacy.as_object_mut().unwrap().remove("completed_batch");
+        atomic_write(&store.path, &serde_json::to_vec(&legacy)?)?;
+        drop(store);
+        let rebuilt = StateStore::open(&cfg)?;
+        assert!(rebuilt.volume(vol.id)?.cursor.is_none());
+        assert!(rebuilt.volume(vol.id)?.needs_scan);
+        assert!(rebuilt.state.completed_batch.is_some());
+        assert_eq!(rebuilt.state.retired_indices.len(), 2);
         Ok(())
     }
 

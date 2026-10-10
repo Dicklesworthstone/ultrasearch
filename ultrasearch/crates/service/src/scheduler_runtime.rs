@@ -12,8 +12,8 @@ use scheduler::{
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -46,6 +46,7 @@ enum Submission {
 
 struct PendingIndexBatch {
     batch: IndexBatch,
+    mutation_lease: Option<Arc<std::fs::File>>,
     acknowledgement: oneshot::Sender<Result<(), String>>,
 }
 
@@ -280,7 +281,7 @@ impl SchedulerRuntime {
         if let Some(batch) = self.legacy_retry.as_ref() {
             self.live.active_workers.fetch_add(1, Ordering::Relaxed);
             self.publish_active_workers();
-            let result = self.dispatcher.spawn_index_batch(batch).await;
+            let result = self.dispatcher.spawn_index_batch(batch, None).await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
             self.publish_active_workers();
             match result {
@@ -296,7 +297,10 @@ impl SchedulerRuntime {
         if let Some(pending) = self.pending_index.take() {
             self.live.active_workers.fetch_add(1, Ordering::Relaxed);
             self.publish_active_workers();
-            let result = self.dispatcher.spawn_index_batch(&pending.batch).await;
+            let result = self
+                .dispatcher
+                .spawn_index_batch(&pending.batch, pending.mutation_lease)
+                .await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
             self.publish_active_workers();
             if let Err(error) = &result {
@@ -349,7 +353,12 @@ pub fn enqueue_content_job(job: JobSpec) -> bool {
 
 /// Wait for bounded admission and the worker's durable commit acknowledgement.
 /// The producer must retain its batch and cursor until this returns success.
-pub async fn submit_index_batch(batch: IndexBatch) -> anyhow::Result<()> {
+/// The lease keeps an ingestion session alive across producer cancellation,
+/// queueing, and detached blocking worker ownership. Legacy callers use None.
+pub async fn submit_index_batch(
+    batch: IndexBatch,
+    mutation_lease: Option<Arc<std::fs::File>>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         batch.jobs.len() <= MAX_INDEX_BATCH_JOBS,
         "index batch exceeds the {MAX_INDEX_BATCH_JOBS}-job bound"
@@ -360,6 +369,7 @@ pub async fn submit_index_batch(batch: IndexBatch) -> anyhow::Result<()> {
     sender
         .send(Submission::IndexBatch(PendingIndexBatch {
             batch,
+            mutation_lease,
             acknowledgement,
         }))
         .await
@@ -549,6 +559,7 @@ mod tests {
         sender
             .try_send(Submission::IndexBatch(PendingIndexBatch {
                 batch: batch.clone(),
+                mutation_lease: None,
                 acknowledgement,
             }))
             .ok()
@@ -590,7 +601,7 @@ mod tests {
             jobs: vec![dummy_job()],
             reset_volumes: Vec::new(),
         };
-        let mut submission = Box::pin(submit_index_batch(batch));
+        let mut submission = Box::pin(submit_index_batch(batch, None));
         let mut context = Context::from_waker(Waker::noop());
         assert!(submission.as_mut().poll(&mut context).is_pending());
         assert_eq!(runtime.job_rx.len(), MAX_PENDING_SUBMISSIONS);
@@ -645,8 +656,47 @@ mod tests {
             jobs: vec![dummy_job(); MAX_INDEX_BATCH_JOBS + 1],
             reset_volumes: Vec::new(),
         };
-        let error = submit_index_batch(batch).await.unwrap_err();
+        let error = submit_index_batch(batch, None).await.unwrap_err();
         assert!(error.to_string().contains("4096-job bound"));
         assert!(runtime.job_rx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admitted_batch_keeps_session_locked_after_producer_cancellation() -> anyhow::Result<()>
+    {
+        let _guard = TEST_LOCK.lock().await;
+        let mut runtime = SchedulerRuntime::new(&AppConfig::default());
+        let root = tempfile::tempdir()?;
+        let lock_path = root.path().join("ingestion.lock");
+        let lease = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)?,
+        );
+        lease.try_lock()?;
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![dummy_job()],
+            reset_volumes: Vec::new(),
+        };
+        let mut submission = Box::pin(submit_index_batch(batch, Some(lease)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        runtime.receive_submissions();
+        assert!(runtime.pending_index.is_some());
+        drop(submission);
+        assert!(
+            contender.try_lock().is_err(),
+            "admitted work still owns the ingestion session"
+        );
+        drop(runtime);
+        contender.try_lock()?;
+        Ok(())
     }
 }

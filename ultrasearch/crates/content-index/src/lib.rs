@@ -11,6 +11,7 @@ pub use tantivy::IndexWriter;
 use tantivy::{
     Index, IndexSettings, ReloadPolicy, Term, schema::document::TantivyDocument, schema::*,
 };
+use uuid::Uuid;
 
 pub mod log_analysis;
 
@@ -128,6 +129,99 @@ pub fn create_writer(idx: &ContentIndex, cfg: &WriterConfig) -> Result<IndexWrit
         .index
         .writer_with_num_threads(cfg.num_threads, cfg.heap_size_bytes)?;
     Ok(writer)
+}
+
+/// Evidence stored atomically with one physical index commit. Replaying a batch
+/// generates a new commit identity, so restoring an older snapshot of that same
+/// batch cannot masquerade as the completed checkpoint's exact index state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchReceipt {
+    pub batch_id: Uuid,
+    pub commit_id: Uuid,
+    pub complete: bool,
+}
+
+impl BatchReceipt {
+    fn payload(self) -> String {
+        format!(
+            "ultrasearch-ingestion-v1:{}:{}:{}",
+            self.batch_id,
+            self.commit_id,
+            if self.complete { "complete" } else { "partial" }
+        )
+    }
+}
+
+/// Publish the successful batch identity atomically with its index mutations,
+/// including an empty batch. The service persists both indexes' exact physical
+/// commit identities before retiring its durable pending intent.
+pub fn commit_batch(writer: &mut IndexWriter, id: Uuid) -> Result<tantivy::Opstamp> {
+    commit_receipt(writer, id, true)
+}
+
+/// Publish a subset of a batch without attesting to completion. This includes
+/// periodic commits and any commit made by a worker that encountered a failed
+/// job. Only a matching durable pending intent permits recovery of this state.
+pub fn commit_partial_batch(writer: &mut IndexWriter, id: Uuid) -> Result<tantivy::Opstamp> {
+    commit_receipt(writer, id, false)
+}
+
+fn commit_receipt(writer: &mut IndexWriter, id: Uuid, complete: bool) -> Result<tantivy::Opstamp> {
+    ensure!(!id.is_nil(), "index batch identity must not be nil");
+    let receipt = BatchReceipt {
+        batch_id: id,
+        commit_id: Uuid::new_v4(),
+        complete,
+    };
+    let mut prepared = writer.prepare_commit()?;
+    prepared.set_payload(&receipt.payload());
+    Ok(prepared.commit()?)
+}
+
+/// Read a receipt from the committed index metadata, not a sidecar or reader
+/// cache. Missing receipts identify legacy or externally modified indexes;
+/// invalid receipts require recovery rather than assuming journal coverage.
+/// A partial receipt must never acknowledge work or validate a finished cursor.
+pub fn batch_receipt(index: &Index) -> Result<Option<BatchReceipt>> {
+    index
+        .load_metas()?
+        .payload
+        .map(|payload| {
+            let mut parts = payload.split(':');
+            ensure!(
+                parts.next() == Some("ultrasearch-ingestion-v1"),
+                "unsupported index batch receipt format"
+            );
+            let batch_id = Uuid::parse_str(parts.next().context("missing receipt batch id")?)
+                .context("invalid receipt batch id")?;
+            let commit_id = Uuid::parse_str(parts.next().context("missing receipt commit id")?)
+                .context("invalid receipt commit id")?;
+            ensure!(
+                !batch_id.is_nil() && !commit_id.is_nil(),
+                "index batch receipt identities must not be nil"
+            );
+            let complete = match parts.next() {
+                Some("complete") => true,
+                Some("partial") => false,
+                _ => anyhow::bail!("invalid receipt completion state"),
+            };
+            ensure!(parts.next().is_none(), "unexpected index receipt fields");
+            Ok(BatchReceipt {
+                batch_id,
+                commit_id,
+                complete,
+            })
+        })
+        .transpose()
+}
+
+/// Return the batch identity only for a completed physical commit. Startup must
+/// additionally compare the full receipt with its saved checkpoint, because a
+/// previous partial or complete attempt can share the same replayable batch ID.
+pub fn committed_batch(index: &Index) -> Result<Option<Uuid>> {
+    Ok(batch_receipt(index)?
+        .filter(|receipt| receipt.complete)
+        .map(|receipt| receipt.batch_id))
 }
 
 pub fn open_reader(idx: &ContentIndex) -> Result<tantivy::IndexReader> {
@@ -337,6 +431,232 @@ mod tests {
         Ok(reader
             .searcher()
             .search(&query, &tantivy::collector::Count)?)
+    }
+
+    #[test]
+    fn batch_receipt_persists_with_replacement_and_empty_commits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = open_or_create(dir.path())?;
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        assert_eq!(committed_batch(&index.index)?, None);
+        let seed = Uuid::new_v4();
+        commit_batch(&mut writer, seed)?;
+        assert_eq!(committed_batch(&index.index)?, Some(seed));
+        assert_eq!(open_reader(&index)?.searcher().num_docs(), 0);
+
+        let key = DocKey::from_parts(7, 0xfedc_0000_0000_0042);
+        let created = Uuid::new_v4();
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(key, "original.txt", "obsoleteword"),
+        )?;
+        commit_batch(&mut writer, created)?;
+        let replaced = Uuid::new_v4();
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(key, "renamed.txt", "replacementword"),
+        )?;
+        commit_batch(&mut writer, replaced)?;
+        let receipt = batch_receipt(&index.index)?;
+        drop(writer);
+        drop(index);
+
+        let index = open_or_create(dir.path())?;
+        assert_eq!(committed_batch(&index.index)?, Some(replaced));
+        assert_eq!(batch_receipt(&index.index)?, receipt);
+        assert_eq!(matches(&index, index.fields.content, "obsoleteword")?, 0);
+        assert_eq!(matches(&index, index.fields.content, "replacementword")?, 1);
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let deleted = Uuid::new_v4();
+        delete_doc(&mut writer, &index.fields, key);
+        commit_batch(&mut writer, deleted)?;
+        assert_eq!(committed_batch(&index.index)?, Some(deleted));
+        assert_eq!(open_reader(&index)?.searcher().num_docs(), 0);
+        let reset = Uuid::new_v4();
+        delete_volume(&mut writer, &index.fields, 7);
+        commit_batch(&mut writer, reset)?;
+        assert_eq!(committed_batch(&index.index)?, Some(reset));
+        Ok(())
+    }
+
+    #[test]
+    fn aborted_batch_preserves_committed_receipt_and_documents() -> Result<()> {
+        let index = create_in_ram()?;
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let key = DocKey::from_parts(7, 42);
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(key, "kept.txt", "committedword"),
+        )?;
+        let committed = Uuid::new_v4();
+        commit_batch(&mut writer, committed)?;
+        let receipt = batch_receipt(&index.index)?;
+        delete_doc(&mut writer, &index.fields, key);
+        let mut prepared = writer.prepare_commit()?;
+        prepared.set_payload(
+            &BatchReceipt {
+                batch_id: Uuid::new_v4(),
+                commit_id: Uuid::new_v4(),
+                complete: true,
+            }
+            .payload(),
+        );
+        assert_eq!(committed_batch(&index.index)?, Some(committed));
+        assert_eq!(batch_receipt(&index.index)?, receipt);
+        assert_eq!(matches(&index, index.fields.content, "committedword")?, 1);
+        prepared.abort()?;
+        assert_eq!(committed_batch(&index.index)?, Some(committed));
+        assert_eq!(batch_receipt(&index.index)?, receipt);
+        assert_eq!(matches(&index, index.fields.content, "committedword")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn segment_merge_preserves_latest_batch_receipt() -> Result<()> {
+        let index = create_in_ram()?;
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        let first = Uuid::new_v4();
+        let last = Uuid::new_v4();
+        for (file_id, token) in [(1, first), (2, last)] {
+            add_content_doc(
+                &mut writer,
+                &index.fields,
+                &sample_doc(DocKey::from_parts(7, file_id), "file.txt", "mergedword"),
+            )?;
+            commit_batch(&mut writer, token)?;
+        }
+        let segments = index.index.searchable_segment_ids()?;
+        assert_eq!(segments.len(), 2);
+        let receipt = batch_receipt(&index.index)?;
+        writer.merge(&segments).wait()?;
+        assert_eq!(index.index.searchable_segment_ids()?.len(), 1);
+        assert_eq!(committed_batch(&index.index)?, Some(last));
+        assert_eq!(batch_receipt(&index.index)?, receipt);
+        assert_eq!(matches(&index, index.fields.content, "mergedword")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_or_invalid_receipts_do_not_claim_journal_coverage() -> Result<()> {
+        let index = create_in_ram()?;
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        assert!(commit_batch(&mut writer, Uuid::nil()).is_err());
+        assert_eq!(committed_batch(&index.index)?, None);
+        commit_batch(&mut writer, Uuid::new_v4())?;
+        writer.commit()?;
+        assert_eq!(committed_batch(&index.index)?, None);
+        let id = Uuid::new_v4();
+        for invalid in [
+            "not-a-batch-id".to_owned(),
+            id.to_string(),
+            format!("ultrasearch-ingestion-v1:{}:{id}:complete", Uuid::nil()),
+            format!("ultrasearch-ingestion-v1:{id}:{}:partial", Uuid::nil()),
+            format!("ultrasearch-ingestion-v1:{id}:{id}:unknown"),
+            format!("ultrasearch-ingestion-v1:{id}:{id}:complete:extra"),
+            format!("ultrasearch-ingestion-v2:{id}:{id}:complete"),
+        ] {
+            let mut prepared = writer.prepare_commit()?;
+            prepared.set_payload(&invalid);
+            prepared.commit()?;
+            assert!(committed_batch(&index.index).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_and_replayed_commits_cannot_reuse_completion_evidence() -> Result<()> {
+        let index = create_in_ram()?;
+        let mut writer = create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let batch_id = Uuid::new_v4();
+        let key = DocKey::from_parts(7, 42);
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(key, "file.txt", "partialword"),
+        )?;
+        commit_partial_batch(&mut writer, batch_id)?;
+        let partial = batch_receipt(&index.index)?.unwrap();
+        assert_eq!(partial.batch_id, batch_id);
+        assert!(!partial.complete);
+        assert_eq!(committed_batch(&index.index)?, None);
+        assert_eq!(matches(&index, index.fields.content, "partialword")?, 1);
+
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(key, "file.txt", "completeword"),
+        )?;
+        commit_batch(&mut writer, batch_id)?;
+        let complete = batch_receipt(&index.index)?.unwrap();
+        assert!(complete.complete);
+        assert_eq!(complete.batch_id, batch_id);
+        assert_ne!(complete.commit_id, partial.commit_id);
+        assert_eq!(committed_batch(&index.index)?, Some(batch_id));
+        assert_eq!(matches(&index, index.fields.content, "partialword")?, 0);
+
+        // A later successful replay can contain a different live snapshot. It
+        // must not validate a backup of the earlier completed attempt.
+        add_content_doc(
+            &mut writer,
+            &index.fields,
+            &sample_doc(key, "file.txt", "replayedword"),
+        )?;
+        commit_batch(&mut writer, batch_id)?;
+        let replay = batch_receipt(&index.index)?.unwrap();
+        assert_eq!(replay.batch_id, batch_id);
+        assert!(replay.complete);
+        assert_ne!(replay.commit_id, complete.commit_id);
+        assert_eq!(matches(&index, index.fields.content, "completeword")?, 0);
+        assert_eq!(matches(&index, index.fields.content, "replayedword")?, 1);
+
+        // Failing during another replay downgrades the index to partial even
+        // though a previous successful attempt of this batch once existed.
+        commit_partial_batch(&mut writer, batch_id)?;
+        let retried_partial = batch_receipt(&index.index)?.unwrap();
+        assert!(!retried_partial.complete);
+        assert_ne!(retried_partial.commit_id, replay.commit_id);
+        assert_eq!(committed_batch(&index.index)?, None);
+        Ok(())
     }
 
     #[test]

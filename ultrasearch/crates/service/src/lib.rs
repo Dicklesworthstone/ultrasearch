@@ -205,7 +205,9 @@ mod e2e_windows_tests {
             "failed batch must remain available for recovery"
         );
         let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        ensure!(batch["version"] == 2, "retained batch version changed");
+        ensure!(batch["version"] == 3, "retained batch version changed");
+        let batch_id: Uuid = serde_json::from_value(batch["id"].clone())?;
+        ensure!(!batch_id.is_nil(), "retained batch identity is missing");
         let jobs = batch["jobs"].as_array().context("retained jobs missing")?;
         ensure!(jobs.len() == 1, "retained batch lost its job");
         let retained: JobSpec = serde_json::from_value(jobs[0].clone())?;
@@ -301,7 +303,9 @@ mod e2e_windows_tests {
             "mixed failed batch must remain recoverable"
         );
         let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        ensure!(batch["version"] == 2, "retained batch version changed");
+        ensure!(batch["version"] == 3, "retained batch version changed");
+        let batch_id: Uuid = serde_json::from_value(batch["id"].clone())?;
+        ensure!(!batch_id.is_nil(), "retained batch identity is missing");
         ensure!(
             batch["jobs"] == serde_json::to_value(&jobs)?,
             "retained mixed batch lost or changed an input"
@@ -318,6 +322,11 @@ mod e2e_windows_tests {
         // No test helper inserts documents: only the real worker can make the
         // fresh content-only token searchable despite the other item's error.
         let index = open_or_create(&index_dir)?;
+        let receipt = content_index::batch_receipt(&index.index)?;
+        ensure!(
+            receipt.is_some_and(|receipt| receipt.batch_id == batch_id && !receipt.complete),
+            "partial real-worker commit lost its durable batch identity"
+        );
         let reader = content_index::open_reader(&index)?;
         reader.reload()?;
         let searcher = reader.searcher();
@@ -468,7 +477,7 @@ mod e2e_windows_tests {
 
         // Shutdown
         let _ = shutdown_tx.send(()).await;
-        let _ = handle.join().expect("service thread panicked")?;
+        handle.join().expect("service thread panicked")?;
         Ok(())
     }
 
@@ -589,7 +598,7 @@ mod e2e_windows_tests {
         );
 
         let _ = shutdown_tx.send(()).await;
-        let _ = handle.join().expect("service thread panicked")?;
+        handle.join().expect("service thread panicked")?;
         Ok(())
     }
 
@@ -694,7 +703,7 @@ mod e2e_windows_tests {
         );
 
         let _ = shutdown_tx.send(()).await;
-        let _ = handle.join().expect("service thread panicked")?;
+        handle.join().expect("service thread panicked")?;
         Ok(())
     }
 }

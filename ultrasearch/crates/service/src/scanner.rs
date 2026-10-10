@@ -9,11 +9,11 @@ use crate::status_provider::{
 };
 use anyhow::{Context, Result, ensure};
 use core_types::config::AppConfig;
-use core_types::{DocKey, VolumeId};
+use core_types::{DocKey, FileMeta, VolumeId};
 use ipc::VolumeStatus;
 use ntfs_watcher::{
-    FileEvent, NtfsError, ReaderConfig, VolumeInfo, canonical_path, discover_volumes,
-    enumerate_mft_with_config, query_journal, tail_usn_batch_with_config,
+    FileEvent, JournalCursor, NtfsError, ReaderConfig, VolumeInfo, begin_mft_scan, canonical_path,
+    discover_volumes, tail_usn_batch_with_config,
 };
 use state::{
     BATCH_LIMIT, ContentPolicy, MetadataChange, PendingBatch, StateStore, event_changes,
@@ -28,6 +28,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
 static RESCAN_GENERATION: AtomicU64 = AtomicU64::new(0);
+const MUTATION_BATCH_LIMIT: usize = 128;
 
 /// Request reconciliation on the same serialized lane as journal changes.
 pub fn request_rescan() {
@@ -328,8 +329,8 @@ async fn process_volume(
                 // Bound durable JSON even for long paths. The raw read's cursor
                 // belongs only to its final mutation batch; earlier chunks can
                 // safely be replayed if the service restarts between them.
-                let count = changes.chunks(128).len();
-                for (number, chunk) in changes.chunks(128).enumerate() {
+                let count = changes.chunks(MUTATION_BATCH_LIMIT).len();
+                for (number, chunk) in changes.chunks(MUTATION_BATCH_LIMIT).enumerate() {
                     let checkpoint = (number + 1 == count).then_some(next);
                     store.begin(pending_for_volume(
                         volume,
@@ -369,26 +370,69 @@ async fn reconcile_volume(
     store.save()?;
     update_status_ingestion_state(format!("reconciling volume {}", volume.id));
     let scan_volume = volume.clone();
-    let reader_config = reader_config(cfg, &store.state.retired_indices)?;
-    let (start, metas) = tokio::task::spawn_blocking(move || -> Result<_> {
-        // Capture BEFORE enumeration so writes during the snapshot are replayed.
-        let start = query_journal(&scan_volume)?;
-        let metas = enumerate_mft_with_config(&scan_volume, &reader_config)?;
-        Ok((start, metas))
-    })
-    .await??;
+    let mut reader_config = reader_config(cfg, &store.state.retired_indices)?;
+    reader_config.max_records_per_tick = MUTATION_BATCH_LIMIT;
+    let mut scan =
+        tokio::task::spawn_blocking(move || begin_mft_scan(&scan_volume, &reader_config)).await??;
+    // Opening the scan captures the journal head before any MFT enumeration.
+    let start = scan.journal_cursor();
+    let batches = std::iter::from_fn(move || scan.next_batch().transpose());
+    apply_mft_scan(store, volume, cfg, start, batches, commit_pending).await
+}
+
+/// Pull the next bounded page only after the previous page's durable work has
+/// committed. There is no background producer that can accumulate the MFT while
+/// worker admission is paused. Reader/worker failure or cancellation leaves the
+/// persisted `needs_scan` marker and any pending intent intact.
+async fn apply_mft_scan<I, C>(
+    store: &mut StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    start: JournalCursor,
+    mut batches: I,
+    mut commit: C,
+) -> Result<()>
+where
+    I: Iterator<Item = std::result::Result<Vec<FileMeta>, NtfsError>> + Send + 'static,
+    C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()>,
+{
+    ensure!(
+        store.volume(volume.id)?.needs_scan,
+        "MFT reconciliation must be marked incomplete before it starts"
+    );
     // Reset through the worker lane as well, so old extraction jobs cannot
     // resurrect files after deletion. A crash restarts this complete scan.
     store.begin(pending_for_volume(volume, Vec::new(), None, true, cfg))?;
-    commit_pending(store, cfg).await?;
-    for chunk in metas.chunks(128) {
-        let changes = chunk.iter().cloned().map(MetadataChange::Upsert).collect();
+    commit(store, cfg).await?;
+    loop {
+        let (returned, batch) = tokio::task::spawn_blocking(move || {
+            let batch = batches.next();
+            (batches, batch)
+        })
+        .await
+        .context("MFT reader task failed")?;
+        batches = returned;
+        let Some(metas) = batch else {
+            break;
+        };
+        let metas = metas?;
+        ensure!(
+            metas.len() <= MUTATION_BATCH_LIMIT,
+            "MFT reader exceeded the mutation batch limit"
+        );
+        // An empty page is progress through excluded/missing records, not EOF.
+        if metas.is_empty() {
+            continue;
+        }
+        let changes = metas.into_iter().map(MetadataChange::Upsert).collect();
         store.begin(pending_for_volume(volume, changes, None, false, cfg))?;
-        commit_pending(store, cfg).await?;
+        commit(store, cfg).await?;
     }
+    // Only a successful, journal-validated native EOF completes the baseline.
     let state = store.volume_mut(volume.id)?;
     state.cursor = Some(start);
     state.needs_scan = false;
+    state.catching_up = true;
     store.save()?;
     Ok(())
 }
@@ -544,22 +588,41 @@ async fn commit_pending(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
         batch.volume
     ));
     // Awaiting admission supplies backpressure. It does not advance any cursor.
-    submit_index_batch(batch.worker.clone()).await?;
+    submit_index_batch(batch.worker.clone(), Some(store.mutation_lease())).await?;
     let apply_cfg = cfg.clone();
     let apply_batch = batch.clone();
-    tokio::task::spawn_blocking(move || apply_metadata(&apply_cfg, &apply_batch)).await??;
+    run_index_mutation(store.mutation_lease(), move || {
+        apply_metadata(&apply_cfg, &apply_batch)
+    })
+    .await?;
     store.finish()?;
     show_pending(&batch);
     update_status_last_commit(Some(unix_timestamp_secs()));
     Ok(())
 }
 
+async fn run_index_mutation<T, F>(lease: std::sync::Arc<std::fs::File>, mutation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        // Dropping a JoinHandle does not stop a blocking task. Keep the sole
+        // ingestion lease here so a new service session cannot overtake it.
+        let _lease = lease;
+        mutation()
+    })
+    .await?
+}
+
 fn apply_metadata(cfg: &AppConfig, batch: &PendingBatch) -> Result<()> {
-    if batch.metadata.is_empty() && batch.worker.reset_volumes.is_empty() {
-        return Ok(());
-    }
     let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
     let content = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+    ensure!(
+        content_index::committed_batch(&content.index)? == Some(batch.worker.id),
+        "worker did not commit the expected ingestion batch {}",
+        batch.worker.id
+    );
     let content_reader = content_index::open_reader(&content)?;
     let mut writer = meta_index::create_writer(
         &index,
@@ -603,7 +666,7 @@ fn apply_metadata(cfg: &AppConfig, batch: &PendingBatch) -> Result<()> {
             MetadataChange::Delete(key) => meta_index::delete_doc(&mut writer, &index.fields, *key),
         }
     }
-    writer.commit()?;
+    content_index::commit_batch(&mut writer, batch.worker.id)?;
     Ok(())
 }
 
@@ -733,7 +796,7 @@ mod tests {
                 )?;
             }
         }
-        writer.commit()?;
+        content_index::commit_batch(&mut writer, batch.worker.id)?;
         Ok(())
     }
 
@@ -741,6 +804,299 @@ mod tests {
         apply_metadata(cfg, batch)?;
         store.finish()?;
         show_pending(batch);
+        Ok(())
+    }
+
+    fn baseline_store(
+        root: &Path,
+        id: VolumeId,
+    ) -> Result<(AppConfig, StateStore, VolumeInfo, JournalCursor)> {
+        let mut cfg = config(root);
+        // Exercise real metadata commits without pretending a test fixture was
+        // extracted by a native worker. Content is disabled for this volume.
+        cfg.volumes = vec!["X:\\".into()];
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = VolumeInfo {
+            id: 0,
+            guid_path: format!("bounded-baseline-{id}"),
+            drive_letters: vec!['X'],
+        };
+        store.bind_volume(&mut volume)?;
+        store.volume_mut(volume.id)?.id = id;
+        volume.id = id;
+        let previous = JournalCursor {
+            journal_id: 17,
+            last_usn: 100,
+        };
+        store.volume_mut(id)?.cursor = Some(previous);
+        store.save()?;
+        hide_volume(id);
+        Ok((cfg, store, volume, previous))
+    }
+
+    #[tokio::test]
+    async fn mft_scan_waits_for_commit_and_continues_after_empty_pages() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volume, previous) = baseline_store(root.path(), 60_001)?;
+        let first = meta(DocKey::from_parts(volume.id, 10), "firstbaseline.txt", 10);
+        let last = meta(DocKey::from_parts(volume.id, 20), "lastbaseline.txt", 20);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let mut pages = vec![Ok(vec![first]), Ok(Vec::new()), Ok(vec![last])].into_iter();
+        let batches = std::iter::from_fn(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            pages.next()
+        });
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut waiting_tx = Some(waiting_tx);
+        let mut release_rx = Some(release_rx);
+        let start = JournalCursor {
+            last_usn: 200,
+            ..previous
+        };
+        let commit = async |store: &mut StateStore, cfg: &AppConfig| {
+            let batch = store.state.pending.clone().context("missing MFT intent")?;
+            hide_pending(&batch);
+            if !batch.metadata.is_empty()
+                && let Some(waiting) = waiting_tx.take()
+            {
+                let _ = waiting.send(());
+                release_rx.take().context("missing worker release")?.await?;
+            }
+            worker_commit(cfg, &batch, None)?;
+            finish(store, cfg, &batch)
+        };
+        let mut operation = Box::pin(apply_mft_scan(
+            &mut store, &volume, &cfg, start, batches, commit,
+        ));
+        tokio::select! {
+            result = &mut operation => panic!("scan completed before worker acknowledgement: {result:?}"),
+            result = waiting_rx => result?,
+        }
+        // The live first-page intent is durable, the old cursor is retained,
+        // and neither the empty page nor the later file has been read ahead.
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            Path::new(&cfg.paths.state_dir).join("ingestion-v2.json"),
+        )?)?;
+        assert_eq!(disk["volumes"][0]["cursor"]["last_usn"], 100);
+        assert_eq!(disk["volumes"][0]["needs_scan"], true);
+        assert_eq!(disk["pending"]["metadata"].as_array().unwrap().len(), 1);
+        assert!(read_visibility().volumes.contains(&volume.id));
+
+        release_tx.send(()).expect("scan is waiting for its worker");
+        operation.await?;
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(start));
+        assert!(!store.volume(volume.id)?.needs_scan);
+        assert!(store.volume(volume.id)?.catching_up);
+        assert!(store.state.pending.is_none());
+        // EOF only completes the baseline; the volume remains hidden until a
+        // real journal read confirms catch-up from the pre-enumeration cursor.
+        assert!(read_visibility().volumes.contains(&volume.id));
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "lastbaseline", SearchMode::NameOnly).total,
+            0
+        );
+        show_volume(volume.id);
+        for term in ["firstbaseline", "lastbaseline"] {
+            assert_eq!(search(&handler, term, SearchMode::NameOnly).total, 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mft_reader_failure_keeps_partial_baseline_hidden_and_checkpoint_unchanged()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volume, previous) = baseline_store(root.path(), 60_002)?;
+        let file = meta(DocKey::from_parts(volume.id, 10), "partialbaseline.txt", 10);
+        let batches = vec![
+            Ok(vec![file]),
+            Err(NtfsError::Mft("injected truncated MFT page".into())),
+        ]
+        .into_iter();
+        let result = apply_mft_scan(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalCursor {
+                last_usn: 200,
+                ..previous
+            },
+            batches,
+            async |store: &mut StateStore, cfg: &AppConfig| {
+                let batch = store.state.pending.clone().context("missing MFT intent")?;
+                worker_commit(cfg, &batch, None)?;
+                finish(store, cfg, &batch)
+            },
+        )
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("truncated MFT page"));
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(store.volume(volume.id)?.needs_scan);
+        assert!(store.state.pending.is_none());
+        drop(store);
+        let store = StateStore::open(&cfg)?;
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(store.volume(volume.id)?.needs_scan);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "partialbaseline", SearchMode::NameOnly).total,
+            0
+        );
+        show_volume(volume.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_mft_scan_retains_pending_batch_for_restart() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volume, previous) = baseline_store(root.path(), 60_003)?;
+        let file = meta(
+            DocKey::from_parts(volume.id, 10),
+            "cancelledbaseline.txt",
+            10,
+        );
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let batches = std::iter::from_fn(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(vec![file.clone()]))
+        });
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let mut waiting_tx = Some(waiting_tx);
+        let mut operation = Box::pin(apply_mft_scan(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalCursor {
+                last_usn: 200,
+                ..previous
+            },
+            batches,
+            async |store: &mut StateStore, cfg: &AppConfig| {
+                let batch = store.state.pending.clone().context("missing MFT intent")?;
+                hide_pending(&batch);
+                if !batch.metadata.is_empty() {
+                    let _ = waiting_tx
+                        .take()
+                        .context("worker already waiting")?
+                        .send(());
+                    std::future::pending::<()>().await;
+                }
+                worker_commit(cfg, &batch, None)?;
+                finish(store, cfg, &batch)
+            },
+        ));
+        tokio::select! {
+            result = &mut operation => panic!("scan completed while worker was paused: {result:?}"),
+            result = waiting_rx => result?,
+        }
+        drop(operation);
+        let pending_id = store.state.pending.as_ref().unwrap().worker.id;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        drop(store);
+        let mut store = StateStore::open(&cfg)?;
+        let pending = store
+            .state
+            .pending
+            .clone()
+            .context("cancelled MFT intent lost")?;
+        assert_eq!(pending.worker.id, pending_id);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(store.volume(volume.id)?.needs_scan);
+        worker_commit(&cfg, &pending, None)?;
+        finish(&mut store, &cfg, &pending)?;
+        assert!(store.state.pending.is_none());
+        assert!(store.volume(volume.id)?.needs_scan);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+        assert!(read_visibility().volumes.contains(&volume.id));
+        show_volume(volume.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_task_keeps_ingestion_lock_until_its_write_finishes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volume, previous) = baseline_store(root.path(), 60_004)?;
+        let file = meta(DocKey::from_parts(volume.id, 10), "leasedmetadata.txt", 10);
+        let pending = pending_for_volume(
+            &volume,
+            vec![MetadataChange::Upsert(file)],
+            Some(JournalCursor {
+                last_usn: 200,
+                ..previous
+            }),
+            false,
+            &cfg,
+        );
+        store.begin(pending.clone())?;
+        hide_pending(&pending);
+        worker_commit(&cfg, &pending, None)?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let apply_cfg = cfg.clone();
+        let apply_batch = pending.clone();
+        let mut operation = Box::pin(run_index_mutation(store.mutation_lease(), move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .context("metadata release channel closed")?;
+            apply_metadata(&apply_cfg, &apply_batch)
+        }));
+        tokio::select! {
+            result = &mut operation => panic!("metadata mutation did not pause: {result:?}"),
+            result = started_rx => result?,
+        }
+        drop(operation);
+        drop(store);
+        match StateStore::open(&cfg) {
+            Ok(_) => anyhow::bail!("a new session overtook a detached metadata mutation"),
+            Err(error) => assert!(format!("{error:#}").contains("another service owns")),
+        }
+
+        release_tx.send(())?;
+        // Cancellation discards the task's result, not its ownership. Wait for
+        // the real metadata commit and the final lock owner to leave the task.
+        let mut recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match StateStore::open(&cfg) {
+                    Ok(store) => break Ok(store),
+                    Err(error) if format!("{error:#}").contains("another service owns") => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(recovered.volume(volume.id)?.cursor, Some(previous));
+        assert_eq!(
+            recovered.state.pending.as_ref().unwrap().worker.id,
+            pending.worker.id
+        );
+        recovered.finish()?;
+        assert_eq!(recovered.volume(volume.id)?.cursor.unwrap().last_usn, 200);
+        show_pending(&pending);
+        show_volume(volume.id);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "leasedmetadata", SearchMode::NameOnly).total,
+            1
+        );
         Ok(())
     }
 
