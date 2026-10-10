@@ -95,10 +95,11 @@ mod tests {
 
     #[test]
     fn doc_key_wire_round_trip() {
-        let dk = DocKey::from_parts(5, 0x1234);
+        let dk = DocKey::from_parts(5, 0xabcd_0000_0000_1234);
         let wire: DocKeyWire = dk.into();
         let back: DocKey = wire.into();
         assert_eq!(back, dk);
+        assert_eq!(wire.file, 0xabcd_0000_0000_1234);
     }
 
     #[test]
@@ -110,6 +111,10 @@ mod tests {
         let bytes = to_bincode(&dk).unwrap();
         let round: DocKeyWire = from_bincode(&bytes).unwrap();
         assert_eq!(round, dk);
+
+        let key = DocKey::from_parts(u16::MAX, u64::MAX);
+        let bytes = to_bincode(&key).unwrap();
+        assert_eq!(from_bincode::<DocKey>(&bytes).unwrap(), key);
     }
 
     #[test]

@@ -163,23 +163,19 @@ async fn handle_connection(mut conn: NamedPipeServer) -> Result<()> {
         let mut buf = vec![0u8; frame_len];
         conn.read_exact(&mut buf).await?;
 
-        // framing::decode_frame expects [header + body].
-        // We have read them separately.
-        // We can reconstruct or just parse the body if we trust it.
-        // Since we are the server, we trust our read logic.
-        // Dispatch expects the RAW payload (no frame).
-        // But wait, `buf` IS the payload.
-        // framing::decode_frame also checks length.
-
-        let response = dispatch(&buf);
-        let framed = framing::encode_frame(&response).unwrap_or_default();
+        // Reject old identity layouts before deserializing a request or
+        // publishing search hits that an old UI could misinterpret.
+        let (kind, payload) = framing::decode_message(&buf)?;
+        let response = dispatch(kind, payload);
+        anyhow::ensure!(!response.is_empty(), "invalid {kind:?} IPC payload");
+        let framed = framing::encode_frame(&framing::encode_message(kind, &response)?)?;
         // framed includes length prefix.
         conn.write_all(&framed).await?;
     }
     Ok(())
 }
 
-fn dispatch(payload: &[u8]) -> Vec<u8> {
+fn dispatch(kind: framing::MessageKind, payload: &[u8]) -> Vec<u8> {
     fn deserialize_exact<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Option<T> {
         let mut cursor = Cursor::new(payload);
         match bincode::deserialize_from::<_, T>(&mut cursor) {
@@ -189,15 +185,17 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
     }
 
     // Fast-path: ping echo when payload is prefixed with "PING" + UUID.
-    if payload.len() >= 20
+    if kind == framing::MessageKind::Ping
+        && payload.len() == 20
         && payload.starts_with(b"PING")
         && let Ok(id) = Uuid::from_slice(&payload[4..20])
     {
         return id.as_bytes().to_vec();
     }
 
-    // Try StatusRequest first.
-    if let Some(req) = deserialize_exact::<StatusRequest>(payload) {
+    if kind == framing::MessageKind::Status
+        && let Some(req) = deserialize_exact::<StatusRequest>(payload)
+    {
         let started = Instant::now();
         let snap = status_snapshot();
         let empty_metrics =
@@ -232,7 +230,9 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
     }
 
     // Handle ReloadConfigRequest
-    if let Some(req) = deserialize_exact::<ReloadConfigRequest>(payload) {
+    if kind == framing::MessageKind::ReloadConfig
+        && let Some(req) = deserialize_exact::<ReloadConfigRequest>(payload)
+    {
         let started = Instant::now();
         let result = core_types::config::reload_config(None);
         let (success, message) = match result {
@@ -250,23 +250,13 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
     }
 
     // Handle RescanRequest
-    if let Some(req) = deserialize_exact::<RescanRequest>(payload) {
+    if kind == framing::MessageKind::Rescan
+        && let Some(req) = deserialize_exact::<RescanRequest>(payload)
+    {
         let started = Instant::now();
-        let cfg = core_types::config::get_current_config();
-        let res = crate::scanner::scan_volumes(&cfg).map(|jobs| {
-            let mut submitted = 0usize;
-            for job in jobs {
-                if crate::scheduler_runtime::enqueue_content_job(job) {
-                    submitted += 1;
-                }
-            }
-            submitted
-        });
-
-        let (success, message) = match res {
-            Ok(count) => (true, Some(format!("Submitted {} jobs", count))),
-            Err(e) => (false, Some(e.to_string())),
-        };
+        crate::scanner::request_rescan();
+        let success = true;
+        let message = Some("Reconciliation requested on the durable indexing lane; check ingestion status for completion".to_string());
 
         let resp = RescanResponse {
             id: req.id,
@@ -278,8 +268,9 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
         return encoded;
     }
 
-    // Fallback: dispatch SearchRequest.
-    if let Some(req) = deserialize_exact::<SearchRequest>(payload) {
+    if kind == framing::MessageKind::Search
+        && let Some(req) = deserialize_exact::<SearchRequest>(payload)
+    {
         let start = Instant::now();
         let req_clone = req.clone();
         let mut resp = search(req);
@@ -301,7 +292,6 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {
         record_ipc_request(elapsed);
         return encoded;
     }
-    // If payload decodes as a UUID prefix, echo it back.
     Vec::new()
 }
 
@@ -320,14 +310,17 @@ mod tests {
         let id = Uuid::new_v4();
         let mut payload = b"PING".to_vec();
         payload.extend_from_slice(id.as_bytes());
-        let resp = dispatch(&payload);
+        let resp = dispatch(framing::MessageKind::Ping, &payload);
         assert_eq!(resp, id.as_bytes());
     }
 
     #[test]
     fn status_request_roundtrip() {
         let req = StatusRequest { id: Uuid::new_v4() };
-        let resp_bytes = dispatch(&bincode::serialize(&req).unwrap());
+        let resp_bytes = dispatch(
+            framing::MessageKind::Status,
+            &bincode::serialize(&req).unwrap(),
+        );
         let resp: StatusResponse = bincode::deserialize(&resp_bytes).unwrap();
         assert_eq!(resp.id, req.id);
         assert!(resp.volumes.is_empty());
@@ -349,10 +342,34 @@ mod tests {
             timeout: None,
             offset: 0,
         };
-        let resp_bytes = dispatch(&bincode::serialize(&req).unwrap());
+        let resp_bytes = dispatch(
+            framing::MessageKind::Search,
+            &bincode::serialize(&req).unwrap(),
+        );
         let resp: SearchResponse = bincode::deserialize(&resp_bytes).unwrap();
         assert_eq!(resp.id, req.id);
         assert!(resp.hits.is_empty());
         assert_eq!(resp.total, 0);
+    }
+
+    #[test]
+    fn rescan_request_is_not_misrouted_to_status() {
+        let req = RescanRequest { id: Uuid::new_v4() };
+        let payload = bincode::serialize(&req).unwrap();
+        assert_eq!(
+            payload,
+            bincode::serialize(&StatusRequest { id: req.id }).unwrap()
+        );
+        let response = dispatch(framing::MessageKind::Rescan, &payload);
+        let response: RescanResponse = bincode::deserialize(&response).unwrap();
+        assert_eq!(response.id, req.id);
+        assert!(response.success);
+        assert!(
+            response
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("Reconciliation requested")
+        );
     }
 }

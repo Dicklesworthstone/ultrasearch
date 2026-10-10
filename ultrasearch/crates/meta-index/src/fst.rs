@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use core_types::DocKey;
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use memmap2::Mmap;
@@ -10,8 +10,8 @@ use memmap2::Mmap;
 /// A memory-mapped FST index for fast prefix lookups.
 ///
 /// Keys are encoded as `normalized_name + \0 + doc_key_be_bytes` to handle duplicates.
-/// The value associated with the FST key is unused (always 0) because the DocKey
-/// is embedded in the key itself to allow multiple files with the same name.
+/// The value marks the key encoding version. The complete DocKey is embedded
+/// in the key itself to allow multiple files with the same name.
 pub struct FstIndex {
     map: Map<Mmap>,
 }
@@ -23,6 +23,12 @@ impl FstIndex {
         // SAFETY: We assume the file is immutable and safe to map.
         let mmap = unsafe { Mmap::map(&file)? };
         let map = Map::new(mmap)?;
+        if let Some((_, version)) = map.stream().next() {
+            ensure!(
+                version == 2,
+                "incompatible FST key encoding; rebuild required"
+            );
+        }
         Ok(Self { map })
     }
 
@@ -63,18 +69,18 @@ impl FstIndex {
                 continue;
             }
 
-            // Key format: name_bytes + \0 + 8 bytes DocKey (BE).
-            if k.len() < 9 {
+            // Key format: name_bytes + \0 + 16 bytes lossless DocKey (BE).
+            if k.len() < 17 {
                 continue;
             }
 
-            let (rest, dk_bytes) = k.split_at(k.len() - 8);
+            let (rest, dk_bytes) = k.split_at(k.len() - 16);
             if rest.last() != Some(&0) {
                 continue;
             }
 
             if let Ok(bytes) = dk_bytes.try_into() {
-                let val = u64::from_be_bytes(bytes);
+                let val = u128::from_be_bytes(bytes);
                 hits.push(DocKey(val));
             }
         }
@@ -116,7 +122,7 @@ impl FstBuilder {
         keys.dedup(); // Dedup exact matches just in case
 
         for k in keys {
-            self.writer.insert(&k, 0)?;
+            self.writer.insert(&k, 2)?;
         }
         Ok(())
     }
@@ -151,7 +157,7 @@ mod tests {
         let index = FstIndex::open(&path)?;
 
         // Exact match "foo" -> should return 1 and 3
-        let mut hits: Vec<u64> = index.search("foo", 10).map(|k| k.0).collect();
+        let mut hits: Vec<u128> = index.search("foo", 10).map(|k| k.0).collect();
         hits.sort();
         // search("foo") is prefix search. It matches "foo\0..." (1, 3) and "foobar\0..." (2).
         // Wait, "foobar" encoded is "foobar\0..."
@@ -162,21 +168,53 @@ mod tests {
         assert_eq!(hits, vec![1, 2, 3]);
 
         // Prefix "foob" -> 2
-        let hits: Vec<u64> = index.search("foob", 10).map(|k| k.0).collect();
+        let hits: Vec<u128> = index.search("foob", 10).map(|k| k.0).collect();
         assert_eq!(hits, vec![2]);
 
         // Prefix "ba" -> 4
-        let hits: Vec<u64> = index.search("ba", 10).map(|k| k.0).collect();
+        let hits: Vec<u128> = index.search("ba", 10).map(|k| k.0).collect();
         assert_eq!(hits, vec![4]);
 
         // No match
-        let hits: Vec<u64> = index.search("z", 10).map(|k| k.0).collect();
+        let hits: Vec<u128> = index.search("z", 10).map(|k| k.0).collect();
         assert!(hits.is_empty());
 
         // Limit check
-        let hits: Vec<u64> = index.search("foo", 1).map(|k| k.0).collect();
+        let hits: Vec<u128> = index.search("foo", 1).map(|k| k.0).collect();
         assert_eq!(hits.len(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn full_reference_numbers_survive_fst_round_trip() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("full-key.fst");
+        let first = DocKey::from_parts(1, 0x0001_0000_0000_002a);
+        let reused = DocKey::from_parts(1, 0x0002_0000_0000_002a);
+        let other = DocKey::from_parts(u16::MAX, u64::MAX);
+        let mut builder = FstBuilder::new(&path)?;
+        builder.insert_batch(vec![
+            ("file".into(), first),
+            ("file".into(), reused),
+            ("file".into(), other),
+        ])?;
+        builder.finish()?;
+        let index = FstIndex::open(&path)?;
+        let mut actual: Vec<_> = index.search("file", 10).collect();
+        actual.sort();
+        assert_eq!(actual, vec![first, reused, other]);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_fst_is_rejected_instead_of_reinterpreted() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("legacy.fst");
+        let mut builder = MapBuilder::new(BufWriter::new(File::create(&path)?))?;
+        builder.insert(b"file\0\0\0\0\0\0\0\0\x01", 0)?;
+        builder.finish()?;
+        assert!(FstIndex::open(&path).is_err());
         Ok(())
     }
 }

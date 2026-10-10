@@ -1,3 +1,4 @@
+use crate::scanner::{Visibility, read_visibility};
 use anyhow::Result;
 use content_index::{ContentIndex, open_or_create as open_content};
 use ipc::{
@@ -6,7 +7,7 @@ use ipc::{
 };
 use meta_index::{MetaFields, MetaIndex, open_or_create_index, open_reader};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -62,8 +63,9 @@ impl UnifiedSearchHandler {
                 Some((idx, reader))
             }
             Err(e) => {
-                warn!("failed to open content index at {:?}: {}", content_path, e);
-                None
+                return Err(e.context(
+                    "content index unavailable; ingestion cannot be reported as healthy",
+                ));
             }
         };
 
@@ -254,14 +256,19 @@ impl UnifiedSearchHandler {
         Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
-    fn search_meta(&self, req: &SearchRequest) -> SearchResponse {
+    fn search_meta(&self, req: &SearchRequest, visibility: &Visibility) -> SearchResponse {
         let start = Instant::now();
         let limit = req.limit.max(1) as usize;
         let offset = req.offset as usize;
 
         let searcher = self.meta_reader.searcher();
         let query = match self.build_meta_query(&req.query) {
-            Ok(q) => q,
+            Ok(q) => visible_query(
+                q,
+                self.meta.fields.doc_key,
+                self.meta.fields.volume,
+                visibility,
+            ),
             Err(err) => {
                 warn!(error = %err, "failed to build meta query");
                 return StubSearchHandler.search(req.clone());
@@ -304,7 +311,7 @@ impl UnifiedSearchHandler {
         }
     }
 
-    fn search_content(&self, req: &SearchRequest) -> SearchResponse {
+    fn search_content(&self, req: &SearchRequest, visibility: &Visibility) -> SearchResponse {
         let Some((content_idx, reader)) = &self.content else {
             return StubSearchHandler.search(req.clone());
         };
@@ -315,7 +322,12 @@ impl UnifiedSearchHandler {
 
         let searcher = reader.searcher();
         let query = match self.build_content_query(&req.query) {
-            Ok(q) => q,
+            Ok(q) => visible_query(
+                q,
+                content_idx.fields.doc_key,
+                content_idx.fields.volume,
+                visibility,
+            ),
             Err(err) => {
                 warn!(error = %err, "failed to build content query");
                 return StubSearchHandler.search(req.clone());
@@ -351,7 +363,7 @@ impl UnifiedSearchHandler {
         }
     }
 
-    fn search_hybrid(&self, req: &SearchRequest) -> SearchResponse {
+    fn search_hybrid(&self, req: &SearchRequest, visibility: &Visibility) -> SearchResponse {
         // Parallel execution? For MVP, sequential.
         // 1. Meta search
         // 2. Content search
@@ -368,7 +380,7 @@ impl UnifiedSearchHandler {
         meta_req.limit = fetch_limit as u32;
         meta_req.offset = 0; // We handle paging after merge? Or simple approach: no deep paging in hybrid for now.
 
-        let meta_resp = self.search_meta(&meta_req);
+        let meta_resp = self.search_meta(&meta_req, visibility);
 
         let mut hits_map: std::collections::HashMap<core_types::DocKey, SearchHit> =
             std::collections::HashMap::new();
@@ -381,7 +393,7 @@ impl UnifiedSearchHandler {
             let mut content_req = req.clone();
             content_req.limit = fetch_limit as u32;
             content_req.offset = 0;
-            let content_resp = self.search_content(&content_req);
+            let content_resp = self.search_content(&content_req, visibility);
 
             for hit in content_resp.hits {
                 hits_map
@@ -420,12 +432,60 @@ impl UnifiedSearchHandler {
 
 impl SearchHandler for UnifiedSearchHandler {
     fn search(&self, req: SearchRequest) -> SearchResponse {
+        // Hold the visibility read lock through both reads. Publishing an intent
+        // and unmasking a committed batch serialize against complete queries.
+        let visibility = read_visibility();
+        if let Err(error) = self.meta_reader.reload().and_then(|()| {
+            if let Some((_, reader)) = &self.content {
+                reader.reload()
+            } else {
+                Ok(())
+            }
+        }) {
+            crate::status_provider::update_status_ingestion_state(format!(
+                "search reader reload failed: {error}"
+            ));
+            let mut response = StubSearchHandler.search(req);
+            response.served_by = Some("service-unavailable".into());
+            return response;
+        }
         match req.mode {
-            SearchMode::NameOnly => self.search_meta(&req),
-            SearchMode::Content => self.search_content(&req),
-            SearchMode::Hybrid | SearchMode::Auto => self.search_hybrid(&req),
+            SearchMode::NameOnly => self.search_meta(&req, &visibility),
+            SearchMode::Content => self.search_content(&req, &visibility),
+            SearchMode::Hybrid | SearchMode::Auto => self.search_hybrid(&req, &visibility),
         }
     }
+}
+
+fn visible_query(
+    query: Box<dyn Query>,
+    key_field: tantivy::schema::Field,
+    volume_field: tantivy::schema::Field,
+    visibility: &Visibility,
+) -> Box<dyn Query> {
+    if visibility.documents.is_empty() && visibility.volumes.is_empty() {
+        return query;
+    }
+    let mut clauses = vec![(Occur::Must, query)];
+    for key in &visibility.documents {
+        clauses.push((
+            Occur::MustNot,
+            Box::new(TermQuery::new(
+                Term::from_field_text(key_field, &key.to_string()),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+    for volume in &visibility.volumes {
+        clauses.push((
+            Occur::MustNot,
+            Box::new(TermQuery::new(
+                Term::from_field_u64(volume_field, u64::from(*volume)),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+    Box::new(BooleanQuery::new(clauses))
 }
 
 // Helper to map content doc to SearchHit
@@ -445,9 +505,7 @@ fn to_hit_content<D: Document>(
     for (field, value) in doc.iter_fields_and_values() {
         match field {
             f if f == fields.doc_key => {
-                if let Some(v) = value.as_u64() {
-                    key = Some(core_types::DocKey(v));
-                }
+                key = value.as_str().and_then(|text| text.parse().ok());
             }
             f if f == fields.name => name = value.as_str().map(|s| s.to_string()),
             f if f == fields.path => path = value.as_str().map(|s| s.to_string()),
@@ -471,16 +529,23 @@ fn to_hit_content<D: Document>(
     })
 }
 
-static HANDLER: OnceLock<Box<dyn SearchHandler>> = OnceLock::new();
+static HANDLER: OnceLock<RwLock<Option<Box<dyn SearchHandler>>>> = OnceLock::new();
 
 pub fn set_search_handler(handler: Box<dyn SearchHandler>) {
     tracing::info!("Global search handler installed.");
-    let _ = HANDLER.set(handler);
+    *HANDLER
+        .get_or_init(RwLock::default)
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(handler);
 }
 
 pub fn search(req: SearchRequest) -> SearchResponse {
     tracing::info!("Received search request id={} mode={:?}", req.id, req.mode);
-    if let Some(h) = HANDLER.get() {
+    let handler = HANDLER
+        .get_or_init(RwLock::default)
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = handler.as_ref() {
         h.search(req)
     } else {
         tracing::warn!("No search handler installed, using StubSearchHandler.");
@@ -499,9 +564,7 @@ fn to_hit<D: Document>(doc: &D, fields: &MetaFields, score: Score) -> Option<Sea
     for (field, value) in doc.iter_fields_and_values() {
         match field {
             f if f == fields.doc_key => {
-                if let Some(v) = value.as_u64() {
-                    key = Some(core_types::DocKey(v));
-                }
+                key = value.as_str().and_then(|text| text.parse().ok());
             }
             f if f == fields.name => {
                 if let Some(s) = value.as_str() {

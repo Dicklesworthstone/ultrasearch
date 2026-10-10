@@ -11,3 +11,6 @@ core-types = { path = "../core-types" }
 anyhow = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "*"

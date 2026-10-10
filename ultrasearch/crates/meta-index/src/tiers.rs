@@ -1,4 +1,6 @@
-use crate::{MetaDoc, MetaFields, MetaIndex, build_schema, to_document};
+use crate::{
+    MetaDoc, MetaFields, MetaIndex, add_batch, build_schema, delete_doc, open_or_create_index,
+};
 use anyhow::Result;
 use std::path::Path;
 use tantivy::collector::TopDocs;
@@ -19,15 +21,7 @@ impl TieredMetaIndex {
     pub fn new(cold_path: &Path) -> Result<Self> {
         // 1. Open/Create Cold Index (Disk)
         let (schema, fields) = build_schema();
-        let cold_index = if cold_path.join("meta.json").exists() {
-            Index::open_in_dir(cold_path)?
-        } else {
-            Index::create_in_dir(cold_path, schema.clone())?
-        };
-        let cold = MetaIndex {
-            index: cold_index,
-            fields: fields.clone(),
-        };
+        let cold = open_or_create_index(cold_path)?;
 
         // 2. Create Delta Index (RAM)
         let ram_dir = tantivy::directory::RamDirectory::create();
@@ -49,8 +43,7 @@ impl TieredMetaIndex {
     }
 
     pub fn add_doc(&mut self, doc: MetaDoc) -> Result<()> {
-        let tdoc = to_document(&doc, &self.delta.fields);
-        self.delta_writer.add_document(tdoc)?;
+        add_batch(&mut self.delta_writer, &self.delta.fields, [doc])?;
         Ok(())
     }
 
@@ -73,6 +66,9 @@ impl TieredMetaIndex {
             for doc_id in segment_reader.doc_ids_alive() {
                 let doc: TantivyDocument =
                     searcher.doc(DocAddress::new(segment_ord as u32, doc_id))?;
+                if let Some(meta) = doc_to_meta(&doc, &self.delta.fields) {
+                    delete_doc(&mut cold_writer, &self.cold.fields, meta.key);
+                }
                 cold_writer.add_document(doc)?;
             }
         }
@@ -143,7 +139,7 @@ pub fn doc_to_meta(doc: &TantivyDocument, fields: &MetaFields) -> Option<MetaDoc
 
     for (field, value) in doc.iter_fields_and_values() {
         match field {
-            f if f == fields.doc_key => key = value.as_u64().map(core_types::DocKey),
+            f if f == fields.doc_key => key = value.as_str().and_then(|value| value.parse().ok()),
             f if f == fields.volume => volume = value.as_u64().map(|v| v as u16),
             f if f == fields.name => name = value.as_str().map(|s| s.to_string()),
             f if f == fields.path => path = value.as_str().map(|s| s.to_string()),

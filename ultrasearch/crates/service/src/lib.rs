@@ -37,6 +37,7 @@ use core_types::config::AppConfig;
 use ntfs_watcher::discover_volumes;
 use std::fs;
 use std::path::Path;
+#[cfg(windows)]
 use std::process::Command;
 
 /// Ensure config has at least one volume; default to all discovered NTFS volumes if empty.
@@ -78,6 +79,8 @@ fn persist_config(cfg: &AppConfig) {
 
 /// Best-effort: ensure Users have modify rights on the config file so the CLI/UI can update volumes.
 pub fn ensure_config_acl_writable(path: &Path) {
+    #[cfg(not(windows))]
+    let _ = path;
     #[cfg(windows)]
     {
         let target = path.to_string_lossy().to_string();
@@ -126,6 +129,19 @@ mod e2e_windows_tests {
             .unwrap_or(0)
     }
 
+    fn file_reference(path: &std::path::Path) -> Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let file = std::fs::File::open(path)?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: file owns a valid handle and info remains writable for the call.
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as isize), &mut info) }?;
+        Ok((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires a real index-worker.exe and a retained E2E artifact directory"]
     async fn e2e_worker_failure_preserves_batch() -> Result<()> {
@@ -166,6 +182,7 @@ mod e2e_windows_tests {
         cfg.paths.content_index = invalid_index.to_string_lossy().into_owned();
         cfg.paths.jobs_dir = jobs_dir.to_string_lossy().into_owned();
         let job = JobSpec {
+            operation: crate::dispatcher::job_dispatch::JobOperation::Upsert,
             volume_id: 1,
             file_id: 42,
             path: input.clone(),
@@ -188,7 +205,7 @@ mod e2e_windows_tests {
             "failed batch must remain available for recovery"
         );
         let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        ensure!(batch["version"] == 1, "retained batch version changed");
+        ensure!(batch["version"] == 2, "retained batch version changed");
         let jobs = batch["jobs"].as_array().context("retained jobs missing")?;
         ensure!(jobs.len() == 1, "retained batch lost its job");
         let retained: JobSpec = serde_json::from_value(jobs[0].clone())?;
@@ -234,10 +251,14 @@ mod e2e_windows_tests {
         );
         let root = artifact_dir.join(format!("mixed-worker-batch-{}", Uuid::new_v4()));
         std::fs::create_dir(&root)?;
-        eprintln!("retaining mixed real-worker artifacts at {}", root.display());
+        eprintln!(
+            "retaining mixed real-worker artifacts at {}",
+            root.display()
+        );
         let input = root.join("document.txt");
         let content_token = format!("content{}", Uuid::new_v4().simple());
         std::fs::write(&input, &content_token)?;
+        let input_reference = file_reference(&input)?;
         let missing_input = root.join("missing-document.txt");
         let index_dir = root.join("content-index");
         std::fs::create_dir(&index_dir)?;
@@ -247,14 +268,16 @@ mod e2e_windows_tests {
         cfg.paths.jobs_dir = jobs_dir.to_string_lossy().into_owned();
         let jobs = vec![
             JobSpec {
+                operation: crate::dispatcher::job_dispatch::JobOperation::Upsert,
                 volume_id: 1,
-                file_id: 42,
+                file_id: input_reference,
                 path: input.clone(),
                 max_bytes: None,
                 max_chars: None,
                 file_size: std::fs::metadata(&input)?.len(),
             },
             JobSpec {
+                operation: crate::dispatcher::job_dispatch::JobOperation::Upsert,
                 volume_id: 1,
                 file_id: 43,
                 path: missing_input.clone(),
@@ -273,14 +296,20 @@ mod e2e_windows_tests {
             "spawn/join failure does not qualify a real worker exit: {failure:#}"
         );
         let files = std::fs::read_dir(&jobs_dir)?.collect::<std::io::Result<Vec<_>>>()?;
-        ensure!(files.len() == 1, "mixed failed batch must remain recoverable");
+        ensure!(
+            files.len() == 1,
+            "mixed failed batch must remain recoverable"
+        );
         let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
-        ensure!(batch["version"] == 1, "retained batch version changed");
+        ensure!(batch["version"] == 2, "retained batch version changed");
         ensure!(
             batch["jobs"] == serde_json::to_value(&jobs)?,
             "retained mixed batch lost or changed an input"
         );
-        ensure!(!missing_input.exists(), "missing input unexpectedly appeared");
+        ensure!(
+            !missing_input.exists(),
+            "missing input unexpectedly appeared"
+        );
         ensure!(
             std::fs::read_to_string(&input)? == content_token,
             "worker changed the successful input"
@@ -340,7 +369,7 @@ mod e2e_windows_tests {
         let content_token = format!("content{}", Uuid::new_v4().simple());
         std::fs::write(&file_path, format!("hello {content_token} e2e"))?;
         let meta = FileMeta::new(
-            DocKey::from_parts(1, 1),
+            DocKey::from_parts(1, file_reference(&file_path)?),
             1,
             None,
             file_path.file_name().unwrap().to_string_lossy().to_string(),
@@ -463,36 +492,6 @@ mod e2e_windows_tests {
             std::fs::create_dir_all(p)?;
         }
 
-        // Seed content index with one doc.
-        let content_idx = open_or_create(&content_index)?;
-        let mut writer = create_writer(&content_idx, &WriterConfig::default())?;
-        let doc = ContentDoc {
-            key: DocKey::from_parts(1, 1),
-            volume: 1,
-            name: Some("hello.txt".into()),
-            path: Some(r"C:\temp\hello.txt".into()),
-            ext: Some("txt".into()),
-            size: 20,
-            modified: now_ts(),
-            content_lang: Some("en".into()),
-            content: "lorem ipsum ultrasearch content".into(),
-        };
-        add_content_doc(&mut writer, &content_idx.fields, &doc)?;
-        writer.commit()?;
-
-        // Seed meta index via bootstrap option.
-        let meta = FileMeta::new(
-            DocKey::from_parts(1, 1),
-            1,
-            None,
-            "hello.txt".into(),
-            Some(r"C:\temp\hello.txt".into()),
-            20,
-            now_ts(),
-            now_ts(),
-            FileFlags::empty(),
-        );
-
         let mut cfg = core_types::config::AppConfig::default();
         cfg.app.data_dir = data_dir.to_string_lossy().to_string();
         cfg.logging.file = log_dir.join("searchd.log").to_string_lossy().to_string();
@@ -501,6 +500,46 @@ mod e2e_windows_tests {
         cfg.paths.state_dir = state_dir.to_string_lossy().to_string();
         cfg.paths.jobs_dir = jobs_dir.to_string_lossy().to_string();
         cfg.metrics.enabled = false;
+        // Prepare the coordinated generation before adding fixture documents;
+        // startup correctly rebuilds indices that have no durable generation.
+        drop(crate::scanner::initialize_indexes(&cfg)?);
+        let file_path = temp.path().join("hello.txt");
+        std::fs::write(&file_path, "lorem ipsum ultrasearch content")?;
+        let key = DocKey::from_parts(1, file_reference(&file_path)?);
+        let file_size = std::fs::metadata(&file_path)?.len();
+
+        // Seed content index with one doc.
+        let content_idx = open_or_create(&content_index)?;
+        let mut writer = create_writer(&content_idx, &WriterConfig::default())?;
+        let doc = ContentDoc {
+            key,
+            volume: 1,
+            name: Some("hello.txt".into()),
+            path: Some(file_path.to_string_lossy().into_owned()),
+            ext: Some("txt".into()),
+            size: file_size,
+            created: now_ts(),
+            modified: now_ts(),
+            flags: 0,
+            content_lang: Some("en".into()),
+            content: "lorem ipsum ultrasearch content".into(),
+        };
+        add_content_doc(&mut writer, &content_idx.fields, &doc)?;
+        writer.commit()?;
+        drop(writer);
+
+        // Seed meta index via bootstrap option.
+        let meta = FileMeta::new(
+            key,
+            1,
+            None,
+            "hello.txt".into(),
+            Some(file_path.to_string_lossy().into_owned()),
+            file_size,
+            now_ts(),
+            now_ts(),
+            FileFlags::empty(),
+        );
 
         let pipe_name = format!(r"\\.\pipe\ultrasearch-test-{}", Uuid::new_v4());
         let opts = BootstrapOptions {

@@ -26,11 +26,12 @@ use crate::{
     meta_ingest::ingest_with_paths,
     metrics::{init_metrics_from_config, set_global_metrics},
     priority::apply_background_priorities,
-    scanner::{scan_volumes, watch_changes},
+    scanner::{initialize_indexes, watch_changes},
     scheduler_runtime::SchedulerRuntime,
     search_handler::set_search_handler,
     status_provider::{
-        init_basic_status_provider, update_status_last_commit, update_status_volumes,
+        init_basic_status_provider, update_status_ingestion_state, update_status_last_commit,
+        update_status_volumes,
     },
 };
 
@@ -67,16 +68,18 @@ pub fn run_app_with_options(
     let mut cfg_owned = cfg.clone();
     super::ensure_default_volumes(&mut cfg_owned)?;
     ensure_data_paths_exist(&cfg_owned)?;
+    core_types::config::set_current_config(cfg_owned.clone())?;
+    let ingestion = initialize_indexes(&cfg_owned)?;
 
+    let use_journal = opts.initial_metas.is_none() && !opts.skip_initial_ingest;
     match opts.initial_metas {
         Some(metas) => ingest_seed_metadata(&cfg_owned, metas, &mut pending_jobs)?,
         None if opts.skip_initial_ingest => {
             tracing::info!("skip_initial_ingest=true; leaving indices empty");
         }
-        None => {
-            let jobs = scan_volumes(&cfg_owned)?;
-            pending_jobs.extend(jobs);
-        }
+        None => tracing::info!(
+            "MFT reconciliation and journal replay will run on the durable ingestion lane"
+        ),
     }
 
     // Start scheduler loop
@@ -91,63 +94,40 @@ pub fn run_app_with_options(
             "Seeding {} content jobs into scheduler queue",
             pending_jobs.len()
         );
-        scheduler.submit_content_jobs(pending_jobs);
+        scheduler
+            .submit_content_jobs(pending_jobs)
+            .map_err(|rejected| {
+                anyhow::anyhow!(
+                    "seed content queue limit exceeded; {} jobs were not admitted",
+                    rejected.len()
+                )
+            })?;
     }
     rt.spawn(scheduler.run_loop());
 
-    // Start change watcher (USN or noop on unsupported platforms) after scheduler channel exists.
-    let cfg_clone = cfg_owned.clone();
-    rt.spawn(async move {
-        if let Err(e) = watch_changes(cfg_clone).await {
-            tracing::warn!("change watcher exited: {e}");
-        }
-    });
+    // Start after the scheduler exists. Test seeds explicitly opt out of native
+    // discovery; production never substitutes a successful no-op watcher.
+    if use_journal {
+        let cfg_clone = cfg_owned.clone();
+        rt.spawn(async move {
+            if let Err(e) = watch_changes(cfg_clone, ingestion).await {
+                update_status_ingestion_state(format!("stopped: {e:#}"));
+                tracing::error!("change watcher stopped: {e:#}");
+            }
+        });
+    } else {
+        update_status_ingestion_state("native ingestion disabled by test bootstrap options");
+    }
 
     // Try to install unified search handler.
     // We pass both meta and content index paths.
     let meta_path = Path::new(&cfg_owned.paths.meta_index);
     let content_path = Path::new(&cfg_owned.paths.content_index);
 
-    let mut attempts = 0;
-    loop {
-        match crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path) {
-            Ok(handler) => {
-                set_search_handler(Box::new(handler));
-                break;
-            }
-            Err(e) => {
-                // Check if error string contains "corruption" or "corrupted" or similar tantivy errors.
-                // Tantivy errors are opaque via anyhow, so string check is a heuristic.
-                let msg = e.to_string().to_lowercase();
-                let is_corruption =
-                    msg.contains("corrupt") || msg.contains("format") || msg.contains("lock");
-
-                if is_corruption && attempts < 1 {
-                    tracing::warn!(
-                        "Index corruption detected ({}), attempting recovery...",
-                        msg
-                    );
-                    // Rename broken index if it exists
-                    if meta_path.exists() {
-                        let broken = meta_path.with_extension("broken");
-                        let _ = std::fs::rename(meta_path, &broken);
-                        tracing::info!("Renamed corrupt meta index to {:?}", broken);
-                    }
-                    // Content index might be fine, but let's be safe and rename it too if opening failed generally?
-                    // UnifiedSearchHandler tries both. If meta fails, we fail.
-                    // If content fails, we log warning but return handler (in try_new implementation).
-                    // So if try_new returns Err, it's likely meta-index issue or critical content issue.
-                    // Let's wipe both if we can't determine source easily, or just meta.
-                    // For simplicity in this resilience task, we wipe meta.
-                    attempts += 1;
-                    continue;
-                }
-
-                tracing::warn!("unified search handler not initialized: {}", e);
-                break;
-            }
-        }
-    }
+    // Schema migration was completed before starting writers. Do not rename an
+    // index out from under an active worker based on an error-string heuristic.
+    let handler = crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path)?;
+    set_search_handler(Box::new(handler));
 
     #[cfg(target_os = "windows")]
     {

@@ -29,8 +29,9 @@ pub fn set_status_provider(provider: Arc<dyn StatusProvider>) {
 
 /// Initialize and register a BasicStatusProvider; returns the handle for direct updates.
 pub fn init_basic_status_provider() -> Arc<BasicStatusProvider> {
-    let basic = Arc::new(BasicStatusProvider::new());
-    let _ = BASIC_PROVIDER.set(basic.clone());
+    let basic = BASIC_PROVIDER
+        .get_or_init(|| Arc::new(BasicStatusProvider::new()))
+        .clone();
     set_status_provider(basic.clone());
     basic
 }
@@ -66,11 +67,19 @@ pub fn update_status_scheduler_state(state: impl Into<String>) {
     }
 }
 
-pub fn update_status_metrics(metrics: Option<MetricsSnapshot>) {
+/// Ingestion health is independent of idle/load admission. A scheduler heartbeat
+/// must never overwrite an unsupported watcher or a failed durable transaction.
+pub fn update_status_ingestion_state(state: impl Into<String>) {
     if let Some(p) = BASIC_PROVIDER.get()
-        && let Some(m) = metrics
+        && let Ok(mut guard) = p.ingestion_state.write()
     {
-        p.update_metrics(Some(m));
+        *guard = state.into();
+    }
+}
+
+pub fn update_status_metrics(metrics: Option<MetricsSnapshot>) {
+    if let Some(p) = BASIC_PROVIDER.get() {
+        p.update_metrics(metrics);
     }
 }
 
@@ -119,6 +128,7 @@ pub fn update_content_remaining(queue_depth: u64, active_workers: u32) {
 pub struct BasicStatusProvider {
     state: RwLock<StatusSnapshot>,
     avg_content_job_bytes: RwLock<Option<u64>>,
+    ingestion_state: RwLock<String>,
 }
 
 impl BasicStatusProvider {
@@ -135,6 +145,7 @@ impl BasicStatusProvider {
                 content_bytes_remaining: None,
             }),
             avg_content_job_bytes: RwLock::new(None),
+            ingestion_state: RwLock::new("initializing".into()),
         }
     }
 
@@ -151,8 +162,10 @@ impl BasicStatusProvider {
     }
 
     pub fn update_metrics(&self, metrics: Option<MetricsSnapshot>) {
-        if let Ok(mut guard) = self.state.write() {
-            guard.metrics = metrics;
+        if let Some(metrics) = metrics
+            && let Ok(mut guard) = self.state.write()
+        {
+            guard.metrics = Some(metrics);
         }
     }
 
@@ -251,19 +264,27 @@ impl BasicStatusProvider {
 
 impl StatusProvider for BasicStatusProvider {
     fn snapshot(&self) -> StatusSnapshot {
-        self.state
+        let mut snapshot =
+            self.state
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_else(|_| StatusSnapshot {
+                    volumes: Vec::new(),
+                    scheduler_state: "initializing".into(),
+                    metrics: global_metrics_snapshot(Some(0), Some(0), Some(0), Some(0)),
+                    last_index_commit_ts: None,
+                    content_jobs_total: None,
+                    content_jobs_remaining: None,
+                    content_bytes_total: None,
+                    content_bytes_remaining: None,
+                });
+        let ingestion = self
+            .ingestion_state
             .read()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| StatusSnapshot {
-                volumes: Vec::new(),
-                scheduler_state: "initializing".into(),
-                metrics: global_metrics_snapshot(Some(0), Some(0), Some(0), Some(0)),
-                last_index_commit_ts: None,
-                content_jobs_total: None,
-                content_jobs_remaining: None,
-                content_bytes_total: None,
-                content_bytes_remaining: None,
-            })
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| "unavailable: ingestion status lock poisoned".into());
+        snapshot.scheduler_state = format!("{}; ingestion={ingestion}", snapshot.scheduler_state);
+        snapshot
     }
 }
 
@@ -273,7 +294,7 @@ mod tests {
 
     #[test]
     fn queue_state_updates_metrics_fields() {
-        let provider = init_basic_status_provider();
+        let provider = BasicStatusProvider::new();
         provider.update_queue_state(Some(5), Some(2), Some(10), Some(1));
         let snap = provider.snapshot();
         let metrics = snap.metrics.unwrap();
@@ -285,12 +306,26 @@ mod tests {
 
     #[test]
     fn update_metrics_none_does_not_clear_queue_state() {
-        let provider = init_basic_status_provider();
+        let provider = BasicStatusProvider::new();
         provider.update_queue_state(Some(3), Some(1), Some(4), Some(0));
-        update_status_metrics(None);
+        provider.update_metrics(None);
         let snap = provider.snapshot();
         let metrics = snap.metrics.unwrap();
         assert_eq!(metrics.queue_depth, Some(3));
         assert_eq!(metrics.active_workers, Some(1));
+    }
+
+    #[test]
+    fn scheduler_idle_does_not_overwrite_ingestion_failure() {
+        let provider = BasicStatusProvider::new();
+        *provider.ingestion_state.write().unwrap() = "unavailable: USN journal is disabled".into();
+        provider.update_scheduler_state("idle");
+        let snapshot = provider.snapshot();
+        assert!(snapshot.scheduler_state.contains("idle"));
+        assert!(
+            snapshot
+                .scheduler_state
+                .contains("unavailable: USN journal is disabled")
+        );
     }
 }

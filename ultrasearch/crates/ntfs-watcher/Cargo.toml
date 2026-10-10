@@ -10,9 +10,11 @@ description = "NTFS volume discovery and USN journal watching for UltraSearch"
 core-types = { path = "../core-types" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-sysinfo = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
-usn-journal-rs = "*"
+
+[dev-dependencies]
+tempfile = "*"

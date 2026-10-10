@@ -1404,6 +1404,7 @@ dependencies = [
  "anyhow",
  "core-types",
  "tantivy",
+ "tempfile",
  "tracing",
 ]
 
@@ -1546,6 +1547,7 @@ dependencies = [
  "dotenvy",
  "once_cell",
  "serde",
+ "serde_json",
  "toml 0.9.8",
 ]
 
@@ -3628,6 +3630,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tantivy",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "windows 0.52.0",
@@ -4650,10 +4653,10 @@ version = "1.5.1"
 dependencies = [
  "anyhow",
  "core-types",
- "sysinfo 0.37.2",
+ "serde",
+ "tempfile",
  "thiserror 2.0.17",
  "tracing",
- "usn-journal-rs",
  "windows 0.52.0",
 ]
 
@@ -8115,19 +8118,6 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
-]
-
-[[package]]
-name = "usn-journal-rs"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1c6b9a0cee2acc1a75ae6e8cbc711efacf8ce7c7bd8d767ff2554fd9ba6f5bb"
-dependencies = [
- "chrono",
- "log",
- "lru 0.16.2",
- "thiserror 2.0.17",
- "windows 0.61.3",
 ]
 
 [[package]]

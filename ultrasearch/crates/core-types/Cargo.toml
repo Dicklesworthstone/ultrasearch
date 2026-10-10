@@ -13,3 +13,6 @@ anyhow = { workspace = true }
 once_cell = "1.19"
 dotenvy = "0.15"
 toml = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

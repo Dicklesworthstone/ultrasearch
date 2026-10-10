@@ -4,7 +4,7 @@ use crate::{
     ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse, SearchRequest,
     SearchResponse, StatusRequest, StatusResponse, framing,
 };
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,30 +77,30 @@ impl PipeClient {
     }
 
     pub async fn status(&self, req: StatusRequest) -> Result<StatusResponse> {
-        self.request(&req).await
+        self.request(framing::MessageKind::Status, &req).await
     }
 
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse> {
-        self.request(&req).await
+        self.request(framing::MessageKind::Search, &req).await
     }
 
     pub async fn reload_config(&self, req: ReloadConfigRequest) -> Result<ReloadConfigResponse> {
-        self.request(&req).await
+        self.request(framing::MessageKind::ReloadConfig, &req).await
     }
 
     pub async fn rescan(&self, req: RescanRequest) -> Result<RescanResponse> {
-        self.request(&req).await
+        self.request(framing::MessageKind::Rescan, &req).await
     }
 
-    async fn request<Req, Resp>(&self, req: &Req) -> Result<Resp>
+    async fn request<Req, Resp>(&self, kind: framing::MessageKind, req: &Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
     {
         // Serialize payload
         let payload = bincode::serialize(req)?;
-        // Frame it (adds length header)
-        let framed = framing::encode_frame(&payload)?;
+        // Enforce the identity layout version before either peer parses bincode.
+        let framed = framing::encode_frame(&framing::encode_message(kind, &payload)?)?;
 
         let mut attempt = 0;
         let mut last_err: Option<anyhow::Error> = None;
@@ -124,7 +124,12 @@ impl PipeClient {
                 conn.read_exact(&mut len_buf).await?;
                 let resp_len = u32::from_le_bytes(len_buf) as usize;
 
-                if resp_len == 0 || resp_len > MAX_MESSAGE_BYTES {
+                if resp_len == 0 {
+                    bail!(
+                        "incompatible UltraSearch IPC protocol: empty response; update UI and service together"
+                    );
+                }
+                if resp_len > MAX_MESSAGE_BYTES {
                     bail!("invalid response length {}", resp_len);
                 }
 
@@ -132,11 +137,17 @@ impl PipeClient {
                 let mut buf = vec![0u8; resp_len];
                 conn.read_exact(&mut buf).await?;
 
-                // Deserialize directly from the body buffer
-                // (framing::decode_frame expects [header + body], but we already consumed header.
-                // Since we trust the stream logic here, we can skip using decode_frame logic for the buffer check
-                // and just deserialize the body.)
-                let resp: Resp = bincode::deserialize(&buf)?;
+                let (response_kind, payload) = framing::decode_message(&buf)?;
+                ensure!(
+                    response_kind == kind,
+                    "unexpected IPC response kind {response_kind:?}; expected {kind:?}"
+                );
+                let mut cursor = std::io::Cursor::new(payload);
+                let resp: Resp = bincode::deserialize_from(&mut cursor)?;
+                ensure!(
+                    cursor.position() as usize == payload.len(),
+                    "IPC response has trailing bytes"
+                );
                 Ok(resp)
             };
 

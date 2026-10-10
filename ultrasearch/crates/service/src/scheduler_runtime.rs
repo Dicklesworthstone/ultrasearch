@@ -1,21 +1,21 @@
-use crate::dispatcher::job_dispatch::{JobDispatcher, JobSpec};
+use crate::dispatcher::job_dispatch::{IndexBatch, JobDispatcher, JobOperation, JobSpec};
 use crate::scanner;
 use crate::status_provider::{
     increment_content_plan, update_content_remaining, update_status_metrics,
     update_status_queue_state, update_status_scheduler_state,
 };
-use core_types::FileMeta;
 use core_types::config::{AppConfig, ExtractSection};
+use core_types::{FileFlags, FileMeta};
+use parking_lot::Mutex;
 use scheduler::{
     SchedulerConfig, allow_content_jobs, idle::IdleTracker, metrics::SystemLoadSampler,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::task;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Default)]
 struct SchedulerLiveState {
@@ -28,10 +28,34 @@ struct SchedulerLiveState {
 }
 
 static LIVE_STATE: OnceLock<SchedulerLiveState> = OnceLock::new();
-static JOB_SENDER: OnceLock<mpsc::UnboundedSender<JobSpec>> = OnceLock::new();
-static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
+static JOB_SENDER: OnceLock<Mutex<Option<ProducerChannel>>> = OnceLock::new();
 
 const MAX_CONTENT_QUEUE: usize = 100_000;
+const MAX_PENDING_SUBMISSIONS: usize = 256;
+const MAX_INDEX_BATCH_JOBS: usize = 4096;
+
+struct ProducerChannel {
+    runtime_id: uuid::Uuid,
+    sender: mpsc::Sender<Submission>,
+}
+
+enum Submission {
+    Content(JobSpec),
+    IndexBatch(PendingIndexBatch),
+}
+
+struct PendingIndexBatch {
+    batch: IndexBatch,
+    acknowledgement: oneshot::Sender<Result<(), String>>,
+}
+
+fn submission_sender() -> Option<mpsc::Sender<Submission>> {
+    JOB_SENDER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .as_ref()
+        .map(|channel| channel.sender.clone())
+}
 
 /// Runtime wrapper that drives a simple scheduling loop and dispatches content batches.
 pub struct SchedulerRuntime {
@@ -39,7 +63,10 @@ pub struct SchedulerRuntime {
     idle: IdleTracker,
     load: SystemLoadSampler,
     content_jobs: VecDeque<JobSpec>,
-    job_rx: mpsc::UnboundedReceiver<JobSpec>,
+    job_rx: mpsc::Receiver<Submission>,
+    pending_index: Option<PendingIndexBatch>,
+    legacy_retry: Option<IndexBatch>,
+    runtime_id: uuid::Uuid,
     dispatcher: JobDispatcher,
     live: &'static SchedulerLiveState,
     current_volumes: Vec<String>,
@@ -60,17 +87,23 @@ impl SchedulerRuntime {
         };
 
         let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
-        let (tx, rx) = mpsc::unbounded_channel();
-        // Keep a global sender so producers (scanner/USN) can enqueue work from anywhere.
-        let _ = JOB_SENDER.get_or_init(|| tx.clone());
-
-        RUNTIME_ACTIVE.store(true, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(MAX_PENDING_SUBMISSIONS);
+        let runtime_id = uuid::Uuid::new_v4();
+        // Replace a closed runtime's sender on restart. A OnceLock containing
+        // the sender itself would permanently retain the first closed channel.
+        *JOB_SENDER.get_or_init(|| Mutex::new(None)).lock() = Some(ProducerChannel {
+            runtime_id,
+            sender: tx,
+        });
 
         Self {
             idle: IdleTracker::new(config.warm_idle, config.deep_idle),
             load: SystemLoadSampler::new(config.disk_busy_threshold_bps),
             content_jobs: VecDeque::new(),
             job_rx: rx,
+            pending_index: None,
+            legacy_retry: None,
+            runtime_id,
             dispatcher: JobDispatcher::new(app_cfg),
             config,
             live,
@@ -84,17 +117,7 @@ impl SchedulerRuntime {
         if self.current_volumes != app_cfg.volumes {
             tracing::info!("Volume configuration changed, triggering rescan...");
             self.current_volumes = app_cfg.volumes.clone();
-            let cfg_clone = app_cfg.clone();
-
-            // Spawn blocking task to rescan
-            task::spawn_blocking(move || match scanner::scan_volumes(&cfg_clone) {
-                Ok(new_jobs) => {
-                    for job in new_jobs {
-                        enqueue_content_job(job);
-                    }
-                }
-                Err(e) => tracing::error!("Failed to rescan volumes after config update: {}", e),
-            });
+            scanner::request_rescan();
         }
 
         self.config.warm_idle = Duration::from_secs(app_cfg.scheduler.idle_warm_seconds);
@@ -107,17 +130,25 @@ impl SchedulerRuntime {
     }
 
     /// Submit a content indexing job (path + doc ids).
-    pub fn submit_content_job(&mut self, job: JobSpec) {
-        self.push_job(job);
+    pub fn submit_content_job(&mut self, job: JobSpec) -> Result<(), JobSpec> {
+        self.push_job(job)
     }
 
     /// Submit a batch of content indexing jobs.
-    pub fn submit_content_jobs<I>(&mut self, jobs: I)
+    pub fn submit_content_jobs<I>(&mut self, jobs: I) -> Result<(), Vec<JobSpec>>
     where
         I: IntoIterator<Item = JobSpec>,
     {
+        let mut rejected = Vec::new();
         for job in jobs {
-            self.submit_content_job(job);
+            if let Err(job) = self.submit_content_job(job) {
+                rejected.push(job);
+            }
+        }
+        if rejected.is_empty() {
+            Ok(())
+        } else {
+            Err(rejected)
         }
     }
 
@@ -129,10 +160,56 @@ impl SchedulerRuntime {
     fn update_live_counts(&self) {
         self.live
             .content
-            .store(self.content_jobs.len(), Ordering::Relaxed);
+            .store(self.pending_jobs(), Ordering::Relaxed);
         // Metadata/critical queues not implemented yet; keep zero.
         self.live.critical.store(0, Ordering::Relaxed);
         self.live.metadata.store(0, Ordering::Relaxed);
+    }
+
+    fn publish_active_workers(&self) {
+        update_status_queue_state(
+            None,
+            Some(self.live.active_workers.load(Ordering::Relaxed)),
+            None,
+            None,
+        );
+    }
+
+    fn pending_jobs(&self) -> usize {
+        self.content_jobs.len()
+            + self
+                .legacy_retry
+                .as_ref()
+                .map_or(0, |batch| batch.jobs.len())
+            + self
+                .pending_index
+                .as_ref()
+                .map_or(0, |pending| pending.batch.jobs.len())
+    }
+
+    fn receive_submissions(&mut self) {
+        // A durable batch is an ordering barrier. Jobs received after it must
+        // never overwrite its newer update or resurrect a deleted document.
+        if self.pending_index.is_some() {
+            return;
+        }
+        while self.content_jobs.len() < MAX_CONTENT_QUEUE {
+            match self.job_rx.try_recv() {
+                Ok(Submission::Content(job)) => {
+                    // Capacity was checked before receiving, so an accepted
+                    // channel submission cannot disappear at a second queue.
+                    let size_hint = job.file_size;
+                    self.content_jobs.push_back(job);
+                    self.live.enqueued_content.fetch_add(1, Ordering::Relaxed);
+                    increment_content_plan(1, size_hint);
+                }
+                Ok(Submission::IndexBatch(pending)) => {
+                    self.pending_index = Some(pending);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     pub async fn run_loop(mut self) {
@@ -148,17 +225,14 @@ impl SchedulerRuntime {
         let app_cfg = core_types::config::get_current_config();
         self.update_config(&app_cfg);
 
-        // Drain any newly submitted content jobs.
-        while let Ok(job) = self.job_rx.try_recv() {
-            self.push_job(job);
-        }
+        self.receive_submissions();
         self.update_live_counts();
 
         let idle_sample = self.idle.sample();
         let load = self.load.sample();
 
         // Update status snapshot counts + active workers.
-        let ct = self.content_jobs.len();
+        let ct = self.pending_jobs();
         let workers = self.live.active_workers.load(Ordering::Relaxed);
         let dropped = self.live.dropped_content.load(Ordering::Relaxed);
         let enqueued = self.live.enqueued_content.load(Ordering::Relaxed);
@@ -176,21 +250,13 @@ impl SchedulerRuntime {
         update_status_metrics(None);
 
         // Gate metadata/content on policies; we only have content jobs for now.
-        let mut allow_content =
+        let allow_content =
             self.force_allow_content || allow_content_jobs(idle_sample.state, load, &self.config);
-
-        // If backlog is large, override load/idle gates to prevent permanent stalls.
-        let backlog = self.content_jobs.len();
-        if backlog >= (MAX_CONTENT_QUEUE / 2) {
-            allow_content = true;
-            tracing::warn!(
-                "Backlog high ({} jobs, max {}); overriding load gates to drain queue",
-                backlog,
-                MAX_CONTENT_QUEUE
-            );
+        if !allow_content {
+            return;
         }
 
-        if allow_content && !self.content_jobs.is_empty() {
+        if self.legacy_retry.is_none() && !self.content_jobs.is_empty() {
             let batch_size = self
                 .config
                 .content_batch_size
@@ -204,63 +270,104 @@ impl SchedulerRuntime {
                 }
             }
 
-            self.update_live_counts();
+            self.legacy_retry = Some(IndexBatch {
+                id: uuid::Uuid::new_v4(),
+                jobs: batch,
+                reset_volumes: Vec::new(),
+            });
+        }
+
+        if let Some(batch) = self.legacy_retry.as_ref() {
             self.live.active_workers.fetch_add(1, Ordering::Relaxed);
-
-            if let Err(e) = self.dispatcher.spawn_batch(batch).await {
-                tracing::error!("failed to dispatch batch: {e:?}");
-            }
-
+            self.publish_active_workers();
+            let result = self.dispatcher.spawn_index_batch(batch).await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
+            self.publish_active_workers();
+            match result {
+                Ok(()) => self.legacy_retry = None,
+                Err(error) => {
+                    tracing::error!(%error, batch_id = %batch.id, "content batch failed; retaining for retry");
+                }
+            }
+            self.update_live_counts();
+            return;
+        }
+
+        if let Some(pending) = self.pending_index.take() {
+            self.live.active_workers.fetch_add(1, Ordering::Relaxed);
+            self.publish_active_workers();
+            let result = self.dispatcher.spawn_index_batch(&pending.batch).await;
+            self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
+            self.publish_active_workers();
+            if let Err(error) = &result {
+                tracing::error!(%error, batch_id = %pending.batch.id, "journal batch failed; checkpoint remains pending");
+            }
+            // The caller persists journal progress only after this successful
+            // worker exit, which occurs after the worker's index commit.
+            let _ = pending
+                .acknowledgement
+                .send(result.map_err(|error| error.to_string()));
+            self.update_live_counts();
         }
     }
 
-    fn push_job(&mut self, job: JobSpec) {
-        if self.content_jobs.len() >= MAX_CONTENT_QUEUE {
+    fn push_job(&mut self, job: JobSpec) -> Result<(), JobSpec> {
+        if self.content_jobs.len() >= MAX_CONTENT_QUEUE || self.pending_index.is_some() {
             self.live.dropped_content.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 queue_len = self.content_jobs.len(),
                 max = MAX_CONTENT_QUEUE,
-                "content queue full; dropping job for {:?}",
+                "content queue unavailable; returning job for {:?}",
                 job.path
             );
-            return;
+            return Err(job);
         }
         let size_hint = job.file_size;
         self.content_jobs.push_back(job);
         self.live.enqueued_content.fetch_add(1, Ordering::Relaxed);
         increment_content_plan(1, size_hint);
         self.update_live_counts();
+        Ok(())
     }
 }
 
 /// Enqueue a content indexing job for the scheduler loop.
-/// Returns `false` if the scheduler has not been initialized yet.
+/// Returns `false` without accepting the job when unavailable or under backpressure.
 pub fn enqueue_content_job(job: JobSpec) -> bool {
-    if !RUNTIME_ACTIVE.load(Ordering::Relaxed) {
-        tracing::warn!("scheduler not initialized; dropping content job");
-        let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
-        live.dropped_content.fetch_add(1, Ordering::Relaxed);
-        return false;
+    if let Some(sender) = submission_sender()
+        && sender.try_send(Submission::Content(job)).is_ok()
+    {
+        return true;
     }
+    tracing::warn!("scheduler unavailable or full; content job was not accepted");
+    LIVE_STATE
+        .get_or_init(SchedulerLiveState::default)
+        .dropped_content
+        .fetch_add(1, Ordering::Relaxed);
+    false
+}
 
-    match JOB_SENDER.get() {
-        Some(tx) => {
-            if tx.send(job).is_ok() {
-                true
-            } else {
-                let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
-                live.dropped_content.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-        }
-        None => {
-            tracing::warn!("scheduler not initialized; dropping content job");
-            let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
-            live.dropped_content.fetch_add(1, Ordering::Relaxed);
-            false
-        }
-    }
+/// Wait for bounded admission and the worker's durable commit acknowledgement.
+/// The producer must retain its batch and cursor until this returns success.
+pub async fn submit_index_batch(batch: IndexBatch) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        batch.jobs.len() <= MAX_INDEX_BATCH_JOBS,
+        "index batch exceeds the {MAX_INDEX_BATCH_JOBS}-job bound"
+    );
+    let sender = submission_sender()
+        .ok_or_else(|| anyhow::anyhow!("scheduler is not running; index batch remains pending"))?;
+    let (acknowledgement, response) = oneshot::channel();
+    sender
+        .send(Submission::IndexBatch(PendingIndexBatch {
+            batch,
+            acknowledgement,
+        }))
+        .await
+        .map_err(|_| anyhow::anyhow!("scheduler stopped before admitting the index batch"))?;
+    response
+        .await
+        .map_err(|_| anyhow::anyhow!("scheduler stopped before acknowledging the index commit"))?
+        .map_err(anyhow::Error::msg)
 }
 
 /// Utility to let other components set active worker count directly (e.g., worker manager updates).
@@ -279,13 +386,23 @@ pub fn set_live_queue_counts(critical: usize, metadata: usize, content: usize) {
 
 impl Drop for SchedulerRuntime {
     fn drop(&mut self) {
-        RUNTIME_ACTIVE.store(false, Ordering::Relaxed);
+        let mut channel = JOB_SENDER.get_or_init(|| Mutex::new(None)).lock();
+        if channel
+            .as_ref()
+            .is_some_and(|channel| channel.runtime_id == self.runtime_id)
+        {
+            *channel = None;
+        }
     }
 }
 
 /// Convert a `FileMeta` into a `JobSpec` if it looks indexable.
 pub fn content_job_from_meta(meta: &FileMeta, extract: &ExtractSection) -> Option<JobSpec> {
-    if meta.flags.is_dir() {
+    if meta
+        .flags
+        .intersects(FileFlags::IS_DIR | FileFlags::REPARSE | FileFlags::OFFLINE | FileFlags::SYSTEM)
+        || meta.size > extract.max_bytes_per_file
+    {
         return None;
     }
     let path_str = meta.path.as_ref()?;
@@ -301,6 +418,7 @@ pub fn content_job_from_meta(meta: &FileMeta, extract: &ExtractSection) -> Optio
     };
 
     Some(JobSpec {
+        operation: JobOperation::Upsert,
         volume_id: meta.volume,
         file_id,
         path,
@@ -323,9 +441,14 @@ pub fn live_counters() -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::status_provider::init_basic_status_provider;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn dummy_job() -> JobSpec {
         JobSpec {
+            operation: JobOperation::Upsert,
             volume_id: 1,
             file_id: 1,
             path: PathBuf::from("C:\\dummy"),
@@ -336,9 +459,48 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_without_runtime_increments_dropped() {
+    fn content_jobs_preserve_full_identity_and_skip_reparse_or_offline_files() {
+        let key = core_types::DocKey::from_parts(12, 0xfedc_1234_5678_9abc);
+        let mut meta = FileMeta::new(
+            key,
+            key.volume(),
+            None,
+            "document.txt".into(),
+            Some("C:\\document.txt".into()),
+            42,
+            1,
+            2,
+            FileFlags::empty(),
+        );
+        let mut cfg = AppConfig::default();
+        cfg.extract.max_bytes_per_file = 64;
+        let job = content_job_from_meta(&meta, &cfg.extract).expect("regular file is eligible");
+        assert_eq!(job.file_id, key.file_id());
+        assert_eq!(job.volume_id, key.volume());
+        for flag in [
+            FileFlags::IS_DIR,
+            FileFlags::REPARSE,
+            FileFlags::OFFLINE,
+            FileFlags::SYSTEM,
+        ] {
+            meta.flags = flag;
+            assert!(content_job_from_meta(&meta, &cfg.extract).is_none());
+        }
+        meta.flags = FileFlags::empty();
+        meta.size = 64;
+        assert!(content_job_from_meta(&meta, &cfg.extract).is_some());
+        meta.size = 65;
+        assert!(content_job_from_meta(&meta, &cfg.extract).is_none());
+        meta.size = 42;
+        meta.path = None;
+        assert!(content_job_from_meta(&meta, &cfg.extract).is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_runtime_increments_dropped() {
+        let _guard = TEST_LOCK.lock().await;
         // Ensure we start from a clean slate in case another test initialized the runtime.
-        RUNTIME_ACTIVE.store(false, Ordering::Relaxed);
+        *JOB_SENDER.get_or_init(|| Mutex::new(None)).lock() = None;
         let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
         live.dropped_content.store(0, Ordering::Relaxed);
 
@@ -349,17 +511,142 @@ mod tests {
         assert!(after > before, "dropped counter should increase");
     }
 
-    #[test]
-    fn submit_content_job_increments_enqueued_counter() {
+    #[tokio::test]
+    async fn submit_content_job_increments_enqueued_counter() {
+        let _guard = TEST_LOCK.lock().await;
         // Initialize status provider once for metric updates (harmless if already set).
         let _ = init_basic_status_provider();
         let cfg = AppConfig::default();
         let mut rt = SchedulerRuntime::new(&cfg);
 
         let before = live_counters().0;
-        rt.submit_content_job(dummy_job());
+        rt.submit_content_job(dummy_job()).expect("queue available");
         rt.update_live_counts();
         let after = live_counters().0;
         assert_eq!(after, before + 1, "enqueued counter should increase");
+    }
+
+    #[tokio::test]
+    async fn durable_batch_preserves_order_between_legacy_jobs() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut runtime = SchedulerRuntime::new(&AppConfig::default());
+        let sender = submission_sender().expect("runtime publishes sender");
+        let mut before = dummy_job();
+        before.file_id = 10;
+        let mut after = dummy_job();
+        after.file_id = 30;
+        let (acknowledgement, mut response) = oneshot::channel();
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![JobSpec {
+                operation: JobOperation::Delete,
+                file_id: 20,
+                ..dummy_job()
+            }],
+            reset_volumes: Vec::new(),
+        };
+        sender.try_send(Submission::Content(before)).ok().unwrap();
+        sender
+            .try_send(Submission::IndexBatch(PendingIndexBatch {
+                batch: batch.clone(),
+                acknowledgement,
+            }))
+            .ok()
+            .unwrap();
+        sender.try_send(Submission::Content(after)).ok().unwrap();
+
+        runtime.receive_submissions();
+        assert_eq!(runtime.content_jobs.len(), 1);
+        assert_eq!(runtime.content_jobs[0].file_id, 10);
+        assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
+        assert_eq!(runtime.job_rx.len(), 1);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Draining another tick cannot move the newer job before the delete.
+        runtime.receive_submissions();
+        assert_eq!(runtime.content_jobs.len(), 1);
+        assert_eq!(runtime.job_rx.len(), 1);
+        drop(runtime);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_admission_waits_and_shutdown_never_acknowledges_commit() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut runtime = SchedulerRuntime::new(&AppConfig::default());
+        for _ in 0..MAX_PENDING_SUBMISSIONS {
+            assert!(enqueue_content_job(dummy_job()));
+        }
+        assert!(!enqueue_content_job(dummy_job()));
+
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![dummy_job()],
+            reset_volumes: Vec::new(),
+        };
+        let mut submission = Box::pin(submit_index_batch(batch));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        assert_eq!(runtime.job_rx.len(), MAX_PENDING_SUBMISSIONS);
+
+        runtime.receive_submissions();
+        assert_eq!(runtime.content_jobs.len(), MAX_PENDING_SUBMISSIONS);
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        runtime.receive_submissions();
+        assert!(runtime.pending_index.is_some());
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        drop(runtime);
+        assert!(submission.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_restart_replaces_sender_and_old_drop_preserves_new_runtime() {
+        let _guard = TEST_LOCK.lock().await;
+        let first = SchedulerRuntime::new(&AppConfig::default());
+        let mut second = SchedulerRuntime::new(&AppConfig::default());
+        drop(first);
+        assert!(enqueue_content_job(dummy_job()));
+        second.receive_submissions();
+        assert_eq!(second.content_jobs.len(), 1);
+        drop(second);
+        assert!(!enqueue_content_job(dummy_job()));
+    }
+
+    #[tokio::test]
+    async fn full_internal_queue_retains_already_accepted_channel_job() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut runtime = SchedulerRuntime::new(&AppConfig::default());
+        runtime.content_jobs.resize(MAX_CONTENT_QUEUE, dummy_job());
+        let mut accepted = dummy_job();
+        accepted.file_id = 99;
+        assert!(enqueue_content_job(accepted));
+        runtime.receive_submissions();
+        assert_eq!(runtime.job_rx.len(), 1);
+        assert_eq!(runtime.content_jobs.len(), MAX_CONTENT_QUEUE);
+        runtime.content_jobs.pop_front();
+        runtime.receive_submissions();
+        assert!(runtime.job_rx.is_empty());
+        assert_eq!(runtime.content_jobs.len(), MAX_CONTENT_QUEUE);
+        assert_eq!(runtime.content_jobs.back().unwrap().file_id, 99);
+    }
+
+    #[tokio::test]
+    async fn oversized_durable_batch_is_rejected_before_admission() {
+        let _guard = TEST_LOCK.lock().await;
+        let runtime = SchedulerRuntime::new(&AppConfig::default());
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![dummy_job(); MAX_INDEX_BATCH_JOBS + 1],
+            reset_volumes: Vec::new(),
+        };
+        let error = submit_index_batch(batch).await.unwrap_err();
+        assert!(error.to_string().contains("4096-job bound"));
+        assert!(runtime.job_rx.is_empty());
     }
 }

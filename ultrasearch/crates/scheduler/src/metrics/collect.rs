@@ -166,7 +166,7 @@ impl SystemLoadSampler {
             let secs = elapsed.as_secs_f64().max(0.001);
             let bytes_per_sec = (delta_bytes as f64 / secs) as u64;
             let busy = bytes_per_sec >= self.disk_busy_threshold_bps;
-            return (bytes_per_sec, busy);
+            (bytes_per_sec, busy)
         }
     }
     fn sample_power(&self) -> bool {

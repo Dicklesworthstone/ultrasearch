@@ -27,3 +27,6 @@ mimalloc = "0.1.48"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+
+[dev-dependencies]
+tempfile = "*"

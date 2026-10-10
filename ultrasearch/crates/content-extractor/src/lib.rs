@@ -7,6 +7,7 @@
 use anyhow::Result;
 use core_types::DocKey;
 use std::fs;
+use std::io::{Read, Seek};
 use std::path::Path;
 use tracing::instrument;
 
@@ -52,6 +53,21 @@ pub trait Extractor {
     fn name(&self) -> &'static str;
     fn supports(&self, ctx: &ExtractContext) -> bool;
     fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError>;
+
+    /// Extract from an already verified file identity. Implementations must
+    /// read this handle instead of reopening `ctx.path`, which may have changed.
+    /// Path-only backends explicitly decline this contract.
+    fn extract_file(
+        &self,
+        _ctx: &ExtractContext,
+        _key: DocKey,
+        _file: &fs::File,
+    ) -> Result<ExtractedContent, ExtractError> {
+        Err(ExtractError::Unsupported(format!(
+            "{} does not support extraction from a verified file handle",
+            self.name()
+        )))
+    }
 }
 
 /// Ordered stack of extractors with first-win semantics.
@@ -105,6 +121,24 @@ impl ExtractorStack {
         let ext = resolve_ext(ctx).unwrap_or_else(|| "unknown".to_string());
         Err(anyhow::anyhow!(ExtractError::Unsupported(ext)))
     }
+
+    /// Preserve the caller's file identity through backend selection and reads.
+    /// A path-only backend cannot fall back to an unverified pathname here.
+    #[instrument(skip(self, ctx, file))]
+    pub fn extract_file(
+        &self,
+        key: DocKey,
+        ctx: &ExtractContext,
+        file: &fs::File,
+    ) -> Result<ExtractedContent> {
+        for backend in &self.backends {
+            if backend.supports(ctx) {
+                return backend.extract_file(ctx, key, file).map_err(Into::into);
+            }
+        }
+        let ext = resolve_ext(ctx).unwrap_or_else(|| "unknown".to_string());
+        Err(anyhow::anyhow!(ExtractError::Unsupported(ext)))
+    }
 }
 
 /// Minimal placeholder extractor that returns empty text; used until real
@@ -131,6 +165,16 @@ impl Extractor for NoopExtractor {
             bytes_processed: used,
         })
     }
+
+    fn extract_file(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        _file: &fs::File,
+    ) -> Result<ExtractedContent, ExtractError> {
+        // This backend produces no content and does not read a pathname.
+        self.extract(ctx, key)
+    }
 }
 
 /// Plain-text extractor for lightweight formats (txt/log/rs/toml/json/md).
@@ -154,7 +198,19 @@ impl Extractor for SimpleTextExtractor {
 
     fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
         let path = Path::new(ctx.path);
-        let meta = fs::metadata(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        let file = fs::File::open(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        self.extract_file(ctx, key, &file)
+    }
+
+    fn extract_file(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        file: &fs::File,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let meta = file
+            .metadata()
+            .map_err(|e| ExtractError::Failed(e.to_string()))?;
         let max_bytes = ctx.max_bytes as u64;
         if meta.len() > max_bytes {
             return Err(ExtractError::FileTooLarge {
@@ -163,7 +219,14 @@ impl Extractor for SimpleTextExtractor {
             });
         }
 
-        let data = fs::read(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        // The file can grow after metadata() (notably an active log). Bound the
+        // actual read as well, rather than allowing fs::read to allocate until
+        // a moving EOF before the worker can reject its changed snapshot.
+        let mut source = file;
+        source
+            .rewind()
+            .map_err(|e| ExtractError::Failed(e.to_string()))?;
+        let data = read_bounded(source, ctx.max_bytes)?;
         if is_probably_binary(&data) {
             return Err(ExtractError::Unsupported("binary".into()));
         }
@@ -180,6 +243,21 @@ impl Extractor for SimpleTextExtractor {
             bytes_processed: used_bytes,
         })
     }
+}
+
+fn read_bounded(source: impl Read, max_bytes: usize) -> Result<Vec<u8>, ExtractError> {
+    let mut data = Vec::with_capacity(max_bytes.min(64 * 1024));
+    source
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|e| ExtractError::Failed(e.to_string()))?;
+    if data.len() > max_bytes {
+        return Err(ExtractError::FileTooLarge {
+            bytes: data.len() as u64,
+            max_bytes: max_bytes as u64,
+        });
+    }
+    Ok(data)
 }
 
 /// Enforce both byte and char limits on an in-memory string.
@@ -312,6 +390,45 @@ mod tests {
     }
 
     #[test]
+    fn verified_handle_extraction_explicitly_rejects_path_only_backends() {
+        struct PathOnly;
+        impl Extractor for PathOnly {
+            fn name(&self) -> &'static str {
+                "path-only"
+            }
+            fn supports(&self, _: &ExtractContext) -> bool {
+                true
+            }
+            fn extract(
+                &self,
+                ctx: &ExtractContext,
+                key: DocKey,
+            ) -> Result<ExtractedContent, ExtractError> {
+                NoopExtractor.extract(ctx, key)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.txt");
+        fs::write(&path, "input").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let ctx = ExtractContext {
+            path: path.to_str().unwrap(),
+            max_bytes: 1024,
+            max_chars: 1024,
+            ext_hint: Some("txt"),
+            mime_hint: None,
+        };
+        let key = DocKey::from_parts(1, 42);
+        let stack = ExtractorStack::new(vec![Box::new(PathOnly), Box::new(NoopExtractor)]);
+        assert_eq!(stack.extract(key, &ctx).unwrap().key, key);
+        let error = stack.extract_file(key, &ctx, &file).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExtractError>(),
+            Some(ExtractError::Unsupported(reason)) if reason.contains("verified file handle")
+        ));
+    }
+
+    #[test]
     fn enforce_limits_truncates_on_chars() {
         let s = "abcdef";
         let ctx = ExtractContext {
@@ -413,6 +530,48 @@ mod tests {
                 bytes: 10,
                 max_bytes: 5
             }
+        ));
+    }
+
+    #[test]
+    fn bounded_read_rejects_growth_after_metadata_without_reading_the_rest() {
+        use std::io::{Seek, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.log");
+        fs::write(&path, b"small").unwrap();
+        let mut reader = fs::File::open(&path).unwrap();
+        assert!(reader.metadata().unwrap().len() <= 8);
+
+        // Deterministically place the growth between the successful initial
+        // size check and the read, without relying on a racing writer thread.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'x'; 4096])
+            .unwrap();
+        let error = read_bounded(&mut reader, 8).unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractError::FileTooLarge {
+                bytes: 9,
+                max_bytes: 8
+            }
+        ));
+        assert_eq!(reader.stream_position().unwrap(), 9);
+        assert_eq!(reader.metadata().unwrap().len(), 4101);
+    }
+
+    #[test]
+    fn bounded_read_accepts_exact_limit_and_handles_zero_budget() {
+        assert_eq!(read_bounded(&b"exact"[..], 5).unwrap(), b"exact");
+        assert!(read_bounded(&b""[..], 0).unwrap().is_empty());
+        assert!(matches!(
+            read_bounded(&b"x"[..], 0),
+            Err(ExtractError::FileTooLarge {
+                bytes: 1,
+                max_bytes: 0
+            })
         ));
     }
 

@@ -406,6 +406,18 @@ pub fn get_current_config() -> AppConfig {
     CONFIG.read().expect("config lock poisoned").clone()
 }
 
+/// Publish the effective startup configuration to runtime consumers without
+/// reloading or writing a configuration file. Validate before replacing it so
+/// rejected changes leave the running configuration intact.
+pub fn set_current_config(cfg: AppConfig) -> Result<()> {
+    cfg.validate()?;
+    let mut lock = CONFIG
+        .write()
+        .map_err(|_| anyhow::anyhow!("config lock poisoned"))?;
+    *lock = cfg;
+    Ok(())
+}
+
 /// Load configuration from .env and a TOML file (default: `config/config.toml`).
 ///
 /// Returns a clone of the current configuration.
@@ -599,6 +611,27 @@ mod tests {
         cfg.features.delta_index = true;
         cfg.features.multi_tier_index = true;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn effective_config_updates_memory_and_rejects_invalid_changes() {
+        let original = get_current_config();
+        let mut configured = AppConfig::default();
+        configured.paths.meta_index = "explicit-startup-index".into();
+        set_current_config(configured.clone()).unwrap();
+        assert_eq!(
+            get_current_config().paths.meta_index,
+            "explicit-startup-index"
+        );
+
+        configured.features.delta_index = true;
+        configured.features.multi_tier_index = false;
+        assert!(set_current_config(configured).is_err());
+        assert_eq!(
+            get_current_config().paths.meta_index,
+            "explicit-startup-index"
+        );
+        set_current_config(original).unwrap();
     }
 
     #[test]
