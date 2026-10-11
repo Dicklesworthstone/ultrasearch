@@ -32,9 +32,24 @@ pub enum FileEvent {
         from: DocKey,
         to: FileMeta,
     },
+    /// An ordinary directory rename can invalidate descendants without giving
+    /// them individual USN records. Both rename halves retain their recorded
+    /// parent and name; these are historical components, not a resolved path.
+    /// `current` is the directory's latest identity-checked metadata, or None
+    /// when the record proves deletion or that full identity no longer exists.
+    /// Reconcile affected descendants before replacing the directory itself,
+    /// retaining indexed path anchors until every bounded page is committed.
+    /// This event survives exclusions so moves into service-owned directories
+    /// still remove previously indexed descendants.
+    DirectoryRenamed {
+        doc: DocKey,
+        parent: DocKey,
+        name: String,
+        current: Option<FileMeta>,
+    },
     AttributesChanged(FileMeta),
-    /// A directory path change also changes descendants, which need not have
-    /// their own USN records. Reconcile the volume from a new pre-scan cursor.
+    /// Directory link/reparse history cannot be resolved as an ordinary rename.
+    /// Reconcile the volume from a new pre-scan cursor.
     RescanRequired {
         doc: DocKey,
     },
@@ -381,6 +396,54 @@ pub fn canonical_path(_path: &std::path::Path) -> Result<String, NtfsError> {
     Err(NtfsError::NotSupported)
 }
 
+/// Resolve one bounded set of full file identities to their current metadata.
+/// Results preserve input order. A missing identity or currently excluded path
+/// produces None; access failures and other unresolved state return an error
+/// for the entire batch. No cursor is advanced by this read-only operation.
+///
+/// The caller must bind `volume` to the saved cursor's GUID. The same volume
+/// handle validates journal identity and retention before and after resolution;
+/// a gap requires a fresh baseline. Parent identities are left unknown because
+/// these probes have no historical parent record. Callers must commit each page
+/// before resolving another, including descendant repairs after a rename.
+#[cfg(windows)]
+pub fn resolve_file_ids(
+    volume: &VolumeInfo,
+    cursor: JournalCursor,
+    keys: &[DocKey],
+    config: &ReaderConfig,
+) -> Result<Vec<Option<FileMeta>>, NtfsError> {
+    journal::validate_file_ids(volume.id, keys, config)?;
+    let handle = open_volume_handle(volume)?;
+    journal::validate_cursor(cursor, native::query_state(&handle)?)?;
+    let resolved = journal::resolve_file_ids(volume.id, keys, config, |key| {
+        native::resolve_metadata(
+            &handle,
+            volume.id,
+            &journal::Record {
+                frn: key.file_id(),
+                parent_frn: 0,
+                usn: cursor.last_usn,
+                reason: 0,
+                attributes: 0,
+                name: String::new(),
+            },
+        )
+    })?;
+    journal::validate_cursor(cursor, native::query_state(&handle)?)?;
+    Ok(resolved)
+}
+
+#[cfg(not(windows))]
+pub fn resolve_file_ids(
+    _volume: &VolumeInfo,
+    _cursor: JournalCursor,
+    _keys: &[DocKey],
+    _config: &ReaderConfig,
+) -> Result<Vec<Option<FileMeta>>, NtfsError> {
+    Err(NtfsError::NotSupported)
+}
+
 /// Capture the current journal identity and end position **before** an MFT
 /// scan. Replaying from this cursor afterward covers changes during the scan.
 #[cfg(windows)]
@@ -664,7 +727,12 @@ mod journal {
         let mut events = Vec::with_capacity(records.len());
         for record in records {
             if let Some(event) = event_from_record(volume, &record, || metadata(&record))? {
-                if excluded(&record, &event)? {
+                // An excluded destination cannot erase a rename's historical
+                // path anchors: previously indexed descendants still need
+                // removal. The service resolves exclusions during repair.
+                if !matches!(&event, FileEvent::DirectoryRenamed { .. })
+                    && excluded(&record, &event)?
+                {
                     events.push(FileEvent::Excluded {
                         doc: DocKey::from_parts(volume, record.frn),
                         is_dir: record.attributes & ATTRIBUTE_DIRECTORY != 0,
@@ -684,11 +752,11 @@ mod journal {
     ) -> Result<Option<FileEvent>, NtfsError> {
         let doc = DocKey::from_parts(volume, record.frn);
         let directory = record.attributes & ATTRIBUTE_DIRECTORY != 0;
+        let directory_rename =
+            directory && record.reason & (REASON_RENAME_OLD | REASON_RENAME_NEW) != 0;
         if directory
-            && (record.reason
-                & (REASON_RENAME_OLD | REASON_RENAME_NEW | REASON_HARD_LINK | REASON_REPARSE)
-                != 0
-                || (record.reason & REASON_DELETE != 0
+            && (record.reason & (REASON_HARD_LINK | REASON_REPARSE) != 0
+                || ((directory_rename || record.reason & REASON_DELETE != 0)
                     && record.attributes & ATTRIBUTE_REPARSE != 0))
         {
             return Ok(Some(FileEvent::RescanRequired { doc }));
@@ -700,28 +768,54 @@ mod journal {
         // directory's tombstone must not reset an otherwise valid volume scan.
         // Keep structural/reparse histories conservative in the branch above.
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw
-        if record.reason & REASON_DELETE != 0 {
+        if !directory_rename && record.reason & REASON_DELETE != 0 {
             return Ok(Some(FileEvent::Deleted(doc)));
         }
         let indexed_reasons =
             REASON_CREATE | REASON_RENAME_NEW | REASON_CONTENT | REASON_ATTRIBUTES;
-        if record.reason & indexed_reasons == 0 {
-            // A lone OLD_NAME is completed by NEW_NAME, even across ticks.
+        if !directory_rename && record.reason & indexed_reasons == 0 {
+            // A file's lone OLD_NAME is completed by NEW_NAME across ticks.
+            // A directory's OLD_NAME must retain its descendant path anchor.
             // CLOSE alone, without an accumulated reason, changes no state.
             return Ok(None);
         }
-        let Some(meta) = metadata()? else {
+        let current = if record.reason & REASON_DELETE != 0 {
+            None
+        } else {
+            metadata()?
+        };
+        if let Some(meta) = &current {
+            validate_metadata_identity(meta, doc)?;
+        }
+        if directory_rename {
+            if let Some(meta) = &current {
+                if !meta.flags.contains(core_types::FileFlags::IS_DIR) {
+                    return Err(NtfsError::Journal(
+                        "resolved directory identity is not a directory".into(),
+                    ));
+                }
+                if meta.flags.contains(core_types::FileFlags::REPARSE) {
+                    return Ok(Some(FileEvent::RescanRequired { doc }));
+                }
+            }
+            // Rename records carry old/new parent and name components, while
+            // OpenFileById observes the current namespace. Preserve both; do
+            // not invent a historical path from a parent's present-day path.
+            // https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-usn_record_v2
+            return Ok(Some(FileEvent::DirectoryRenamed {
+                doc,
+                parent: DocKey::from_parts(volume, record.parent_frn),
+                name: record.name.clone(),
+                current,
+            }));
+        }
+        let Some(meta) = current else {
             // The record may outlive its file. Missing metadata means the full
             // identity no longer resolves, not that access happened to fail.
             // Access failures remain errors so this cursor cannot silently
             // discard a still-existing file or rely on another security event.
             return Ok(Some(FileEvent::Deleted(doc)));
         };
-        if meta.key != doc || meta.volume != volume {
-            return Err(NtfsError::Journal(
-                "resolved metadata identity does not match journal record".into(),
-            ));
-        }
         if record.reason & REASON_RENAME_NEW != 0 {
             Ok(Some(FileEvent::Renamed {
                 from: doc,
@@ -734,6 +828,63 @@ mod journal {
         } else {
             Ok(Some(FileEvent::AttributesChanged(meta)))
         }
+    }
+
+    fn validate_metadata_identity(meta: &FileMeta, key: DocKey) -> Result<(), NtfsError> {
+        if meta.key != key || meta.volume != key.volume() {
+            return Err(NtfsError::Journal(
+                "resolved metadata identity does not match requested file reference".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_file_ids(
+        volume: VolumeId,
+        keys: &[DocKey],
+        config: &ReaderConfig,
+    ) -> Result<(), NtfsError> {
+        config.validate()?;
+        if keys.len() > config.max_records_per_tick {
+            return Err(NtfsError::Journal(
+                "file identity resolution exceeds the record limit".into(),
+            ));
+        }
+        if keys.iter().any(|key| key.volume() != volume) {
+            return Err(NtfsError::Journal(
+                "file identity resolution spans multiple volumes".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn resolve_file_ids(
+        volume: VolumeId,
+        keys: &[DocKey],
+        config: &ReaderConfig,
+        mut metadata: impl FnMut(DocKey) -> Result<Option<FileMeta>, NtfsError>,
+    ) -> Result<Vec<Option<FileMeta>>, NtfsError> {
+        validate_file_ids(volume, keys, config)?;
+        let mut resolved = Vec::with_capacity(keys.len());
+        for &key in keys {
+            let Some(mut meta) = metadata(key)? else {
+                resolved.push(None);
+                continue;
+            };
+            validate_metadata_identity(&meta, key)?;
+            let path = meta.path.as_deref().ok_or_else(|| {
+                NtfsError::Journal("resolved file identity has no current path".into())
+            })?;
+            if excluded_path(path, &config.exclude_paths) {
+                resolved.push(None);
+            } else {
+                // The identity probe has no USN parent record. Do not expose
+                // its placeholder as a real parent in descendant metadata.
+                meta.parent = None;
+                resolved.push(Some(meta));
+            }
+        }
+        Ok(resolved)
     }
 }
 
@@ -1226,6 +1377,7 @@ mod native {
             | FileEvent::Modified(meta)
             | FileEvent::AttributesChanged(meta)
             | FileEvent::Renamed { to: meta, .. } => Some(meta),
+            FileEvent::DirectoryRenamed { .. } => return Ok(false),
             FileEvent::Deleted(_)
             | FileEvent::RescanRequired { .. }
             | FileEvent::Excluded { .. } => None,
@@ -2395,13 +2547,316 @@ mod tests {
     }
 
     #[test]
-    fn directory_structural_changes_still_require_descendant_reconciliation() {
+    fn directory_rename_history_survives_bounded_replay_and_excluded_destinations() {
+        let frn = 0xABCD_0000_0000_0040;
+        let old_parent = 0x1234_0000_0000_0020;
+        let new_parent = 0x5678_0000_0000_0030;
+        let mut records = [
+            record(128, frn, journal::REASON_RENAME_OLD, "original"),
+            record(256, frn, journal::REASON_RENAME_NEW, "intermediate"),
+            record(384, frn, journal::REASON_RENAME_OLD, "intermediate"),
+            record(
+                512,
+                frn,
+                journal::REASON_RENAME_NEW | journal::REASON_CLOSE,
+                "final",
+            ),
+        ];
+        for (index, record) in records.iter_mut().enumerate() {
+            record.parent_frn = if index == 0 { old_parent } else { new_parent };
+            record.attributes = journal::ATTRIBUTE_DIRECTORY;
+        }
+        let mut current = resolved_meta(&records[3]);
+        current.flags = FileFlags::IS_DIR;
+        current.path = Some(r"\\?\Volume{fixture}\service-output\final".into());
+        let expected: Vec<_> = records
+            .iter()
+            .map(|record| FileEvent::DirectoryRenamed {
+                doc: current.key,
+                parent: DocKey::from_parts(42, record.parent_frn),
+                name: record.name.clone(),
+                current: Some(current.clone()),
+            })
+            .collect();
+
+        // Each replay sees the latest namespace, not a fabricated intermediate
+        // pathname. Historical components survive one-record ticks and retain
+        // both parents even when the final destination is excluded.
+        for budget in [1, 2, 3] {
+            for _ in 0..2 {
+                let mut position = cursor(128);
+                let mut observed = Vec::new();
+                while observed.len() < records.len() {
+                    let remaining = &records[observed.len()..];
+                    let (events, next) = journal::resolve_batch(
+                        42,
+                        &encoded_batch(640, remaining),
+                        position,
+                        budget,
+                        |_| Ok(Some(current.clone())),
+                        |_, _| panic!("directory repair anchors must bypass exclusion filtering"),
+                    )
+                    .unwrap();
+                    assert_eq!(events.len(), remaining.len().min(budget));
+                    assert!(next.last_usn > position.last_usn);
+                    assert_eq!(next.journal_id, position.journal_id);
+                    observed.extend(events);
+                    position = next;
+                }
+                assert_eq!(observed, expected);
+                assert_eq!(position, cursor(640));
+            }
+        }
+        let (new_half, next) = journal::resolve_batch(
+            42,
+            &encoded_batch(640, &records[1..]),
+            cursor(256),
+            1,
+            |_| Ok(Some(current.clone())),
+            |_, _| panic!("a separately read new half still needs descendant repair"),
+        )
+        .unwrap();
+        assert_eq!(new_half, expected[1..2]);
+        assert_eq!(next, cursor(384));
+    }
+
+    #[test]
+    fn missing_or_deleted_renamed_directories_retain_descendant_anchors() {
         for reason in [
             journal::REASON_RENAME_OLD,
             journal::REASON_RENAME_NEW,
+            journal::REASON_RENAME_OLD | journal::REASON_RENAME_NEW | journal::REASON_CLOSE,
+            journal::REASON_DELETE | journal::REASON_RENAME_NEW | journal::REASON_CLOSE,
+        ] {
+            let mut change = record(128, 0xFEDC_0000_0000_0040, reason, "gone-directory");
+            change.attributes = journal::ATTRIBUTE_DIRECTORY;
+            assert_eq!(
+                journal::event_from_record(42, &change, || {
+                    assert_eq!(reason & journal::REASON_DELETE, 0);
+                    Ok(None)
+                })
+                .unwrap(),
+                Some(FileEvent::DirectoryRenamed {
+                    doc: DocKey::from_parts(42, change.frn),
+                    parent: DocKey::from_parts(42, change.parent_frn),
+                    name: "gone-directory".into(),
+                    current: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn inaccessible_directory_rename_replays_without_acknowledging_a_prefix() {
+        let before = record(128, 10, journal::REASON_CREATE, "before.txt");
+        let mut rename = record(256, 11, journal::REASON_RENAME_OLD, "old-directory");
+        rename.attributes = journal::ATTRIBUTE_DIRECTORY;
+        let after = record(384, 12, journal::REASON_CREATE, "after.txt");
+        let records = [before, rename, after];
+        let bytes = encoded_batch(512, &records);
+        let mut probes = Vec::new();
+        let failed = journal::resolve_batch(
+            42,
+            &bytes,
+            cursor(128),
+            2,
+            |record| {
+                probes.push(record.frn);
+                if record.frn == 11 {
+                    Err(NtfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "directory metadata denied",
+                    )))
+                } else {
+                    Ok(Some(resolved_meta(record)))
+                }
+            },
+            |_, _| Ok(false),
+        );
+        assert!(matches!(failed, Err(NtfsError::Io(_))));
+        assert_eq!(probes, [10, 11]);
+
+        let mut current = resolved_meta(&records[1]);
+        current.flags = FileFlags::IS_DIR;
+        current.name = "new-directory".into();
+        current.path = Some(r"\\?\Volume{fixture}\new-directory".into());
+        let (replayed, next) = journal::resolve_batch(
+            42,
+            &bytes,
+            cursor(128),
+            2,
+            |record| {
+                Ok(Some(if record.frn == 11 {
+                    current.clone()
+                } else {
+                    resolved_meta(record)
+                }))
+            },
+            |_, _| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(
+            replayed,
+            [
+                FileEvent::Created(resolved_meta(&records[0])),
+                FileEvent::DirectoryRenamed {
+                    doc: current.key,
+                    parent: DocKey::from_parts(42, records[1].parent_frn),
+                    name: "old-directory".into(),
+                    current: Some(current),
+                },
+            ]
+        );
+        assert_eq!(next, cursor(384));
+    }
+
+    #[test]
+    fn identity_resolution_rejects_unbounded_or_cross_volume_work_before_probing() {
+        let config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 2,
+            ..ReaderConfig::default()
+        };
+        let keys = [
+            DocKey::from_parts(42, 10),
+            DocKey::from_parts(42, 11),
+            DocKey::from_parts(42, 12),
+        ];
+        assert!(
+            journal::resolve_file_ids(42, &keys, &config, |_| panic!("over-budget probe")).is_err()
+        );
+        assert!(
+            journal::resolve_file_ids(
+                42,
+                &[keys[0], DocKey::from_parts(43, 11)],
+                &config,
+                |_| panic!("cross-volume probe"),
+            )
+            .is_err()
+        );
+        assert!(
+            journal::resolve_file_ids(
+                42,
+                &keys[..1],
+                &ReaderConfig {
+                    max_records_per_tick: 0,
+                    ..config.clone()
+                },
+                |_| panic!("invalid configuration probe"),
+            )
+            .is_err()
+        );
+        assert!(
+            journal::resolve_file_ids(42, &[], &config, |_| panic!("empty batch probe"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn descendant_resolution_keeps_identity_and_purges_missing_or_excluded_paths() {
+        let records = [
+            record(128, 0x1111_0000_0000_0020, 0, "visible.txt"),
+            record(256, 0x2222_0000_0000_0020, 0, "gone.txt"),
+            record(384, 0x3333_0000_0000_0020, 0, "excluded.txt"),
+            record(512, 0x4444_0000_0000_0020, 0, "sibling.txt"),
+        ];
+        let keys: Vec<_> = records
+            .iter()
+            .map(|record| DocKey::from_parts(42, record.frn))
+            .collect();
+        let config = ReaderConfig {
+            max_records_per_tick: 4,
+            exclude_paths: vec![r"\\?\Volume{fixture}\service".into()],
+            ..ReaderConfig::default()
+        };
+        let mut visible = resolved_meta(&records[0]);
+        visible.path = Some(r"\\?\Volume{fixture}\new-directory\visible.txt".into());
+        let mut excluded = resolved_meta(&records[2]);
+        excluded.path = Some(r"\\?\Volume{fixture}\SERVICE\excluded.txt".into());
+        let mut sibling = resolved_meta(&records[3]);
+        sibling.path = Some(r"\\?\Volume{fixture}\service-sibling\sibling.txt".into());
+        let current = [
+            Some(visible.clone()),
+            None,
+            Some(excluded),
+            Some(sibling.clone()),
+        ];
+        for _ in 0..2 {
+            let mut calls = 0;
+            let resolved = journal::resolve_file_ids(42, &keys, &config, |key| {
+                assert_eq!(key, keys[calls]);
+                let meta = current[calls].clone();
+                calls += 1;
+                Ok(meta)
+            })
+            .unwrap();
+            assert_eq!(calls, keys.len());
+            let mut expected_visible = visible.clone();
+            expected_visible.parent = None;
+            let mut expected_sibling = sibling.clone();
+            expected_sibling.parent = None;
+            assert_eq!(
+                resolved,
+                [Some(expected_visible), None, None, Some(expected_sibling)]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_descendant_resolution_cannot_return_a_partial_replacement_page() {
+        let records = [
+            record(128, 10, 0, "first.txt"),
+            record(256, 11, 0, "second.txt"),
+        ];
+        let keys = [DocKey::from_parts(42, 10), DocKey::from_parts(42, 11)];
+        let config = ReaderConfig::default();
+        for failure in 0..4 {
+            let mut probes = 0;
+            let failed = journal::resolve_file_ids(42, &keys, &config, |key| {
+                assert_eq!(key, keys[probes]);
+                let mut meta = resolved_meta(&records[probes]);
+                probes += 1;
+                if key == keys[1] {
+                    match failure {
+                        0 => {
+                            return Err(NtfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "descendant metadata denied",
+                            )));
+                        }
+                        1 => meta.key = DocKey::from_parts(42, 0x0001_0000_0000_000B),
+                        2 => meta.volume = 43,
+                        3 => meta.path = None,
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(Some(meta))
+            });
+            assert!(failed.is_err());
+            assert_eq!(probes, 2);
+        }
+        let replayed = journal::resolve_file_ids(42, &keys, &config, |key| {
+            let record = &records[usize::from(key == keys[1])];
+            Ok(Some(resolved_meta(record)))
+        })
+        .unwrap();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|meta| meta.as_ref().unwrap().key)
+                .collect::<Vec<_>>(),
+            keys
+        );
+    }
+
+    #[test]
+    fn directory_link_and_reparse_history_still_require_full_reconciliation() {
+        for reason in [
             journal::REASON_HARD_LINK,
             journal::REASON_REPARSE,
-            journal::REASON_DELETE | journal::REASON_RENAME_NEW,
+            journal::REASON_RENAME_OLD | journal::REASON_HARD_LINK,
+            journal::REASON_RENAME_NEW | journal::REASON_REPARSE,
             journal::REASON_DELETE | journal::REASON_REPARSE,
         ] {
             let mut change = record(100, 10, reason, "directory");
@@ -2414,15 +2869,31 @@ mod tests {
                 })
             );
         }
-        let mut reparse_delete = record(100, 10, journal::REASON_DELETE, "junction");
-        reparse_delete.attributes = journal::ATTRIBUTE_DIRECTORY | journal::ATTRIBUTE_REPARSE;
-        assert_eq!(
-            journal::event_from_record(42, &reparse_delete, || panic!("requires reconciliation"))
-                .unwrap(),
-            Some(FileEvent::RescanRequired {
-                doc: DocKey::from_parts(42, 10)
-            })
-        );
+        for reason in [
+            journal::REASON_DELETE,
+            journal::REASON_RENAME_OLD,
+            journal::REASON_RENAME_NEW,
+        ] {
+            let mut reparse = record(100, 10, reason, "junction");
+            reparse.attributes = journal::ATTRIBUTE_DIRECTORY | journal::ATTRIBUTE_REPARSE;
+            assert_eq!(
+                journal::event_from_record(42, &reparse, || panic!("requires reconciliation"))
+                    .unwrap(),
+                Some(FileEvent::RescanRequired {
+                    doc: DocKey::from_parts(42, 10)
+                })
+            );
+            if reason != journal::REASON_DELETE {
+                // Reparse state may have changed since the historical record.
+                let mut current = resolved_meta(&reparse);
+                current.flags = FileFlags::IS_DIR | FileFlags::REPARSE;
+                reparse.attributes = journal::ATTRIBUTE_DIRECTORY;
+                assert!(matches!(
+                    journal::event_from_record(42, &reparse, || Ok(Some(current))).unwrap(),
+                    Some(FileEvent::RescanRequired { .. })
+                ));
+            }
+        }
     }
 
     #[test]
@@ -2434,6 +2905,19 @@ mod tests {
         let mut wrong = resolved_meta(&change);
         wrong.volume = 43;
         assert!(journal::event_from_record(42, &change, || Ok(Some(wrong))).is_err());
+        let mut directory = record(100, 10, journal::REASON_RENAME_OLD, "directory");
+        directory.attributes = journal::ATTRIBUTE_DIRECTORY;
+        for failure in 0..3 {
+            let mut wrong = resolved_meta(&directory);
+            wrong.flags = FileFlags::IS_DIR;
+            match failure {
+                0 => wrong.key = DocKey::from_parts(42, 11),
+                1 => wrong.volume = 43,
+                2 => wrong.flags = FileFlags::empty(),
+                _ => unreachable!(),
+            }
+            assert!(journal::event_from_record(42, &directory, || Ok(Some(wrong))).is_err());
+        }
     }
 
     #[test]
@@ -2479,6 +2963,15 @@ mod tests {
         ));
         assert!(matches!(
             tail_usn(&volume, cursor(100)),
+            Err(NtfsError::NotSupported)
+        ));
+        assert!(matches!(
+            resolve_file_ids(
+                &volume,
+                cursor(100),
+                &[DocKey::from_parts(1, 10)],
+                &ReaderConfig::default(),
+            ),
             Err(NtfsError::NotSupported)
         ));
     }
@@ -2900,6 +3393,109 @@ mod tests {
             |event| matches!(event, FileEvent::Deleted(doc) if *doc == key),
         );
 
+        // Directory moves preserve historical path components and let callers
+        // refresh descendants by FRN without another whole-volume MFT scan.
+        let rename_source = dir.path().join("rename-source");
+        let rename_nested = rename_source.join("nested");
+        let rename_child = rename_nested.join("unchanged-child.txt");
+        let rename_parent = dir.path().join("rename-parent");
+        std::fs::create_dir_all(&rename_nested).unwrap();
+        std::fs::create_dir(&rename_parent).unwrap();
+        std::fs::write(&rename_child, b"child content survives ancestor moves").unwrap();
+        let rename_created = read_to_head(&volume, &mut position);
+        let rename_key = created_key(&rename_created, &rename_source);
+        let rename_child_key = created_key(&rename_created, &rename_child);
+        let rename_parent_key = created_key(&rename_created, &rename_parent);
+        let before_rename = position;
+        let rename_intermediate = rename_parent.join("intermediate");
+        let rename_final = rename_parent.join("final");
+        std::fs::rename(&rename_source, &rename_intermediate).unwrap();
+        std::fs::rename(&rename_intermediate, &rename_final).unwrap();
+        let current_directory_path = canonical_path(&rename_final).unwrap();
+        let current_child_path =
+            canonical_path(&rename_final.join("nested").join("unchanged-child.txt")).unwrap();
+        let renamed = read_to_head(&volume, &mut position);
+        let mut replay_position = before_rename;
+        let replayed = read_to_head(&volume, &mut replay_position);
+        for events in [&renamed, &replayed] {
+            let mut historical_names = std::collections::BTreeSet::new();
+            let mut new_parent_seen = false;
+            for event in events {
+                match event {
+                    FileEvent::DirectoryRenamed {
+                        doc,
+                        parent,
+                        name,
+                        current,
+                    } if *doc == rename_key => {
+                        let current = current.as_ref().expect("renamed directory still exists");
+                        assert_eq!(current.key, rename_key);
+                        assert_eq!(
+                            current.path.as_deref(),
+                            Some(current_directory_path.as_str())
+                        );
+                        assert!(current.flags.contains(FileFlags::IS_DIR));
+                        historical_names.insert(name.as_str());
+                        new_parent_seen |= *parent == rename_parent_key;
+                    }
+                    FileEvent::RescanRequired { doc } => {
+                        assert_ne!(
+                            *doc, rename_key,
+                            "ordinary rename must not reset the volume"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(historical_names.contains("rename-source"));
+            assert!(historical_names.contains("intermediate"));
+            assert!(historical_names.contains("final"));
+            assert!(new_parent_seen);
+        }
+        let resolve_config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 2,
+            ..ReaderConfig::default()
+        };
+        let descendants = resolve_file_ids(
+            &volume,
+            before_rename,
+            &[rename_child_key, rename_key],
+            &resolve_config,
+        )
+        .expect("bounded native identity resolution must succeed");
+        let child = descendants[0].as_ref().expect("unchanged child survives");
+        assert_eq!(child.key, rename_child_key);
+        assert_eq!(child.path.as_deref(), Some(current_child_path.as_str()));
+        assert_eq!(child.parent, None);
+        assert_eq!(descendants[1].as_ref().unwrap().key, rename_key);
+        let excluded_config = ReaderConfig {
+            exclude_paths: vec![canonical_path(&rename_parent).unwrap()],
+            ..resolve_config.clone()
+        };
+        assert_eq!(
+            resolve_file_ids(
+                &volume,
+                before_rename,
+                &[rename_child_key, rename_key],
+                &excluded_config,
+            )
+            .unwrap(),
+            [None, None]
+        );
+        let mut excluded_position = before_rename;
+        let mut excluded_rename_seen = false;
+        while excluded_position.last_usn < position.last_usn {
+            let batch = tail_usn_batch_with_config(&volume, excluded_position, &excluded_config)
+                .expect("excluded directory rename replay must succeed");
+            assert!(batch.cursor.last_usn > excluded_position.last_usn);
+            excluded_position = batch.cursor;
+            excluded_rename_seen |= batch.events.iter().any(|event| {
+                matches!(event, FileEvent::DirectoryRenamed { doc, .. } if *doc == rename_key)
+            });
+        }
+        assert!(excluded_rename_seen);
+
         // Recursive directory deletion must remain incremental. Move one child
         // out first: deleting its former ancestors must not remove that stable
         // file identity or turn routine directory tombstones into volume resets.
@@ -2990,12 +3586,25 @@ mod tests {
             tail_usn(&volume, wrong_identity),
             Err(NtfsError::GapDetected)
         ));
+        assert!(matches!(
+            resolve_file_ids(
+                &volume,
+                wrong_identity,
+                &[rename_child_key],
+                &resolve_config
+            ),
+            Err(NtfsError::GapDetected)
+        ));
         let future = JournalCursor {
             last_usn: i64::MAX as u64,
             ..position
         };
         assert!(matches!(
             tail_usn(&volume, future),
+            Err(NtfsError::GapDetected)
+        ));
+        assert!(matches!(
+            resolve_file_ids(&volume, future, &[rename_child_key], &resolve_config),
             Err(NtfsError::GapDetected)
         ));
     }

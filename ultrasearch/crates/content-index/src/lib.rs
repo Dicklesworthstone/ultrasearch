@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use core_types::{DocKey, FileFlags, FileMeta};
+use core_types::{DocKey, FileFlags, FileMeta, normalize_index_path};
 pub use tantivy::IndexWriter;
 use tantivy::{
     Index, IndexSettings, ReloadPolicy, Term, schema::document::TantivyDocument, schema::*,
@@ -22,6 +22,7 @@ pub struct ContentFields {
     pub volume: Field,
     pub name: Field,
     pub path: Field,
+    pub path_exact: Field,
     pub ext: Field,
     pub size: Field,
     pub created: Field,
@@ -38,6 +39,7 @@ pub fn build_schema() -> (Schema, ContentFields) {
     let volume = builder.add_u64_field("volume", INDEXED | FAST | STORED);
     let name = builder.add_text_field("name", TEXT | STORED);
     let path = builder.add_text_field("path", TEXT | STORED);
+    let path_exact = builder.add_text_field("path_exact", STRING);
     let ext = builder.add_text_field("ext", STRING | FAST | STORED);
     let size = builder.add_u64_field("size", FAST | STORED);
     let created = builder.add_i64_field("created", FAST | STORED);
@@ -53,6 +55,7 @@ pub fn build_schema() -> (Schema, ContentFields) {
         volume,
         name,
         path,
+        path_exact,
         ext,
         size,
         created,
@@ -95,7 +98,7 @@ pub fn open_or_create(path: &Path) -> Result<ContentIndex> {
 pub fn validate_schema(index: &Index) -> Result<()> {
     ensure!(
         index.schema() == build_schema().0,
-        "incompatible content index schema; rebuild required for lossless document keys"
+        "incompatible content index schema; rebuild required for lossless keys and normalized paths"
     );
     Ok(())
 }
@@ -366,6 +369,7 @@ pub fn to_document(doc: &ContentDoc, fields: &ContentFields) -> TantivyDocument 
     }
     if let Some(path) = &doc.path {
         d.add_text(fields.path, path);
+        d.add_text(fields.path_exact, normalize_index_path(path));
     }
     if let Some(ext) = &doc.ext {
         d.add_text(fields.ext, ext);
@@ -472,6 +476,7 @@ mod tests {
             fields.volume,
             fields.name,
             fields.path,
+            fields.path_exact,
             fields.ext,
             fields.size,
             fields.created,
@@ -540,6 +545,50 @@ mod tests {
         Ok(reader
             .searcher()
             .search(&query, &tantivy::collector::Count)?)
+    }
+
+    #[test]
+    fn normalized_raw_paths_replace_without_changing_stored_display_paths() -> Result<()> {
+        let index = create_in_ram()?;
+        let mut writer = index.index.writer_with_num_threads(1, 20_000_000)?;
+        let key = DocKey::from_parts(1, 0x0003_0000_0000_0042);
+        let mut doc = sample_doc(key, "Report.txt", "stablebody");
+        let displayed = "//?/Volume{AbCd}/DIR.+[x]/Report.txt";
+        doc.path = Some(displayed.into());
+        add_content_doc(&mut writer, &index.fields, &doc)?;
+        writer.commit()?;
+        let normalized = normalize_index_path(displayed);
+        assert_eq!(matches(&index, index.fields.path_exact, &normalized)?, 1);
+        assert_eq!(matches(&index, index.fields.path_exact, "report")?, 0);
+        assert_eq!(
+            read_file_meta(&index, &open_reader(&index)?, key)?
+                .unwrap()
+                .path
+                .as_deref(),
+            Some(displayed)
+        );
+        doc.name = Some("Renamed.txt".into());
+        doc.path = Some(r"\\?\Volume{AbCd}\Elsewhere\Renamed.txt".into());
+        add_content_doc(&mut writer, &index.fields, &doc)?;
+        add_content_doc(&mut writer, &index.fields, &doc)?;
+        writer.commit()?;
+        assert_eq!(matches(&index, index.fields.path_exact, &normalized)?, 0);
+        assert_eq!(
+            matches(
+                &index,
+                index.fields.path_exact,
+                &normalize_index_path(doc.path.as_deref().unwrap())
+            )?,
+            1
+        );
+        assert_eq!(
+            read_file_meta(&index, &open_reader(&index)?, key)?
+                .unwrap()
+                .path,
+            doc.path
+        );
+        assert_eq!(open_reader(&index)?.searcher().num_docs(), 1);
+        Ok(())
     }
 
     #[test]

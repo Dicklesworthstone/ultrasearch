@@ -8,6 +8,8 @@
 //!
 //! The test indexes the configured volume. It creates a unique fixture directory
 //! and retains its indices, journal checkpoints, and success evidence for inspection.
+//! Directory moves run under real worker backpressure, retaining an unrelated
+//! searchable file while repairing unchanged descendants and exclusion transitions.
 //! It holds a real sharing-violation handle across a service restart and allows
 //! up to six minutes for recovery through the persisted extraction retry schedule.
 
@@ -16,7 +18,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use core_types::{DocKey, VolumeId, config::AppConfig};
 use ipc::{
-    QueryExpr, SearchHit, SearchMode, SearchRequest, SearchResponse, TermExpr, TermModifier,
+    FieldKind, QueryExpr, SearchHit, SearchMode, SearchRequest, SearchResponse, TermExpr,
+    TermModifier,
 };
 use ntfs_watcher::{canonical_path, discover_volumes, query_journal};
 use serde_json::Value;
@@ -47,13 +50,17 @@ const MODES: [SearchMode; 3] = [
 
 struct WorkerLoop {
     stop: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<SchedulerRuntime>>,
 }
 
 impl WorkerLoop {
     fn start(cfg: &AppConfig) -> Self {
         let mut scheduler = SchedulerRuntime::new(cfg);
         scheduler.force_allow_content();
+        Self::resume(scheduler)
+    }
+
+    fn resume(mut scheduler: SchedulerRuntime) -> Self {
         let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_millis(200));
@@ -67,6 +74,7 @@ impl WorkerLoop {
                 // Do not interrupt a real worker or its commit during shutdown.
                 scheduler.tick().await;
             }
+            scheduler
         });
         Self {
             stop: Some(stop),
@@ -74,7 +82,7 @@ impl WorkerLoop {
         }
     }
 
-    async fn stop(mut self) -> Result<()> {
+    async fn stop(mut self) -> Result<SchedulerRuntime> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -103,6 +111,7 @@ struct Pipeline {
     search: UnifiedSearchHandler,
     watcher: Option<JoinHandle<Result<()>>>,
     workers: Option<WorkerLoop>,
+    paused_workers: Option<SchedulerRuntime>,
 }
 
 impl Pipeline {
@@ -120,6 +129,7 @@ impl Pipeline {
             search,
             watcher: Some(watcher),
             workers: Some(workers),
+            paused_workers: None,
         })
     }
 
@@ -183,23 +193,37 @@ impl Pipeline {
         ensure!(
             volumes.len() == 1
                 && volumes[0]["needs_scan"] == false
-                && volumes[0]["catching_up"] == false,
+                && volumes[0]["catching_up"] == false
+                && volumes[0]["directory_repair"].is_null()
+                && volumes[0]["unsettled_directories"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty),
             "persisted reconciliation is incomplete: {volumes:?}"
         );
         Ok(())
     }
 
     async fn pause_workers(&mut self) -> Result<()> {
-        self.workers
-            .take()
-            .context("worker loop is already paused")?
-            .stop()
-            .await
+        // Keep the real admission channel alive while dispatch is paused.
+        // Dropping the runtime would simulate a scheduler failure and hide the
+        // whole volume, instead of exposing ordinary worker backpressure.
+        self.paused_workers = Some(
+            self.workers
+                .take()
+                .context("worker loop is already paused")?
+                .stop()
+                .await?,
+        );
+        Ok(())
     }
 
     fn resume_workers(&mut self) -> Result<()> {
         ensure!(self.workers.is_none(), "worker loop is already running");
-        self.workers = Some(WorkerLoop::start(&self.cfg));
+        self.workers = Some(WorkerLoop::resume(
+            self.paused_workers
+                .take()
+                .context("paused scheduler is missing")?,
+        ));
         Ok(())
     }
 
@@ -256,11 +280,16 @@ async fn eventually_within<T>(
     }
 }
 
-fn search(handler: &UnifiedSearchHandler, term: &str, mode: SearchMode) -> Result<SearchResponse> {
+fn query_field(
+    handler: &UnifiedSearchHandler,
+    term: &str,
+    mode: SearchMode,
+    field: Option<FieldKind>,
+) -> Result<SearchResponse> {
     let response = handler.search(SearchRequest {
         id: Uuid::new_v4(),
         query: QueryExpr::Term(TermExpr {
-            field: None,
+            field,
             value: term.to_owned(),
             modifier: TermModifier::Term,
         }),
@@ -276,6 +305,11 @@ fn search(handler: &UnifiedSearchHandler, term: &str, mode: SearchMode) -> Resul
         ),
         "search unavailable for {term:?} in {mode:?}"
     );
+    Ok(response)
+}
+
+fn search(handler: &UnifiedSearchHandler, term: &str, mode: SearchMode) -> Result<SearchResponse> {
+    let response = query_field(handler, term, mode, None)?;
     // Every term is unique to one fixture. Fail immediately on duplicates even
     // during replay; retrying until they disappear would conceal the regression.
     assert!(
@@ -294,12 +328,34 @@ fn one_hit(handler: &UnifiedSearchHandler, term: &str, mode: SearchMode) -> Resu
     Ok(response.hits.remove(0))
 }
 
+fn directory_key(handler: &UnifiedSearchHandler, name: &str) -> Result<DocKey> {
+    let response = query_field(handler, name, SearchMode::NameOnly, Some(FieldKind::Name))?;
+    ensure!(
+        response.hits.len() == 1 && response.total == 1,
+        "expected one directory name {name:?}, got {response:?}"
+    );
+    Ok(response.hits[0].key)
+}
+
 fn absent(handler: &UnifiedSearchHandler, term: &str, modes: &[SearchMode]) -> Result<()> {
     for mode in modes {
         let response = search(handler, term, *mode)?;
         ensure!(
             response.hits.is_empty() && response.total == 0,
             "stale {mode:?} result for {term:?}: {response:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Directory path terms legitimately match several descendants. Check their
+/// complete disappearance independently of the unique-file duplicate guard.
+fn absent_path(handler: &UnifiedSearchHandler, term: &str) -> Result<()> {
+    for mode in MODES {
+        let response = query_field(handler, term, mode, Some(FieldKind::Path))?;
+        ensure!(
+            response.hits.is_empty() && response.total == 0,
+            "stale directory path {term:?} in {mode:?}: {response:?}"
         );
     }
     Ok(())
@@ -391,6 +447,44 @@ fn volume_state(state: &Value, volume: VolumeId) -> Result<&Value> {
         .context("persisted volume identity missing")
 }
 
+fn directory_pending(pipeline: &Pipeline, descendants: &[DocKey]) -> Result<Value> {
+    pipeline.ensure_running()?;
+    let state = read_state(&pipeline.cfg)?;
+    let key = descendants
+        .first()
+        .context("directory fixture has no descendants")?;
+    let volume = volume_state(&state, key.volume())?;
+    // Fail immediately: waiting for a later successful full rebuild would hide
+    // the availability regression this native directory test must detect.
+    assert_eq!(
+        volume["needs_scan"], false,
+        "ordinary directory rename requested a full-volume baseline: {volume:?}"
+    );
+    if !state["pending"].is_null() {
+        assert!(
+            state["pending"]["worker"]["reset_volumes"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "ordinary directory rename admitted a full-volume reset"
+        );
+    }
+    ensure!(
+        !volume["directory_repair"].is_null()
+            && state["pending"]["worker"]["jobs"]
+                .as_array()
+                .is_some_and(|jobs| jobs.iter().any(|job| descendants.iter().any(|key| {
+                    job["volume_id"].as_u64() == Some(u64::from(key.volume()))
+                        && job["file_id"].as_u64() == Some(key.file_id())
+                }))),
+        "directory descendants have not reached durable admission"
+    );
+    ensure!(
+        volume["cursor"] == volume["directory_repair"]["from"],
+        "directory cursor advanced before blocked descendants committed"
+    );
+    Ok(state)
+}
+
 fn deferred_file(state: &Value, key: DocKey) -> Result<&Value> {
     let entries = state["deferred"]
         .as_array()
@@ -421,8 +515,8 @@ fn deferred_snapshot(pipeline: &Pipeline, key: DocKey) -> Result<Value> {
     pipeline.ensure_running()?;
     let state = read_state(&pipeline.cfg)?;
     ensure!(
-        state["version"] == 3,
-        "native deferral requires the v3 state protocol"
+        state["version"] == 4,
+        "native deferral requires the v4 state protocol"
     );
     ensure!(
         state["pending"].is_null(),
@@ -575,6 +669,232 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
         document(&pipeline.search, &new_name, &second, &renamed, Some(key))?;
         absent(&pipeline.search, &old_name, &MODES)
     })
+    .await?;
+
+    // This child receives no direct write or rename after creation. Its current
+    // path must follow directory USNs through the production repair lane while
+    // the unrelated sentinel stays searchable throughout each turn. A single
+    // non-root descendant makes the blocked content admission unambiguous.
+    let tree_old_name = format!("treeold{nonce}");
+    let tree_middle_name = format!("treemiddle{nonce}");
+    let tree_final_name = format!("treenew{nonce}");
+    let tree_returned_name = format!("treereturned{nonce}");
+    let child_name = format!("child{nonce}");
+    let child_body = format!("childbody{nonce}");
+    let tree_old = documents.join(&tree_old_name);
+    let tree_middle = documents.join(&tree_middle_name);
+    let tree_final = documents.join(&tree_final_name);
+    let tree_returned = documents.join(&tree_returned_name);
+    let child_file_name = format!("{child_name}.txt");
+    let child_old = tree_old.join(&child_file_name);
+    fs::create_dir_all(&tree_old)?;
+    replace_contents(&child_old, &format!("{child_body}\n"))?;
+    let (child_key, tree_key) = eventually("child fixture indexed before directory moves", || {
+        pipeline.ensure_ready()?;
+        Ok((
+            document(&pipeline.search, &child_name, &child_body, &child_old, None)?,
+            directory_key(&pipeline.search, &tree_old_name)?,
+        ))
+    })
+    .await?;
+    ensure!(
+        child_key != tree_key && child_key != key && child_key != sentinel_key,
+        "directory fixture identities collided"
+    );
+    let descendants = [child_key];
+    pipeline.pause_workers().await?;
+    fs::rename(&tree_old, &tree_middle)?;
+    let child_middle_path = canonical_path(&tree_middle.join(&child_file_name))?;
+    let blocked_directory = eventually(
+        "intermediate child path durably admitted under worker backpressure",
+        || {
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )
+            .expect("ordinary directory repair hid or replaced an unrelated file");
+            let state = directory_pending(&pipeline, &descendants)?;
+            let job = state["pending"]["worker"]["jobs"]
+                .as_array()
+                .context("directory worker jobs missing")?
+                .iter()
+                .find(|job| {
+                    job["volume_id"].as_u64() == Some(u64::from(child_key.volume()))
+                        && job["file_id"].as_u64() == Some(child_key.file_id())
+                })
+                .context("unchanged child job is not durably admitted")?;
+            ensure!(
+                job["operation"] == "reconcile"
+                    && job["path"]
+                        .as_str()
+                        .is_some_and(|path| path.eq_ignore_ascii_case(&child_middle_path)),
+                "pending child does not retain its intermediate pathname: {job:?}"
+            );
+            ensure!(
+                volume_state(&state, child_key.volume())?["unsettled_directories"]
+                    .as_array()
+                    .is_some_and(|keys| keys.contains(&Value::String(tree_key.to_string()))),
+                "known directory repair lost its discovery obligation"
+            );
+            absent_path(&pipeline.search, &tree_old_name)?;
+            absent_path(&pipeline.search, &tree_middle_name)?;
+            absent(&pipeline.search, &child_name, &MODES)?;
+            Ok(state)
+        },
+    )
+    .await?;
+    // The admitted B\\child path becomes obsolete before the real worker opens
+    // it. The later B -> C directory event must rediscover the unchanged child
+    // even if this pending reconciliation successfully tombstones both views.
+    fs::rename(&tree_middle, &tree_final)?;
+    let after_second_directory_move = directory_pending(&pipeline, &descendants)?;
+    ensure!(
+        after_second_directory_move["pending"] == blocked_directory["pending"],
+        "paused worker intent changed before the second directory move completed"
+    );
+    document(
+        &pipeline.search,
+        &keep_name,
+        &guard,
+        &sentinel,
+        Some(sentinel_key),
+    )
+    .expect("second directory move hid the unrelated sentinel");
+    pipeline.resume_workers()?;
+    let child_final = tree_final.join(&child_file_name);
+    let directory_repaired = eventually(
+        "rename after durable admission restores the unchanged child",
+        || {
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )
+            .expect("directory catch-up made unrelated results unavailable");
+            pipeline.ensure_ready()?;
+            document(
+                &pipeline.search,
+                &child_name,
+                &child_body,
+                &child_final,
+                Some(child_key),
+            )?;
+            ensure!(
+                directory_key(&pipeline.search, &tree_final_name)? == tree_key,
+                "directory identity changed across rename replay"
+            );
+            absent_path(&pipeline.search, &tree_old_name)?;
+            absent_path(&pipeline.search, &tree_middle_name)?;
+            read_state(&cfg)
+        },
+    )
+    .await?;
+
+    // Move the complete tree into an existing service-owned output directory.
+    // Descendant search documents must disappear while their files survive.
+    let tree_excluded = Path::new(&cfg.paths.jobs_dir).join(format!("treeexcluded{nonce}"));
+    pipeline.pause_workers().await?;
+    fs::rename(&tree_final, &tree_excluded)?;
+    let blocked_exclusion = eventually("directory exclusion admits descendant removals", || {
+        document(
+            &pipeline.search,
+            &keep_name,
+            &guard,
+            &sentinel,
+            Some(sentinel_key),
+        )
+        .expect("directory exclusion reset unrelated search results");
+        directory_pending(&pipeline, &descendants)
+    })
+    .await?;
+    pipeline.resume_workers()?;
+    let directory_excluded = eventually(
+        "excluded directory removes metadata and content descendants",
+        || {
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )
+            .expect("excluded descendant removal hid the whole volume");
+            pipeline.ensure_ready()?;
+            absent(&pipeline.search, &child_name, &MODES)?;
+            absent(&pipeline.search, &child_body, &MODES)?;
+            absent_path(&pipeline.search, &tree_final_name)?;
+            read_state(&cfg)
+        },
+    )
+    .await?;
+    ensure!(
+        fs::read(tree_excluded.join(&child_file_name))? == format!("{child_body}\n").as_bytes(),
+        "excluded fixture content changed"
+    );
+
+    // The root and children are now absent from the indices. Moving out of the
+    // exclusion must discover unchanged descendants from real NTFS metadata;
+    // no per-child event or new content write can satisfy this phase.
+    pipeline.pause_workers().await?;
+    fs::rename(&tree_excluded, &tree_returned)?;
+    let blocked_discovery = eventually(
+        "directory leaving exclusion discovers bounded descendants",
+        || {
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )
+            .expect("directory discovery reset unrelated results");
+            let state = directory_pending(&pipeline, &descendants)?;
+            ensure!(
+                volume_state(&state, child_key.volume())?["directory_repair"]["discover_paths"]
+                    .as_array()
+                    .is_some_and(|paths| !paths.is_empty()),
+                "unindexed directory has no persisted discovery coverage"
+            );
+            Ok(state)
+        },
+    )
+    .await?;
+    pipeline.resume_workers()?;
+    let child_returned = tree_returned.join(&child_file_name);
+    let directory_returned = eventually(
+        "unchanged excluded child returns at its stable identity",
+        || {
+            document(
+                &pipeline.search,
+                &keep_name,
+                &guard,
+                &sentinel,
+                Some(sentinel_key),
+            )
+            .expect("directory discovery catch-up hid unrelated results");
+            pipeline.ensure_ready()?;
+            document(
+                &pipeline.search,
+                &child_name,
+                &child_body,
+                &child_returned,
+                Some(child_key),
+            )?;
+            ensure!(
+                directory_key(&pipeline.search, &tree_returned_name)? == tree_key,
+                "directory identity changed across exclusion discovery"
+            );
+            for term in [&tree_old_name, &tree_middle_name, &tree_final_name] {
+                absent_path(&pipeline.search, term)?;
+            }
+            read_state(&cfg)
+        },
+    )
     .await?;
 
     // Suspend admission to prove that a forced rescan persists its intent and
@@ -979,6 +1299,20 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
             "journal_after": journal_after,
             "initial_checkpoint": initial_volume,
             "final_checkpoint": final_volume,
+            "directory_repair": {
+                "child_key": child_key,
+                "directory_key": tree_key,
+                "blocked_descendant_batch": blocked_directory["pending"]["worker"]["id"],
+                "admitted_intermediate_child_path": child_middle_path,
+                "second_rename_after_descendant_admission": true,
+                "rename_checkpoint": volume_state(&directory_repaired, child_key.volume())?,
+                "blocked_exclusion_batch": blocked_exclusion["pending"]["worker"]["id"],
+                "excluded_checkpoint": volume_state(&directory_excluded, child_key.volume())?,
+                "blocked_discovery_batch": blocked_discovery["pending"]["worker"]["id"],
+                "returned_checkpoint": volume_state(&directory_returned, child_key.volume())?,
+                "unrelated_results_visible_under_backpressure": true,
+                "unchanged_child_rediscovered_after_exclusion": true
+            },
             "deferred_extraction": {
                 "native_error": ERROR_SHARING_VIOLATION.0,
                 "attribute_only_access_verified": true,
@@ -990,7 +1324,7 @@ async fn production_ntfs_incremental_lifecycle_and_restart() -> Result<()> {
                 "recovered_obligations": recovered_state["deferred"],
                 "recovered_checkpoint": volume_state(&recovered_state, key.volume())?
             },
-            "verified": ["live create", "content replacement", "rename", "durable backpressure", "rescan replay", "restart with offline edit", "real sharing violation", "durable file deferral", "journal create/modify/delete past failed extraction", "restart with deferred obligation", "scheduled retry after unlock without another edit", "delete", "all search modes", "stable identity", "no duplicates"]
+            "verified": ["live create", "content replacement", "rename", "directory rename after durable child admission", "directory backpressure without a volume reset", "excluded directory descendant removal", "unchanged descendant discovery after leaving exclusion", "durable backpressure", "rescan replay", "restart with offline edit", "real sharing violation", "durable file deferral", "journal create/modify/delete past failed extraction", "restart with deferred obligation", "scheduled retry after unlock without another edit", "delete", "all search modes", "stable identity", "no duplicates"]
         }))?,
     )?;
     eprintln!(

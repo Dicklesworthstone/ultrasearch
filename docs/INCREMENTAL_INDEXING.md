@@ -51,6 +51,13 @@ redirect an admitted job to another volume.
 `JournalBatch.caught_up` compares progress with the head observed before that
 read. Checkpoint/index writes can generate more USN records themselves, so
 absolute filesystem inactivity is not a prerequisite for reporting catch-up.
+Admitting any Reconcile job durably retains the volume's catch-up obligation:
+a path can move while that job waits. A read taken before these workers cannot
+certify their later filesystem observations. The service settles coverage only
+after a subsequent caught-up read that admits no new Reconcile work; reconciliation
+admitted from a journal batch requests an immediate follow-up turn.
+Ignored output records and metadata-only cleanup can still
+settle that verification read.
 
 ## Commit, visibility, and replay
 
@@ -126,9 +133,10 @@ shared seed batch and retain their individual physical commit identities.
 ## Reconciliation and exclusions
 
 A new index, incompatible index generation/schema, journal gap, or requested
-rescan triggers full-volume reconciliation. Directory rename and link/reparse
-changes also trigger it because descendants can change paths without receiving
-individual rename records. Ordinary non-reparse directory deletion is a precise
+rescan triggers full-volume reconciliation. Link/reparse changes and ambiguous
+directory ancestry also require it. Ordinary directory renames use the bounded
+subtree repair described below because descendants can change paths without
+receiving individual rename records. Ordinary non-reparse directory deletion is a precise
 tombstone, including records with accumulated create, data, attribute, or close
 reasons. Recursive removal supplies each child's deletion or move records; routine
 temporary-directory cleanup no longer resets a volume. Directory deletion with
@@ -166,8 +174,55 @@ index directory, and retained migration archives are excluded using canonical
 GUID paths with case-insensitive path-boundary matching. The baseline skips
 them; their journal records still consume the read budget and advance progress.
 An indexed file moved into an excluded directory is removed from both views;
-an indexed directory move requires descendant reconciliation. Failure to resolve
+an indexed directory move requires descendant repair. Failure to resolve
 mandatory output exclusions is an ingestion error.
+
+### Directory moves without repeated volume resets
+
+The watcher retains each directory rename record's complete file reference,
+historical parent reference, and recorded name, together with identity-checked
+current metadata. The service combines these records with indexed ancestry to
+preserve old, intermediate, and current path prefixes. It durably records those
+prefixes before changing descendants. Missing or ambiguous ancestry, excessive
+history, journal gaps, and structural link/reparse changes fall back to full
+reconciliation instead of accepting uncertain coverage.
+
+A frozen metadata reader examines at most 128 raw document positions or segment
+transitions per turn, including deleted, unrelated, and other-volume entries.
+Matching descendants are resolved by full file reference against the original
+journal position, then replaced or deleted through the existing dual-index
+receipt lane. Deferred descendants are included even though their search rows
+were removed. This can examine the whole stored metadata index in bounded pages;
+it does not extract or replace unrelated files. Ordinary changes in the same
+journal batch are also refreshed before application. Directory roots are updated
+last, and only the final committed page advances the journal cursor.
+
+Search masks use the volume identity and normalized, case-insensitive path
+boundaries in both indices before result counts and pagination. A repair hides
+its affected prefixes while unrelated results remain searchable. After restart,
+pending work replays first and saved prefixes are reconstructed before repair
+resumes; startup also retains its conservative volume mask until journal catch-up.
+A failed file probe discards the volatile reader so the saved history can be
+scanned again. Capacity rejection retains the already-read page without
+reading ahead. Repair admission preserves space for existing retries; if history
+prevents admission and no retry can release capacity, full reconciliation replaces
+the repair obligation. Query execution and index commits still have their normal costs;
+the bounded ingestion page is not an end-to-end latency guarantee.
+
+A directory entering indexed coverage may contain unchanged children with no
+individual journal event. Such moves also run bounded MFT discovery filtered to
+the affected current prefixes. Discovery also covers prior baseline, edit, or
+retry work whose queued pathnames may have disappeared before the worker opened
+them. A successful obsolete-path tombstone can remove the only indexed child
+identity even though the unchanged file survives under its parent's new name.
+The retained catch-up obligation makes the first following directory move
+discover that child again. This includes roots already observed by a baseline
+after leaving an exclusion. Every repaired directory retains its coverage
+obligation through the root commit and restart until fresh journal catch-up;
+further ancestor or child moves during that interval require discovery again.
+The filtered scan can resolve unrelated MFT metadata while enumerating the volume,
+but only matching descendants enter mutation batches. It neither resets the
+volume nor hides unrelated files.
 
 ## Content omissions and errors
 
@@ -267,8 +322,13 @@ bounded retry batch of 128 files while content extraction is allowed. Due files
 are ordered by deadline and document identity. A retry has no journal cursor and
 cannot reset a volume; it uses the worker's current verified file snapshot for
 replacement in both indices. Fresh changes supersede older obligations, and
-deletion, exclusion, or a volume reset removes them. Offline and deselected
-volumes retain their saved retries without preventing selected volumes' retries.
+deletion, exclusion, or a volume reset removes them. After pending work has
+replayed, offline and deselected volumes exchange their per-file retries for a
+durable full-volume reconciliation obligation. The volume stays hidden, and the
+service persists that replacement obligation before releasing any retry capacity.
+Remounting or selecting it again requires a fresh baseline and journal catch-up.
+This prevents an unavailable volume from occupying the entire shared retry ledger
+indefinitely while another volume waits to index new changes.
 Retries follow successful bounded reads even when more journal records remain,
 so sustained change load cannot starve a recovered file solely by preventing
 full catch-up.
@@ -303,6 +363,8 @@ successful native read or conceal a fatal dependency failure.
 | Worker failure, full admission queue, or unwritable output | Retain state and job artifacts. Inspect logs, the worker executable/configuration, permissions, and free space. Restore the dependency; pending work is retried without advancing its checkpoint. |
 | `degraded: N files deferred for extraction retry` | Other journal changes can progress. Pending file/byte totals include the retained obligations. Restore file access or release locks and allow the bounded retry schedule to run; readiness requires no selected-volume obligations. |
 | Deferred extraction capacity reserved | New affected work waits before installing intent or moving its cursor. Due existing obligations receive priority so recovery can release capacity. Persistent failures or paused content admission can continue to apply backpressure. |
+| Directory repair in progress | Affected path prefixes remain hidden until bounded descendant replacement completes. Unrelated files stay searchable. Discovery may also enumerate MFT metadata when unchanged children enter coverage. |
+| Unavailable volume retained deferred work | Its per-file ledger is replaced transactionally by full-volume recovery, releasing shared capacity. Keep the saved checkpoint; remounting requires reconciliation before this volume becomes visible. |
 | Invalid/unsupported state or duplicate volume identities | Startup refuses to guess identities or checkpoints. Preserve the failed state and recover a coherent index/state set as described below. |
 
 Before recovery, stop the service and preserve its configuration, both indices,
@@ -330,14 +392,19 @@ untagged and cannot acknowledge durable service ingestion. Tantivy ingestion
 payload version 2 adds the deferred-key set; readers also accept version 1
 receipts as having no deferred obligations. Partial receipts cannot carry retries.
 
-The state envelope is now version 3, retaining the `ingestion-v2.json` filename so
-existing volume identities stay bound. Valid version 2 state with exact commit
-evidence upgrades in place without a rebuild. An older service rejects the new
-envelope instead of silently dropping its retry ledger. Deploy the updated service
-and worker together. Existing v2 checkpoints without commit evidence still trigger
-an archived-index rebuild. The
-document-key representation and index schema also changed to preserve the
-complete NTFS identity.
+The state envelope is now version 4, retaining the `ingestion-v2.json` filename so
+existing volume identities stay bound. Valid version 2 and 3 state is accepted
+and upgraded with empty directory-repair history. An older service rejects the
+new envelope instead of silently dropping recovery obligations. Deploy the updated
+service and worker together. Exact index commit evidence remains required.
+
+Both indices now require the normalized, untokenized `path_exact` field used for
+precise subtree masking. An index created by the preceding schema therefore
+undergoes the preserved, archived-index rebuild described above on its first
+startup with this version. The state-format upgrade itself retains volume IDs;
+the schema rebuild invalidates journal checkpoints so the new field is populated
+for every document. Existing v2 checkpoints without commit evidence still require
+reconciliation. Full NTFS document identities remain unchanged by this upgrade.
 
 ## Deterministic regressions and quality gates
 
@@ -505,6 +572,55 @@ no debug symbols. Host linking emitted the toolchain's existing gold-linker
 deprecation notice. No dependency versions, feature gates, receipt formats, or
 checkpoint schema versions changed in this pass. UBS and RCH were unavailable.
 
+### Directory repair and unavailable-volume capacity verification
+
+The 2026-10-11 pass replaces ordinary directory-triggered volume resets with
+durable bounded descendant repair and filtered discovery, and reclaims unavailable
+volumes' shared retry capacity only after persisting full-volume recovery. It
+also preserves existing retry byte headroom when recording directory history.
+
+There were **192 distinct passing Linux tests** across seven affected packages:
+service 71, ntfs-watcher 36, core-types 16, meta-index 17, content-index 15,
+index-worker 20, and content-extractor 17. All passed with zero failed or ignored
+tests. This includes 23 new host regressions relative to the preceding versions
+of these packages; repeated final runs are not additional distinct tests.
+
+The new service regressions use real metadata/content index commits with modeled
+native probes and worker outcomes. They cover more than one descendant page,
+content-before-metadata failure and restart replay, retaining old and intermediate
+directory paths, exclusion entry, discovery after an overlapping baseline,
+subsequent ancestor and child moves, unchanged children entering coverage,
+resolver failure, retained pages at retry saturation, and transactional history
+admission near the byte limit. Two additional regressions force a parent move
+after durable child admission and model the resulting successful obsolete-path
+tombstone without deferred debt. They cover directory repair, initial MFT work,
+and ordinary edits, then require recovery from directory events alone after
+restart and a fresh post-worker read before healthy catch-up.
+The tests also fill the retry ledger with an unavailable volume, require
+unrelated-volume edit/delete progress, and verify that restart
+preserves the unavailable volume's full-recovery obligation. Watcher and index
+regressions cover raw rename history, bounded identity probes, unsupported hosts,
+full reference reuse sequences, path boundaries, volume isolation, bounded scans,
+and schema migration. Native kernel behavior remains outside these host tests.
+
+| Gate | Recorded result |
+| --- | --- |
+| Linux tests for the seven affected packages, with `--locked --offline -- --test-threads=1` | All 192 passed. The final service suite passed all 71 tests, including the admitted-path races and fresh-read recovery assertions. |
+| Final Linux all-target check and strict Clippy for the same seven packages | Both passed with `--locked --offline` and `-D warnings` for Clippy. |
+| Windows GNU all-target check and strict Clippy for `ntfs-watcher` and `ipc` | Both passed, including the new bounded identity-probe and directory-history native test code. |
+| Final Windows GNU all-target check and strict Clippy for `service`, `index-worker`, and `content-extractor`, with `service/e2e-windows` | Both passed, including the revised real-worker fixture that moves the directory after the child's intermediate path is durably admitted. Compilation/lint only. |
+| Workspace `cargo fmt --all -- --check` and Git staged/unstaged whitespace checks | Passed. |
+| Whole-workspace Linux check and strict Clippy | Both attempted and exited 101 in unchanged `glib-sys 0.18.1`: `pkg-config` is absent, so `glib-2.0 >= 2.56` cannot be located. Neither whole-workspace gate passed. |
+| Native Windows execution, installed MSI acceptance, and native performance qualification | Not run; no Windows runtime is available here. |
+
+Verification used the pinned `nightly-2026-08-31` toolchain and locked dependencies,
+the official LLVM-MinGW 20261006 MSVCRT Linux x86-64 cross toolchain, and the host
+linker/OpenSSL settings described above. Host linking emitted the existing gold
+linker deprecation notice; no source lint failures remained. No tracked dependency
+versions, feature gates, workflow files, worker batch formats, or receipt formats
+changed. State v4 and the exact-path index fields require the migration described
+above. UBS and RCH were unavailable. Native acceptance remains outstanding.
+
 ## Native NTFS acceptance
 
 Use an **elevated Windows developer PowerShell** with an isolated mounted NTFS
@@ -540,7 +656,9 @@ prerequisite is absent. Separate token regressions use duplicate tokens to test
 activation, idempotence, and rejection when the privilege is genuinely absent;
 they do not change the test process token or grant account rights. Recursive
 directory removal verifies each deleted identity, a moved-out survivor, and replay
-without a full-volume reset.
+without a full-volume reset. Consecutive directory moves retain both recorded
+names and current metadata while a bounded full-reference probe resolves an
+unchanged child; exclusion replay retains the directory's historical anchors.
 Worker component tests exercise actual atomic oplock capture with existing and
 new fully shared writers, a same-length overwrite, and recovery after the broken
 capture closes. Another test opens a share-incompatible writer on a separate
@@ -559,7 +677,16 @@ access, verifies both-index tombstones and one durable retry obligation, and che
 unrelated create/edit/delete progress. The obligation must survive a restart with
 the lock still held. After unlocking without another edit, the test permits up to
 360 seconds for the persisted five-minute maximum backoff to restore one current
-result under the original identity. Healthy readiness requires an empty retry list.
+result under the original identity. The directory fixture pauses real dispatch
+while retaining the scheduler's admission channel, renames a directory, waits for
+the unchanged child's durable job at the intermediate path, and renames the
+directory again before dispatch resumes. It requires descendant work without a volume
+reset while an unrelated sentinel stays visible. After resuming, it checks stable
+identities and removal of old and intermediate paths. Moving the tree into an
+excluded output directory removes descendants from both search views; moving it
+back out discovers unchanged children. The evidence records blocked intent and
+the cursors for these phases. Healthy readiness requires an empty retry list,
+no directory repair, and no unsettled discovery obligations.
 It retains a uniquely named fixture directory and writes
 `data/log/native-ingestion-evidence.json` only after success. Missing prerequisites
 fail an explicitly selected native test; they do not return an early success.

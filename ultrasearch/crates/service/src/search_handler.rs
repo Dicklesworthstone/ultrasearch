@@ -262,13 +262,16 @@ impl UnifiedSearchHandler {
         let offset = req.offset as usize;
 
         let searcher = self.meta_reader.searcher();
-        let query = match self.build_meta_query(&req.query) {
-            Ok(q) => visible_query(
+        let query = match self.build_meta_query(&req.query).and_then(|q| {
+            visible_query(
                 q,
                 self.meta.fields.doc_key,
                 self.meta.fields.volume,
+                self.meta.fields.path_exact,
                 visibility,
-            ),
+            )
+        }) {
+            Ok(query) => query,
             Err(err) => {
                 warn!(error = %err, "failed to build meta query");
                 return StubSearchHandler.search(req.clone());
@@ -321,13 +324,16 @@ impl UnifiedSearchHandler {
         let offset = req.offset as usize;
 
         let searcher = reader.searcher();
-        let query = match self.build_content_query(&req.query) {
-            Ok(q) => visible_query(
+        let query = match self.build_content_query(&req.query).and_then(|q| {
+            visible_query(
                 q,
                 content_idx.fields.doc_key,
                 content_idx.fields.volume,
+                content_idx.fields.path_exact,
                 visibility,
-            ),
+            )
+        }) {
+            Ok(query) => query,
             Err(err) => {
                 warn!(error = %err, "failed to build content query");
                 return StubSearchHandler.search(req.clone());
@@ -461,10 +467,14 @@ fn visible_query(
     query: Box<dyn Query>,
     key_field: tantivy::schema::Field,
     volume_field: tantivy::schema::Field,
+    path_field: tantivy::schema::Field,
     visibility: &Visibility,
-) -> Box<dyn Query> {
-    if visibility.documents.is_empty() && visibility.volumes.is_empty() {
-        return query;
+) -> Result<Box<dyn Query>> {
+    if visibility.documents.is_empty()
+        && visibility.volumes.is_empty()
+        && visibility.directories.is_empty()
+    {
+        return Ok(query);
     }
     let mut clauses = vec![(Occur::Must, query)];
     for key in &visibility.documents {
@@ -485,7 +495,23 @@ fn visible_query(
             )),
         ));
     }
-    Box::new(BooleanQuery::new(clauses))
+    for (volume, paths) in &visibility.directories {
+        let subtree = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(volume_field, u64::from(*volume)),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
+            (
+                Occur::Must,
+                meta_index::path_prefix_query(path_field, paths)?,
+            ),
+        ]);
+        clauses.push((Occur::MustNot, Box::new(subtree)));
+    }
+    Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
 // Helper to map content doc to SearchHit

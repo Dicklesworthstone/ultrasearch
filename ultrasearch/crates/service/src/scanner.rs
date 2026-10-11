@@ -9,18 +9,19 @@ use crate::status_provider::{
 };
 use anyhow::{Context, Result, ensure};
 use core_types::config::AppConfig;
-use core_types::{DocKey, FileMeta, VolumeId};
+use core_types::{DocKey, FileFlags, FileMeta, VolumeId, index_path_matches, normalize_index_path};
 use ipc::VolumeStatus;
 use ntfs_watcher::{
     FileEvent, JournalBatch, JournalCursor, NtfsError, ReaderConfig, VolumeInfo, begin_mft_scan,
-    canonical_path, discover_volumes, tail_usn_batch_with_config,
+    canonical_path, discover_volumes, resolve_file_ids, tail_usn_batch_with_config,
 };
 use state::{
-    BATCH_LIMIT, ContentPolicy, DeferredFile, MAX_DEFERRED_FILES, MetadataChange, PendingBatch,
-    StateStore, event_changes, pending_for_volume, validate_deferred_outcome,
+    BATCH_LIMIT, ContentPolicy, DeferredFile, DirectoryRepairCheckpoint, MAX_DEFERRED_FILES,
+    MetadataChange, PendingBatch, StateStore, event_changes, pending_for_volume,
+    validate_deferred_outcome,
 };
 use stats::IndexStatistics;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
@@ -32,6 +33,23 @@ const MUTATION_BATCH_LIMIT: usize = 128;
 
 type MftPages = Box<dyn Iterator<Item = std::result::Result<Vec<FileMeta>, NtfsError>> + Send>;
 type MftScans = BTreeMap<VolumeId, MftProgress<MftPages>>;
+type DirectoryRepairs = BTreeMap<VolumeId, DirectoryProgress>;
+
+/// A frozen metadata snapshot and at most one unadmitted mutation page. Old
+/// prefixes are durable; the readers are recreated after restart without ever
+/// resetting unrelated documents or advancing past unfinished descendants.
+struct DirectoryProgress {
+    checkpoint: DirectoryRepairCheckpoint,
+    index: Option<meta_index::PathScan>,
+    index_done: bool,
+    deferred: VecDeque<FileMeta>,
+    discovery: Option<MftPages>,
+    discovery_done: bool,
+    ordinary: VecDeque<MetadataChange>,
+    roots: VecDeque<DocKey>,
+    page: Option<Vec<MetadataChange>>,
+    final_page: bool,
+}
 
 /// One bounded reader and, at most, one not-yet-admitted page per volume.
 /// Readers are deliberately volatile: a service restart repeats the reset and
@@ -67,11 +85,13 @@ pub fn request_rescan() {
 }
 
 /// Entries being replaced are hidden from both indices until their transaction
-/// commits. Whole-volume reconciliation hides descendants of renamed directories.
+/// commits. Directory repair masks only affected path prefixes; journal gaps
+/// and incomplete baselines still hide the complete volume.
 #[derive(Default)]
 pub(crate) struct Visibility {
     pub volumes: BTreeSet<VolumeId>,
     pub documents: BTreeSet<DocKey>,
+    pub directories: BTreeMap<VolumeId, Vec<String>>,
 }
 
 static VISIBILITY: OnceLock<RwLock<Visibility>> = OnceLock::new();
@@ -93,11 +113,29 @@ fn hide_volume(id: VolumeId) {
 }
 
 fn show_volume(id: VolumeId) {
+    let mut visibility = VISIBILITY
+        .get_or_init(RwLock::default)
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    visibility.volumes.remove(&id);
+    visibility.directories.remove(&id);
+}
+
+fn hide_directories(id: VolumeId, paths: &[String]) {
     VISIBILITY
         .get_or_init(RwLock::default)
         .write()
         .unwrap_or_else(|e| e.into_inner())
-        .volumes
+        .directories
+        .insert(id, paths.to_vec());
+}
+
+fn show_directories(id: VolumeId) {
+    VISIBILITY
+        .get_or_init(RwLock::default)
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .directories
         .remove(&id);
 }
 
@@ -167,6 +205,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
     let mut last_idle_checkpoint = Instant::now();
     let mut statistics = IndexStatistics::new(Path::new(&cfg.paths.meta_index))?;
     let mut scans = MftScans::new();
+    let mut repairs = DirectoryRepairs::new();
     let mut work_remaining = true;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -196,9 +235,12 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         let requested = RESCAN_GENERATION.load(Ordering::Relaxed);
         if requested != generation {
             scans.clear();
+            repairs.clear();
             for volume in &mut store.state.volumes {
                 volume.needs_scan = true;
                 volume.catching_up = true;
+                volume.directory_repair = None;
+                volume.unsettled_directories.clear();
                 hide_volume(volume.id);
             }
             store.save()?;
@@ -210,6 +252,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             Ok(volumes) => filter_volumes(&cfg, volumes),
             Err(error) => {
                 scans.clear();
+                repairs.clear();
                 for volume in &store.state.volumes {
                     hide_volume(volume.id);
                 }
@@ -225,10 +268,12 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             store.bind_volume(volume)?;
             if refresh_content_policy(store, volume, &cfg)? {
                 scans.remove(&volume.id);
+                repairs.remove(&volume.id);
             }
         }
         let selected: BTreeSet<_> = volumes.iter().map(|v| v.id).collect();
         scans.retain(|id, _| selected.contains(id));
+        repairs.retain(|id, _| selected.contains(id));
         for volume in &store.state.volumes {
             if !selected.contains(&volume.id) {
                 hide_volume(volume.id);
@@ -244,6 +289,13 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             tracing::error!(%error, "pending batch failed; cursor retained");
             publish_status(store, &mut statistics)?;
             continue;
+        }
+        let reclaimed = store.reclaim_unavailable_retries(&selected)?;
+        if reclaimed > 0 {
+            tracing::info!(
+                files = reclaimed,
+                "unavailable-volume retries retained as full reconciliation; capacity released"
+            );
         }
         if volumes.is_empty() {
             update_status_ingestion_state("unavailable: no configured NTFS volume is mounted");
@@ -311,7 +363,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
                 ));
                 continue;
             }
-            match process_volume(store, volume, &cfg, &mut scans).await {
+            match process_volume(store, volume, &cfg, &mut scans, &mut repairs).await {
                 Ok(progress) => {
                     work_remaining |= progress.work_remaining;
                     if progress.journal_read {
@@ -455,8 +507,18 @@ async fn process_volume(
     volume: &VolumeInfo,
     cfg: &AppConfig,
     scans: &mut MftScans,
+    repairs: &mut DirectoryRepairs,
 ) -> Result<VolumeProgress> {
     if store.volume(volume.id)?.needs_scan || store.volume(volume.id)?.cursor.is_none() {
+        repairs.remove(&volume.id);
+        if store
+            .volume_mut(volume.id)?
+            .directory_repair
+            .take()
+            .is_some()
+        {
+            store.save()?;
+        }
         reconcile_volume(store, volume, cfg, scans).await?;
         return Ok(VolumeProgress {
             journal_read: false,
@@ -467,19 +529,63 @@ async fn process_volume(
         .volume(volume.id)?
         .cursor
         .context("volume has no journal checkpoint")?;
+    if let Some(repair) = repairs.get_mut(&volume.id) {
+        // Pending replay may have completed the final page after the original
+        // caller was cancelled. Never replay the volatile reader past its USN.
+        if cursor == repair.checkpoint.through
+            && store.volume(volume.id)?.directory_repair.is_none()
+        {
+            repairs.remove(&volume.id);
+            show_directories(volume.id);
+            return Ok(VolumeProgress {
+                journal_read: true,
+                work_remaining: true,
+            });
+        }
+        let result = directory_turn(store, volume, cfg, repair).await;
+        match result {
+            Ok(done) => {
+                if done {
+                    repairs.remove(&volume.id);
+                    show_directories(volume.id);
+                }
+                return Ok(VolumeProgress {
+                    journal_read: done,
+                    work_remaining: true,
+                });
+            }
+            Err(error) => {
+                if error
+                    .downcast_ref::<NtfsError>()
+                    .is_some_and(|error| matches!(error, NtfsError::GapDetected))
+                    || (error.is::<state::DeferredCapacity>() && store.state.deferred.is_empty())
+                {
+                    // With no retry obligation left, capacity cannot recover
+                    // while the repair's history occupies the state envelope.
+                    // A full scan can replace those anchors without losing work.
+                    repairs.remove(&volume.id);
+                    require_full_scan(store, volume.id)?;
+                    return Ok(VolumeProgress {
+                        journal_read: false,
+                        work_remaining: true,
+                    });
+                }
+                if store.state.pending.is_none() && !error.is::<state::DeferredCapacity>() {
+                    repairs.remove(&volume.id);
+                }
+                return Err(error);
+            }
+        }
+    }
     let read_volume = volume.clone();
-    let reader_config = reader_config(cfg, &store.state.retired_indices)?;
+    let read_config = reader_config(cfg, &store.state.retired_indices)?;
     let result = tokio::task::spawn_blocking(move || {
-        tail_usn_batch_with_config(&read_volume, cursor, &reader_config)
+        tail_usn_batch_with_config(&read_volume, cursor, &read_config)
     })
     .await?;
     match result {
         Err(NtfsError::GapDetected) => {
-            hide_volume(volume.id);
-            let state = store.volume_mut(volume.id)?;
-            state.needs_scan = true;
-            state.catching_up = true;
-            store.save()?;
+            require_full_scan(store, volume.id)?;
             update_status_ingestion_state(format!("volume {} journal gap; reconciling", volume.id));
             Ok(VolumeProgress {
                 journal_read: false,
@@ -487,8 +593,551 @@ async fn process_volume(
             })
         }
         Err(error) => Err(error.into()),
-        Ok(batch) => apply_journal_batch(store, volume, cfg, batch, commit_pending).await,
+        Ok(batch) => {
+            if batch
+                .events
+                .iter()
+                .any(|event| matches!(event, FileEvent::DirectoryRenamed { .. }))
+            {
+                let config = reader_config(cfg, &store.state.retired_indices)?;
+                let mut parent_config = config.clone();
+                parent_config.exclude_paths.clear();
+                let parent_keys: Vec<_> = batch
+                    .events
+                    .iter()
+                    .filter_map(|event| {
+                        if let FileEvent::DirectoryRenamed { parent, .. } = event {
+                            Some(*parent)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let read_volume = volume.clone();
+                let parents = tokio::task::spawn_blocking(move || {
+                    resolve_file_ids(&read_volume, cursor, &parent_keys, &parent_config)
+                })
+                .await??;
+                match prepare_directory_repair(store, volume, cfg, &batch, &config, &parents)? {
+                    Some(repair) => {
+                        repairs.insert(volume.id, repair);
+                    }
+                    None => require_full_scan(store, volume.id)?,
+                }
+                return Ok(VolumeProgress {
+                    journal_read: false,
+                    work_remaining: true,
+                });
+            }
+            ensure!(
+                store.volume(volume.id)?.directory_repair.is_none(),
+                "journal replay lost an unfinished directory range"
+            );
+            apply_journal_batch(store, volume, cfg, batch, commit_pending).await
+        }
     }
+}
+
+fn require_full_scan(store: &mut StateStore, volume: VolumeId) -> Result<()> {
+    hide_volume(volume);
+    let state = store.volume_mut(volume)?;
+    state.needs_scan = true;
+    state.catching_up = true;
+    state.directory_repair = None;
+    state.unsettled_directories.clear();
+    store.save()
+}
+
+fn path_selected(path: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| index_path_matches(path, prefix))
+}
+
+/// Combine the indexed ancestry with every recorded rename component. Neither
+/// an OLD_NAME bit nor a freshly resolved parent proves a historical full path:
+/// records accumulate reasons, and a parent may itself have moved meanwhile.
+fn prepare_directory_repair(
+    store: &mut StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    batch: &JournalBatch,
+    reader: &ReaderConfig,
+    current_parents: &[Option<FileMeta>],
+) -> Result<Option<DirectoryProgress>> {
+    let from = store
+        .volume(volume.id)?
+        .cursor
+        .context("missing journal cursor")?;
+    let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+    let mut roots = BTreeSet::new();
+    let mut records = Vec::new();
+    let mut anchors: BTreeMap<DocKey, BTreeSet<String>> = BTreeMap::new();
+    let mut indexed_roots = BTreeSet::new();
+    let mut current_roots = BTreeMap::new();
+    let mut ordinary = Vec::new();
+    for event in &batch.events {
+        if let FileEvent::DirectoryRenamed {
+            doc,
+            parent,
+            name,
+            current,
+        } = event
+        {
+            ensure!(
+                doc.volume() == volume.id && parent.volume() == volume.id,
+                "cross-volume directory history"
+            );
+            if doc == parent
+                || name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains(['\\', '/'])
+            {
+                return Ok(None);
+            }
+            roots.insert(*doc);
+            records.push((*doc, *parent, name));
+            if let Some(meta) = current {
+                ensure!(
+                    meta.key == *doc && meta.flags.contains(FileFlags::IS_DIR),
+                    "invalid directory snapshot"
+                );
+                if let Some(path) = &meta.path {
+                    current_roots.insert(*doc, normalize_index_path(path));
+                    anchors
+                        .entry(*doc)
+                        .or_default()
+                        .insert(normalize_index_path(path));
+                }
+            }
+        } else {
+            ordinary.push(event.clone());
+        }
+    }
+    ensure!(!roots.is_empty(), "directory repair has no root");
+    let Some(mut ordinary) = resolve_events(&ordinary, cfg, &store.state.deferred)? else {
+        return Ok(None);
+    };
+    ordinary.retain(|change| !roots.contains(&change.key()));
+    let identities: BTreeSet<_> = records
+        .iter()
+        .flat_map(|(doc, parent, _)| [*doc, *parent])
+        .collect();
+    for key in identities {
+        if let Some(meta) = meta_index::file_meta(&index, key)? {
+            ensure!(
+                meta.flags.contains(FileFlags::IS_DIR),
+                "indexed directory ancestry is not a directory"
+            );
+            if let Some(path) = meta.path {
+                anchors
+                    .entry(key)
+                    .or_default()
+                    .insert(normalize_index_path(&path));
+                if roots.contains(&key) {
+                    indexed_roots.insert(key);
+                }
+            }
+        } else if let Some(meta) = current_parents
+            .iter()
+            .flatten()
+            .find(|meta| meta.key == key)
+            && let Some(path) = &meta.path
+        {
+            // A volume root cannot be renamed. A known excluded parent has no
+            // indexed descendants to preserve. Other missing historical parents
+            // are ambiguous and must be covered by another recorded anchor.
+            if meta.flags.contains(FileFlags::IS_DIR)
+                && (normalize_index_path(path) == normalize_index_path(&volume.guid_path)
+                    || path_selected(path, &reader.exclude_paths))
+            {
+                anchors
+                    .entry(key)
+                    .or_default()
+                    .insert(normalize_index_path(path));
+            }
+        }
+    }
+    // Propagate parent history through nested moves in the same raw batch.
+    // Temporal ancestry can contain cycles; bound that ambiguity and retain
+    // conservative full reconciliation instead of expanding paths indefinitely.
+    loop {
+        let mut changed = false;
+        for (doc, parent, name) in &records {
+            let parents = anchors.get(parent).cloned().unwrap_or_default();
+            for parent_path in parents {
+                let path = normalize_index_path(&format!("{parent_path}\\{name}"));
+                changed |= anchors.entry(*doc).or_default().insert(path);
+                if anchors.values().map(BTreeSet::len).sum::<usize>() > BATCH_LIMIT {
+                    return Ok(None);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // An unanchored historical parent could conceal an intermediate subtree
+    // during baseline enumeration. Current paths alone cannot certify coverage.
+    if records
+        .iter()
+        .any(|(_, parent, _)| !anchors.contains_key(parent))
+    {
+        return Ok(None);
+    }
+    let mut paths: BTreeSet<String> = roots
+        .iter()
+        .flat_map(|root| anchors.get(root).into_iter().flatten().cloned())
+        .collect();
+    let mut discovery_roots = store
+        .volume(volume.id)?
+        .unsettled_directories
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    // While directory coverage is unsettled, an indexed ancestor may move the
+    // subtree, or a partially indexed child may move out of it. No persisted
+    // parent graph can prove either unaffected: discover every renamed root
+    // until a fresh successful journal catch-up settles this coverage.
+    // Baseline, edit, or retry jobs can also lose old pathnames to a directory
+    // move before any rename repair exists. Their admission retains catch-up
+    // until a journal read AFTER those workers, covering vanished index rows.
+    let discovery_unsettled = !discovery_roots.is_empty() || store.volume(volume.id)?.catching_up;
+    let mut discover_paths = BTreeSet::new();
+    for (key, path) in current_roots {
+        // A mixed-time baseline can index the root after it left an exclusion
+        // while having skipped its unchanged children beforehand. Historical
+        // excluded ancestry therefore still requires discovery for known roots.
+        let excluded_history = anchors.get(&key).is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|path| path_selected(path, &reader.exclude_paths))
+        });
+        if (!indexed_roots.contains(&key) || discovery_unsettled || excluded_history)
+            && !path_selected(&path, &reader.exclude_paths)
+        {
+            discovery_roots.insert(key);
+            discover_paths.insert(path);
+        }
+    }
+    // A queued descendant pathname can disappear after another directory move.
+    // The worker then correctly tombstones that obsolete path, erasing the only
+    // indexed child identity. Retain every repaired root until fresh catch-up so
+    // the later rename discovers such unchanged children even for known roots.
+    // Decide this turn's discovery above, using only the prior obligations.
+    discovery_roots.extend(roots.iter().copied());
+    if discovery_roots.len() > BATCH_LIMIT {
+        return Ok(None);
+    }
+    if let Some(previous) = &store.volume(volume.id)?.directory_repair {
+        paths.extend(previous.paths.iter().cloned());
+        discover_paths.extend(previous.discover_paths.iter().cloned());
+    }
+    paths.extend(discover_paths.iter().cloned());
+    if paths.is_empty() || paths.len() > BATCH_LIMIT {
+        return Ok(None);
+    }
+    let checkpoint = DirectoryRepairCheckpoint {
+        from,
+        through: batch.cursor,
+        paths: paths.into_iter().collect(),
+        discover_paths: discover_paths.into_iter().collect(),
+    };
+    // Compile the mask before publishing intent; malformed/oversized query
+    // state may never result in an unprotected descendant mutation.
+    meta_index::path_prefix_query(index.fields.path_exact, &checkpoint.paths)?;
+    let scan = meta_index::PathScan::new(&index, volume.id, &checkpoint.paths)?;
+    let deferred = store
+        .state
+        .deferred
+        .iter()
+        .filter(|retry| {
+            retry.meta.volume == volume.id
+                && retry
+                    .meta
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path_selected(path, &checkpoint.paths))
+        })
+        .map(|retry| retry.meta.clone())
+        .collect();
+    if let Err(error) = store.begin_directory_repair(
+        volume.id,
+        checkpoint.clone(),
+        &discovery_roots.into_iter().collect::<Vec<_>>(),
+    ) {
+        if error.is::<state::DeferredCapacity>() && store.state.deferred.is_empty() {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    hide_directories(volume.id, &checkpoint.paths);
+    Ok(Some(DirectoryProgress {
+        discovery_done: checkpoint.discover_paths.is_empty(),
+        checkpoint,
+        index: Some(scan),
+        index_done: false,
+        deferred,
+        discovery: None,
+        ordinary: ordinary.into(),
+        roots: roots.into_iter().collect(),
+        page: None,
+        final_page: false,
+    }))
+}
+
+async fn directory_turn(
+    store: &mut StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    repair: &mut DirectoryProgress,
+) -> Result<bool> {
+    let mut config = reader_config(cfg, &store.state.retired_indices)?;
+    config.max_records_per_tick = MUTATION_BATCH_LIMIT;
+    if repair.index_done
+        && repair.deferred.is_empty()
+        && !repair.discovery_done
+        && repair.discovery.is_none()
+    {
+        // A directory entering indexed coverage may contain unchanged files
+        // with no individual USN event. Enumerate bounded MFT pages, select this
+        // subtree, and keep every unrelated index entry intact and searchable.
+        let read_volume = volume.clone();
+        let scan_config = config.clone();
+        let mut scan =
+            tokio::task::spawn_blocking(move || begin_mft_scan(&read_volume, &scan_config))
+                .await??;
+        repair.discovery = Some(Box::new(std::iter::from_fn(move || {
+            scan.next_batch().transpose()
+        })));
+        return Ok(false);
+    }
+    let from = repair.checkpoint.from;
+    apply_directory_turn(
+        store,
+        volume,
+        cfg,
+        repair,
+        |keys| {
+            let read_volume = volume.clone();
+            let config = config.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    resolve_file_ids(&read_volume, from, &keys, &config)
+                })
+                .await?
+                .map_err(Into::into)
+            }
+        },
+        commit_pending,
+    )
+    .await
+}
+
+fn same_snapshot(left: &FileMeta, right: &FileMeta) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.parent = None;
+    right.parent = None;
+    left == right
+}
+
+/// Resolve and commit one bounded page, including empty-page/EOF turns. A page
+/// rejected before durable admission remains attached to this reader. Once
+/// admitted, the existing global pending lane owns it across failure/restart.
+async fn apply_directory_turn<R, F, C>(
+    store: &mut StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    repair: &mut DirectoryProgress,
+    mut resolve: R,
+    mut commit: C,
+) -> Result<bool>
+where
+    R: FnMut(Vec<DocKey>) -> F,
+    F: std::future::Future<Output = Result<Vec<Option<FileMeta>>>> + Send,
+    C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()>,
+{
+    ensure!(
+        store.state.pending.is_none(),
+        "pending work must replay before directory repair"
+    );
+    ensure!(
+        store.volume(volume.id)?.directory_repair.as_ref() == Some(&repair.checkpoint),
+        "directory repair lost its durable anchors"
+    );
+    if repair.page.is_none() {
+        let (observed, force) = if !repair.index_done {
+            let mut index = repair
+                .index
+                .take()
+                .context("directory snapshot task was cancelled")?;
+            let (returned, page) = tokio::task::spawn_blocking(move || {
+                let page = index.next_batch(MUTATION_BATCH_LIMIT);
+                (index, page)
+            })
+            .await?;
+            repair.index = Some(returned);
+            let Some(page) = page? else {
+                repair.index_done = true;
+                return Ok(false);
+            };
+            (
+                page.into_iter()
+                    .filter(|meta| !repair.roots.contains(&meta.key))
+                    .collect::<Vec<_>>(),
+                false,
+            )
+        } else if !repair.deferred.is_empty() {
+            let count = repair.deferred.len().min(MUTATION_BATCH_LIMIT);
+            (repair.deferred.drain(..count).collect(), true)
+        } else if !repair.discovery_done {
+            let mut reader = repair
+                .discovery
+                .take()
+                .context("directory discovery reader is not open")?;
+            let (returned, page) = tokio::task::spawn_blocking(move || {
+                let page = reader.next();
+                (reader, page)
+            })
+            .await?;
+            repair.discovery = Some(returned);
+            let Some(page) = page else {
+                repair.discovery_done = true;
+                return Ok(false);
+            };
+            let page = page?;
+            ensure!(
+                page.len() <= MUTATION_BATCH_LIMIT,
+                "directory discovery page exceeded limit"
+            );
+            let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+            let mut changes = Vec::new();
+            for meta in page {
+                if !repair.roots.contains(&meta.key)
+                    && meta
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path_selected(path, &repair.checkpoint.discover_paths))
+                    && meta_index::file_meta(&index, meta.key)?
+                        .is_none_or(|old| !same_snapshot(&old, &meta))
+                {
+                    changes.push(MetadataChange::Upsert(meta));
+                }
+            }
+            repair.page = Some(changes);
+            (Vec::new(), false)
+        } else if !repair.ordinary.is_empty() {
+            let count = repair.ordinary.len().min(MUTATION_BATCH_LIMIT);
+            let original: Vec<_> = repair.ordinary.iter().take(count).cloned().collect();
+            let keys: Vec<_> = original
+                .iter()
+                .filter_map(|change| {
+                    if let MetadataChange::Upsert(meta) = change {
+                        Some(meta.key)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let current = resolve(keys.clone()).await?;
+            ensure!(
+                current.len() == keys.len(),
+                "ordinary resolver omitted results"
+            );
+            let mut refreshed = BTreeMap::new();
+            for (key, meta) in keys.into_iter().zip(current) {
+                if let Some(meta) = &meta {
+                    ensure!(
+                        meta.key == key && meta.volume == volume.id,
+                        "ordinary resolver changed identity"
+                    );
+                }
+                refreshed.insert(
+                    key,
+                    meta.map_or(MetadataChange::Delete(key), MetadataChange::Upsert),
+                );
+            }
+            repair.ordinary.drain(..count);
+            repair.page = Some(
+                original
+                    .into_iter()
+                    .map(|change| refreshed.remove(&change.key()).unwrap_or(change))
+                    .collect(),
+            );
+            (Vec::new(), false)
+        } else {
+            let count = repair.roots.len().min(MUTATION_BATCH_LIMIT);
+            let keys: Vec<_> = repair.roots.iter().take(count).copied().collect();
+            // The final identity probe also revalidates the ORIGINAL journal
+            // position after any long pause or subtree discovery.
+            let current = resolve(keys.clone()).await?;
+            ensure!(
+                current.len() == keys.len(),
+                "directory resolver omitted results"
+            );
+            let mut changes = Vec::new();
+            for (key, meta) in keys.iter().zip(current) {
+                if let Some(meta) = &meta {
+                    ensure!(meta.key == *key, "directory resolver changed identity");
+                }
+                changes.push(meta.map_or(MetadataChange::Delete(*key), MetadataChange::Upsert));
+            }
+            repair.roots.drain(..count);
+            repair.final_page = repair.roots.is_empty();
+            repair.page = Some(changes);
+            (Vec::new(), false)
+        };
+        if repair.page.is_none() {
+            if observed.is_empty() {
+                return Ok(false);
+            }
+            let keys: Vec<_> = observed.iter().map(|meta| meta.key).collect();
+            let current = resolve(keys.clone()).await?;
+            ensure!(
+                current.len() == keys.len(),
+                "descendant resolver omitted results"
+            );
+            let mut changes = BTreeMap::new();
+            for (old, meta) in observed.into_iter().zip(current) {
+                if let Some(meta) = &meta {
+                    ensure!(
+                        meta.key == old.key && meta.volume == volume.id,
+                        "descendant resolver changed identity"
+                    );
+                    if !force && same_snapshot(&old, meta) {
+                        continue;
+                    }
+                }
+                changes.insert(
+                    old.key,
+                    meta.map_or(MetadataChange::Delete(old.key), MetadataChange::Upsert),
+                );
+            }
+            repair.page = Some(changes.into_values().collect());
+        }
+    }
+    let page = repair
+        .page
+        .as_ref()
+        .context("directory mutation page missing")?;
+    if page.is_empty() && !repair.final_page {
+        repair.page = None;
+        return Ok(false);
+    }
+    store.begin(pending_for_volume(
+        volume,
+        page.clone(),
+        repair.final_page.then_some(repair.checkpoint.through),
+        false,
+        cfg,
+    ))?;
+    repair.page = None;
+    commit(store, cfg).await?;
+    Ok(repair.final_page)
 }
 
 async fn apply_journal_batch<C>(
@@ -507,11 +1156,7 @@ where
     );
     let next = batch.cursor;
     let Some(changes) = resolve_events(&batch.events, cfg, &store.state.deferred)? else {
-        hide_volume(volume.id);
-        let state = store.volume_mut(volume.id)?;
-        state.needs_scan = true;
-        state.catching_up = true;
-        store.save()?;
+        require_full_scan(store, volume.id)?;
         return Ok(VolumeProgress {
             journal_read: false,
             work_remaining: true,
@@ -523,36 +1168,40 @@ where
         store.volume_mut(volume.id)?.catching_up = true;
         store.save()?;
     }
+    let mut reconciled_after_read = false;
     if !changes.is_empty() {
         // The raw read's cursor belongs only to its final mutation batch;
         // earlier chunks can safely replay after an interrupted volume turn.
         let count = changes.chunks(MUTATION_BATCH_LIMIT).len();
         for (number, chunk) in changes.chunks(MUTATION_BATCH_LIMIT).enumerate() {
             let checkpoint = (number + 1 == count).then_some(next);
-            store.begin(pending_for_volume(
-                volume,
-                chunk.to_vec(),
-                checkpoint,
-                false,
-                cfg,
-            ))?;
+            let pending = pending_for_volume(volume, chunk.to_vec(), checkpoint, false, cfg);
+            let reconciles = pending.worker.jobs.iter().any(|job| {
+                job.operation == crate::dispatcher::job_dispatch::JobOperation::Reconcile
+            });
+            store.begin(pending)?;
+            reconciled_after_read |= reconciles;
             commit(store, cfg).await?;
         }
     } else {
         store.volume_mut(volume.id)?.cursor = Some(next);
     }
-    // Our own checkpoint/log writes cannot prevent catch-up forever: the reader
-    // compares progress against its observed pre-read head.
-    if batch.caught_up {
+    // A pre-worker read cannot certify moves that invalidate queued pathnames.
+    // Require a fresh read after Reconcile admission before retiring coverage
+    // debt. Our excluded checkpoint/log writes still count as bounded progress.
+    let coverage_verified = batch.caught_up && !reconciled_after_read;
+    if coverage_verified {
         if store.volume(volume.id)?.catching_up {
-            store.volume_mut(volume.id)?.catching_up = false;
+            let volume = store.volume_mut(volume.id)?;
+            volume.catching_up = false;
+            volume.unsettled_directories.clear();
             store.save()?;
         }
         show_volume(volume.id);
     }
     Ok(VolumeProgress {
         journal_read: true,
-        work_remaining: !batch.caught_up,
+        work_remaining: !coverage_verified,
     })
 }
 
@@ -730,7 +1379,9 @@ fn resolve_events(
     let mut seen = BTreeSet::new();
     for event in events {
         match event {
-            FileEvent::RescanRequired { .. } => return Ok(None),
+            FileEvent::RescanRequired { .. } | FileEvent::DirectoryRenamed { .. } => {
+                return Ok(None);
+            }
             FileEvent::Excluded { doc, is_dir } => {
                 if indexed(*doc)? || seen.contains(doc) {
                     if *is_dir {
@@ -1105,6 +1756,1171 @@ mod tests {
         apply_metadata(cfg, batch)?;
         store.finish()?;
         show_pending(batch);
+        Ok(())
+    }
+
+    fn directory_meta(key: DocKey, parent: DocKey, path: &str) -> FileMeta {
+        let mut meta = meta(key, path.rsplit('\\').next().unwrap_or("root"), 0);
+        meta.parent = Some(parent);
+        meta.path = Some(path.into());
+        meta.flags = FileFlags::IS_DIR;
+        meta
+    }
+
+    async fn commit_directory_fixture(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
+        let batch = store
+            .state
+            .pending
+            .clone()
+            .context("missing fixture batch")?;
+        ensure!(
+            batch.worker.reset_volumes.is_empty(),
+            "directory repair reset unrelated documents"
+        );
+        ensure!(
+            batch.metadata.len() <= MUTATION_BATCH_LIMIT,
+            "unbounded directory mutation"
+        );
+        let snapshots: Vec<_> = batch
+            .metadata
+            .iter()
+            .filter_map(|change| {
+                if let MetadataChange::Upsert(meta) = change {
+                    Some((meta, "directorypayload"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hide_pending(&batch);
+        worker_outcome(cfg, &batch, &snapshots, &[])?;
+        finish(store, cfg, &batch)
+    }
+
+    async fn seed_directory_fixture(
+        store: &mut StateStore,
+        volume: &VolumeInfo,
+        cfg: &AppConfig,
+        metas: &[FileMeta],
+    ) -> Result<()> {
+        for chunk in metas.chunks(MUTATION_BATCH_LIMIT) {
+            store.begin(pending_for_volume(
+                volume,
+                chunk.iter().cloned().map(MetadataChange::Upsert).collect(),
+                None,
+                false,
+                cfg,
+            ))?;
+            commit_directory_fixture(store, cfg).await?;
+        }
+        let checkpoint = store.volume_mut(volume.id)?;
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        checkpoint.content_policy = Some(ContentPolicy::for_volume(volume, cfg));
+        store.save()?;
+        show_volume(volume.id);
+        Ok(())
+    }
+
+    fn search_directory_path(
+        handler: &UnifiedSearchHandler,
+        path: &str,
+        mode: SearchMode,
+    ) -> SearchResponse {
+        handler.search(SearchRequest {
+            id: Uuid::new_v4(),
+            query: QueryExpr::Term(TermExpr {
+                field: Some(ipc::FieldKind::Path),
+                value: path.into(),
+                modifier: TermModifier::Term,
+            }),
+            limit: 1000,
+            offset: 0,
+            mode,
+            timeout: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn directory_repair_replays_bounded_pages_and_preserves_unrelated_search() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60030)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        let parent = DocKey::from_parts(volume.id, 5);
+        let folder = DocKey::from_parts(volume.id, 10);
+        let directory = directory_meta(folder, parent, r"C:\oldroot");
+        let mut renamed = directory.clone();
+        renamed.name = "newroot".into();
+        renamed.path = Some(r"C:\newroot".into());
+        let mut originals = vec![directory_meta(parent, parent, r"C:\"), directory];
+        let mut current = BTreeMap::from([
+            (parent, Some(originals[0].clone())),
+            (folder, Some(renamed.clone())),
+        ]);
+        for file in 100..(100 + MUTATION_BATCH_LIMIT as u64 + 5) {
+            let mut original = meta(
+                DocKey::from_parts(volume.id, file),
+                &format!("proof{file}.txt"),
+                20,
+            );
+            original.path = Some(format!(r"C:\oldroot\{}", original.name));
+            let mut moved = original.clone();
+            moved.path = Some(format!(r"C:\newroot\{}", moved.name));
+            current.insert(original.key, (file != 103).then_some(moved));
+            originals.push(original);
+        }
+        let mut unrelated = meta(DocKey::from_parts(volume.id, 999), "unrelated.txt", 10);
+        unrelated.path = Some(r"C:\oldrootish\unrelated.txt".into());
+        originals.push(unrelated.clone());
+        seed_directory_fixture(&mut store, &volume, &cfg, &originals).await?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        let retry_key = DocKey::from_parts(volume.id, 888);
+        let mut retry = meta(retry_key, "deferred.txt", 10);
+        retry.path = Some(r"C:\oldroot\deferred.txt".into());
+        store.state.deferred.push(DeferredFile {
+            meta: retry.clone(),
+            attempts: 2,
+            retry_at: 999,
+        });
+        retry.path = Some(r"C:\newroot\deferred.txt".into());
+        current.insert(retry_key, Some(retry));
+        store.save()?;
+        let through = JournalCursor {
+            journal_id: before.journal_id,
+            last_usn: before.last_usn + 100,
+        };
+        let batch = JournalBatch {
+            events: vec![
+                FileEvent::DirectoryRenamed {
+                    doc: folder,
+                    parent,
+                    name: "oldroot".into(),
+                    current: Some(renamed.clone()),
+                },
+                FileEvent::DirectoryRenamed {
+                    doc: folder,
+                    parent,
+                    name: "newroot".into(),
+                    current: Some(renamed),
+                },
+            ],
+            cursor: through,
+            caught_up: true,
+        };
+        let config = ReaderConfig::default();
+        let mut repair = prepare_directory_repair(&mut store, &volume, &cfg, &batch, &config, &[])?
+            .context("ordinary rename requested reset")?;
+        assert!(
+            repair.discovery_done,
+            "known subtree should not enumerate the MFT"
+        );
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            assert_eq!(search_directory_path(&handler, "oldroot", mode).total, 0);
+            assert_eq!(
+                search(&handler, "unrelated", mode).hits[0].key,
+                unrelated.key
+            );
+        }
+        // Crash after the content half of a real descendant commit. The old
+        // raw cursor and all subtree masks must survive the partial transaction.
+        let mut failed = false;
+        for _ in 0..100 {
+            let result = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| current.get(&key).cloned().flatten())
+                        .collect())
+                },
+                async |store, cfg| {
+                    let pending = store
+                        .state
+                        .pending
+                        .clone()
+                        .context("pending page missing")?;
+                    assert!(
+                        !pending
+                            .metadata
+                            .iter()
+                            .any(|change| change.key() == unrelated.key)
+                    );
+                    let snapshots: Vec<_> = pending
+                        .metadata
+                        .iter()
+                        .filter_map(|change| {
+                            if let MetadataChange::Upsert(meta) = change {
+                                Some((meta, "directorypayload"))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    hide_pending(&pending);
+                    worker_outcome(cfg, &pending, &snapshots, &[])?;
+                    anyhow::bail!("simulated loss before metadata acknowledgement")
+                },
+            )
+            .await;
+            if result.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(before));
+        assert!(store.state.pending.is_some());
+        let anchors = store.volume(volume.id)?.directory_repair.clone().unwrap();
+        drop(repair);
+        drop(store);
+        let mut store = StateStore::open(&cfg)?;
+        assert_eq!(store.volume(volume.id)?.directory_repair, Some(anchors));
+        replay_pending(
+            &mut store,
+            &cfg,
+            &BTreeSet::from([volume.id]),
+            commit_directory_fixture,
+        )
+        .await?;
+        let mut repair =
+            prepare_directory_repair(&mut store, &volume, &cfg, &batch, &config, &[])?.unwrap();
+        assert!(!repair.discovery_done);
+        let snapshot: Vec<_> = current.values().flatten().cloned().collect();
+        let pages: Vec<_> = snapshot
+            .chunks(MUTATION_BATCH_LIMIT)
+            .map(|page| Ok(page.to_vec()))
+            .collect();
+        repair.discovery = Some(Box::new(pages.into_iter()));
+        let mut done = false;
+        for _ in 0..200 {
+            done = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| current.get(&key).cloned().flatten())
+                        .collect())
+                },
+                async |store, cfg| {
+                    assert!(
+                        !store
+                            .state
+                            .pending
+                            .as_ref()
+                            .unwrap()
+                            .metadata
+                            .iter()
+                            .any(|change| change.key() == unrelated.key)
+                    );
+                    commit_directory_fixture(store, cfg).await
+                },
+            )
+            .await?;
+            if done {
+                break;
+            }
+            assert_eq!(store.volume(volume.id)?.cursor, Some(before));
+            assert_eq!(
+                search(&handler, "unrelated", SearchMode::Content).hits[0].key,
+                unrelated.key
+            );
+        }
+        assert!(done);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(through));
+        assert!(!store.volume(volume.id)?.needs_scan);
+        assert!(store.volume(volume.id)?.directory_repair.is_none());
+        assert!(store.state.deferred.is_empty());
+        show_directories(volume.id);
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            assert_eq!(search_directory_path(&handler, "oldroot", mode).total, 0);
+            let hits = search_directory_path(&handler, "newroot", mode).hits;
+            let keys: BTreeSet<_> = hits.iter().map(|hit| hit.key).collect();
+            assert_eq!(keys.len(), hits.len());
+            assert!(keys.contains(&retry_key));
+            assert!(!keys.contains(&DocKey::from_parts(volume.id, 103)));
+            assert!(keys.contains(&DocKey::from_parts(volume.id, 100)));
+            assert_eq!(
+                search(&handler, "unrelated", mode).hits[0].key,
+                unrelated.key
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_move_after_admission_recovers_children_tombstoned_at_obsolete_paths()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60034)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        let parent = DocKey::from_parts(volume.id, 5);
+        let folder = DocKey::from_parts(volume.id, 10);
+        let child = DocKey::from_parts(volume.id, 20);
+        let first = directory_meta(folder, parent, r"C:\first");
+        let middle = directory_meta(folder, parent, r"C:\middle");
+        let final_root = directory_meta(folder, parent, r"C:\final");
+        let mut first_child = meta(child, "racechild.txt", 10);
+        first_child.path = Some(r"C:\first\racechild.txt".into());
+        let mut middle_child = first_child.clone();
+        middle_child.path = Some(r"C:\middle\racechild.txt".into());
+        let mut final_child = first_child.clone();
+        final_child.path = Some(r"C:\final\racechild.txt".into());
+        let sentinel = meta(DocKey::from_parts(volume.id, 30), "sentinel.txt", 10);
+        seed_directory_fixture(
+            &mut store,
+            &volume,
+            &cfg,
+            &[
+                directory_meta(parent, parent, r"C:\"),
+                first,
+                first_child,
+                sentinel.clone(),
+            ],
+        )
+        .await?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        let batch = JournalBatch {
+            events: vec![FileEvent::DirectoryRenamed {
+                doc: folder,
+                parent,
+                name: "first".into(),
+                current: Some(middle.clone()),
+            }],
+            cursor: JournalCursor {
+                last_usn: before.last_usn + 100,
+                ..before
+            },
+            caught_up: true,
+        };
+        let reader = ReaderConfig::default();
+        let mut repair =
+            prepare_directory_repair(&mut store, &volume, &cfg, &batch, &reader, &[])?.unwrap();
+        assert!(repair.discovery_done, "known first move need not scan MFT");
+        let moved_again = std::sync::atomic::AtomicBool::new(false);
+        let mut done = false;
+        for _ in 0..50 {
+            done = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| {
+                            let moved = moved_again.load(Ordering::SeqCst);
+                            Some(if key == folder {
+                                if moved {
+                                    final_root.clone()
+                                } else {
+                                    middle.clone()
+                                }
+                            } else {
+                                assert_eq!(key, child);
+                                if moved {
+                                    final_child.clone()
+                                } else {
+                                    middle_child.clone()
+                                }
+                            })
+                        })
+                        .collect())
+                },
+                async |store, cfg| {
+                    let pending = store.state.pending.clone().unwrap();
+                    assert!(pending.worker.reset_volumes.is_empty());
+                    assert!(
+                        !pending
+                            .metadata
+                            .iter()
+                            .any(|change| change.key() == sentinel.key)
+                    );
+                    if pending.metadata.iter().any(|change| change.key() == child) {
+                        let job = pending
+                            .worker
+                            .jobs
+                            .iter()
+                            .find(|job| {
+                                job.volume_id == child.volume() && job.file_id == child.file_id()
+                            })
+                            .unwrap();
+                        assert_eq!(job.operation, JobOperation::Reconcile);
+                        assert_eq!(job.path, Path::new(r"C:\middle\racechild.txt"));
+                        assert!(!moved_again.swap(true, Ordering::SeqCst));
+                        // The second move occurs after durable admission and
+                        // before the worker opens the obsolete middle pathname.
+                        // Its successful tombstone has no deferred-file debt.
+                        hide_pending(&pending);
+                        worker_outcome(cfg, &pending, &[], &[])?;
+                        finish(store, cfg, &pending)
+                    } else {
+                        commit_directory_fixture(store, cfg).await
+                    }
+                },
+            )
+            .await?;
+            assert_eq!(
+                search(&handler, "sentinel", SearchMode::Hybrid).hits[0].key,
+                sentinel.key
+            );
+            if done {
+                break;
+            }
+        }
+        assert!(done && moved_again.load(Ordering::SeqCst));
+        assert!(store.state.deferred.is_empty());
+        assert_eq!(store.volume(volume.id)?.cursor, Some(batch.cursor));
+        let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+        assert!(meta_index::file_meta(&index, child)?.is_none());
+        assert_eq!(
+            meta_index::file_meta(&index, folder)?.unwrap().path,
+            final_root.path
+        );
+        assert!(
+            search(&handler, "racechild", SearchMode::Content)
+                .hits
+                .is_empty()
+        );
+        show_directories(volume.id);
+        drop(repair);
+        drop(store);
+        let mut store = StateStore::open(&cfg)?;
+        assert!(
+            store
+                .volume(volume.id)?
+                .unsettled_directories
+                .contains(&folder)
+        );
+
+        // Only the directory has another journal event. The unchanged child is
+        // absent from the index, so a second prefix-only scan cannot recover it.
+        let later = JournalBatch {
+            events: vec![FileEvent::DirectoryRenamed {
+                doc: folder,
+                parent,
+                name: "middle".into(),
+                current: Some(final_root.clone()),
+            }],
+            cursor: JournalCursor {
+                last_usn: batch.cursor.last_usn + 100,
+                ..batch.cursor
+            },
+            caught_up: true,
+        };
+        let mut repair =
+            prepare_directory_repair(&mut store, &volume, &cfg, &later, &reader, &[])?.unwrap();
+        assert!(!repair.discovery_done);
+        repair.discovery = Some(Box::new(vec![Ok(vec![final_child.clone()])].into_iter()));
+        done = false;
+        for _ in 0..50 {
+            done = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| {
+                            assert_eq!(key, folder);
+                            Some(final_root.clone())
+                        })
+                        .collect())
+                },
+                commit_directory_fixture,
+            )
+            .await?;
+            assert_eq!(
+                search(&handler, "sentinel", SearchMode::Hybrid).hits[0].key,
+                sentinel.key
+            );
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        show_directories(volume.id);
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor: later.cursor,
+                caught_up: true,
+            },
+            commit_directory_fixture,
+        )
+        .await?;
+        assert!(store.volume(volume.id)?.unsettled_directories.is_empty());
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            let found = search(&handler, "racechild", mode);
+            assert_eq!(found.total, 1);
+            assert_eq!(found.hits[0].key, child);
+            assert_eq!(
+                found.hits[0].path.as_deref(),
+                Some(r"C:\final\racechild.txt")
+            );
+            assert_eq!(search_directory_path(&handler, "first", mode).total, 0);
+            assert_eq!(search_directory_path(&handler, "middle", mode).total, 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_directory_rename_recovers_child_lost_during_baseline_or_ordinary_edit()
+    -> Result<()> {
+        async fn obsolete_path(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
+            let pending = store.state.pending.clone().unwrap();
+            assert!(pending.worker.reset_volumes.is_empty());
+            assert_eq!(pending.worker.jobs.len(), 1);
+            assert_eq!(pending.worker.jobs[0].operation, JobOperation::Reconcile);
+            assert_eq!(
+                pending.worker.jobs[0].path,
+                Path::new(r"C:\source\lostchild.txt")
+            );
+            assert!(store.volume(pending.volume)?.catching_up);
+            // The parent moves after this old pathname was durably queued.
+            // A real worker returns this successful obsolete/tombstoned outcome.
+            hide_pending(&pending);
+            worker_outcome(cfg, &pending, &[], &[])?;
+            finish(store, cfg, &pending)
+        }
+
+        for baseline in [true, false] {
+            let root = tempfile::tempdir()?;
+            let (mut cfg, mut store, volume, before) =
+                baseline_store(root.path(), if baseline { 60035 } else { 60036 })?;
+            cfg.content_index_volumes = vec!["X:\\".into()];
+            let parent = DocKey::from_parts(volume.id, 5);
+            let folder = DocKey::from_parts(volume.id, 10);
+            let child = DocKey::from_parts(volume.id, 20);
+            let source = directory_meta(folder, parent, r"C:\source");
+            let target = directory_meta(folder, parent, r"C:\destination");
+            let mut original_child = meta(child, "lostchild.txt", 10);
+            original_child.path = Some(r"C:\source\lostchild.txt".into());
+            let mut current_child = original_child.clone();
+            current_child.path = Some(r"C:\destination\lostchild.txt".into());
+            let sentinel = meta(DocKey::from_parts(volume.id, 30), "survivor.txt", 10);
+            let mut seeded = vec![
+                directory_meta(parent, parent, r"C:\"),
+                source,
+                sentinel.clone(),
+            ];
+            if !baseline {
+                seeded.push(original_child.clone());
+            }
+            seed_directory_fixture(&mut store, &volume, &cfg, &seeded).await?;
+            if baseline {
+                // Prior baseline pages already committed the root and sentinel.
+                // This later MFT page loses the child before validated EOF.
+                store.volume_mut(volume.id)?.needs_scan = true;
+                store.save()?;
+                let mut scan = MftProgress::new(before, vec![Ok(vec![original_child])].into_iter());
+                scan.reset_admitted = true;
+                assert!(
+                    !apply_mft_scan(&mut store, &volume, &cfg, &mut scan, obsolete_path).await?
+                );
+                assert!(apply_mft_scan(&mut store, &volume, &cfg, &mut scan, obsolete_path).await?);
+            } else {
+                let progress = apply_journal_batch(
+                    &mut store,
+                    &volume,
+                    &cfg,
+                    JournalBatch {
+                        events: vec![FileEvent::Modified(original_child)],
+                        cursor: JournalCursor {
+                            last_usn: before.last_usn + 50,
+                            ..before
+                        },
+                        caught_up: true,
+                    },
+                    obsolete_path,
+                )
+                .await?;
+                assert!(
+                    progress.work_remaining,
+                    "pre-worker head incorrectly certified coverage"
+                );
+            }
+            assert!(!store.volume(volume.id)?.needs_scan);
+            assert!(store.volume(volume.id)?.catching_up);
+            assert!(store.volume(volume.id)?.unsettled_directories.is_empty());
+            assert!(store.state.deferred.is_empty());
+            let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+            assert!(meta_index::file_meta(&index, child)?.is_none());
+            assert!(meta_index::file_meta(&index, folder)?.is_some());
+            drop(store);
+            let mut store = StateStore::open(&cfg)?;
+            assert!(store.volume(volume.id)?.catching_up);
+            let cursor = store.volume(volume.id)?.cursor.unwrap();
+            let batch = JournalBatch {
+                events: vec![FileEvent::DirectoryRenamed {
+                    doc: folder,
+                    parent,
+                    name: "source".into(),
+                    current: Some(target.clone()),
+                }],
+                cursor: JournalCursor {
+                    last_usn: cursor.last_usn + 100,
+                    ..cursor
+                },
+                caught_up: true,
+            };
+            let mut repair = prepare_directory_repair(
+                &mut store,
+                &volume,
+                &cfg,
+                &batch,
+                &ReaderConfig::default(),
+                &[],
+            )?
+            .unwrap();
+            assert!(
+                !repair.discovery_done,
+                "first rename forgot obsolete child coverage"
+            );
+            repair.discovery = Some(Box::new(vec![Ok(vec![current_child.clone()])].into_iter()));
+            let handler = UnifiedSearchHandler::try_new(
+                Path::new(&cfg.paths.meta_index),
+                Path::new(&cfg.paths.content_index),
+            )?;
+            let mut done = false;
+            for _ in 0..50 {
+                done = apply_directory_turn(
+                    &mut store,
+                    &volume,
+                    &cfg,
+                    &mut repair,
+                    async |keys| {
+                        Ok(keys
+                            .into_iter()
+                            .map(|key| {
+                                assert_eq!(key, folder);
+                                Some(target.clone())
+                            })
+                            .collect())
+                    },
+                    commit_directory_fixture,
+                )
+                .await?;
+                assert_eq!(
+                    search(&handler, "survivor", SearchMode::Hybrid).hits[0].key,
+                    sentinel.key
+                );
+                if done {
+                    break;
+                }
+            }
+            assert!(done);
+            assert!(store.volume(volume.id)?.catching_up);
+            apply_journal_batch(
+                &mut store,
+                &volume,
+                &cfg,
+                JournalBatch {
+                    events: Vec::new(),
+                    cursor: batch.cursor,
+                    caught_up: true,
+                },
+                commit_directory_fixture,
+            )
+            .await?;
+            assert!(!store.volume(volume.id)?.catching_up);
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Hybrid,
+            ] {
+                let found = search(&handler, "lostchild", mode);
+                assert_eq!(found.total, 1);
+                assert_eq!(found.hits[0].key, child);
+                assert_eq!(
+                    found.hits[0].path.as_deref(),
+                    Some(r"C:\destination\lostchild.txt")
+                );
+                assert_eq!(search_directory_path(&handler, "source", mode).total, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_anchors_cover_intermediate_names_and_excluded_descendants() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60031)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        let parent = DocKey::from_parts(volume.id, 5);
+        let folder = DocKey::from_parts(volume.id, 10);
+        let old = directory_meta(folder, parent, r"C:\first");
+        let final_meta = directory_meta(folder, parent, r"C:\excluded\final");
+        let mut child = meta(DocKey::from_parts(volume.id, 50), "child.txt", 10);
+        child.path = Some(r"C:\middle\child.txt".into());
+        seed_directory_fixture(
+            &mut store,
+            &volume,
+            &cfg,
+            &[directory_meta(parent, parent, r"C:\"), old, child.clone()],
+        )
+        .await?;
+        let excluded_parent = DocKey::from_parts(volume.id, 11);
+        let reader = ReaderConfig {
+            exclude_paths: vec![r"C:\excluded".into()],
+            ..ReaderConfig::default()
+        };
+        let batch = JournalBatch {
+            events: [
+                (parent, "first"),
+                (parent, "middle"),
+                (parent, "middle"),
+                (excluded_parent, "final"),
+            ]
+            .into_iter()
+            .map(|(parent, name)| FileEvent::DirectoryRenamed {
+                doc: folder,
+                parent,
+                name: name.into(),
+                current: Some(final_meta.clone()),
+            })
+            .collect(),
+            cursor: JournalCursor {
+                last_usn: before.last_usn + 100,
+                ..before
+            },
+            caught_up: true,
+        };
+        let mut repair = prepare_directory_repair(
+            &mut store,
+            &volume,
+            &cfg,
+            &batch,
+            &reader,
+            &[Some(directory_meta(
+                excluded_parent,
+                parent,
+                r"C:\excluded",
+            ))],
+        )?
+        .context("anchored move into exclusion requested reset")?;
+        assert!(
+            repair
+                .checkpoint
+                .paths
+                .contains(&normalize_index_path(r"C:\middle"))
+        );
+        assert!(repair.discovery_done);
+        let mut done = false;
+        for _ in 0..50 {
+            done = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| Ok(vec![None; keys.len()]),
+                commit_directory_fixture,
+            )
+            .await?;
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        show_directories(volume.id);
+        let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+        assert!(meta_index::file_meta(&index, child.key)?.is_none());
+        assert!(meta_index::file_meta(&index, folder)?.is_none());
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert!(
+            search(&handler, "child", SearchMode::Content)
+                .hits
+                .is_empty()
+        );
+        assert!(!store.volume(volume.id)?.needs_scan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_obligations_survive_root_commit_ancestor_moves_and_child_moves_out()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60032)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        let root_key = DocKey::from_parts(volume.id, 5);
+        let ancestor = DocKey::from_parts(volume.id, 10);
+        let entered = DocKey::from_parts(volume.id, 20);
+        let child = DocKey::from_parts(volume.id, 30);
+        let first_leaf = DocKey::from_parts(volume.id, 40);
+        let escaped_leaf = DocKey::from_parts(volume.id, 50);
+        let excluded_parent = DocKey::from_parts(volume.id, 60);
+        let root_meta = directory_meta(root_key, root_key, r"C:\");
+        let ancestor_meta = directory_meta(ancestor, root_key, r"C:\parent");
+        // The baseline saw this root after the move, but skipped its unchanged
+        // children while they were still excluded. An indexed root alone does
+        // not certify that those children were discovered.
+        let entered_meta = directory_meta(entered, ancestor, r"C:\parent\entry");
+        seed_directory_fixture(
+            &mut store,
+            &volume,
+            &cfg,
+            &[root_meta, ancestor_meta, entered_meta],
+        )
+        .await?;
+        let reader = ReaderConfig {
+            exclude_paths: vec![r"C:\excluded".into()],
+            ..ReaderConfig::default()
+        };
+        let resolved_parent = Some(directory_meta(excluded_parent, root_key, r"C:\excluded"));
+        let mut cursor = before;
+        let mut current_files = BTreeMap::new();
+        for (key, parent, old_name, path) in [
+            (entered, excluded_parent, "entry", r"C:\parent\entry"),
+            (ancestor, root_key, "parent", r"C:\movedparent"),
+            (child, entered, "child", r"C:\escapedchild"),
+        ] {
+            let current_parent = if key == entered { ancestor } else { parent };
+            let current = directory_meta(key, current_parent, path);
+            current_files.insert(key, current.clone());
+            let page = if key == entered {
+                let nested = directory_meta(child, entered, r"C:\parent\entry\child");
+                current_files.insert(child, nested.clone());
+                vec![nested]
+            } else if key == ancestor {
+                current_files.insert(
+                    entered,
+                    directory_meta(entered, ancestor, r"C:\movedparent\entry"),
+                );
+                current_files.insert(
+                    child,
+                    directory_meta(child, entered, r"C:\movedparent\entry\child"),
+                );
+                let mut leaf = meta(first_leaf, "latearrival.txt", 10);
+                leaf.path = Some(r"C:\movedparent\entry\latearrival.txt".into());
+                current_files.insert(first_leaf, leaf.clone());
+                vec![leaf]
+            } else {
+                let mut leaf = meta(escaped_leaf, "escapedarrival.txt", 10);
+                leaf.path = Some(r"C:\escapedchild\escapedarrival.txt".into());
+                current_files.insert(escaped_leaf, leaf.clone());
+                vec![leaf]
+            };
+            let batch = JournalBatch {
+                events: vec![FileEvent::DirectoryRenamed {
+                    doc: key,
+                    parent,
+                    name: old_name.into(),
+                    current: Some(current.clone()),
+                }],
+                cursor: JournalCursor {
+                    last_usn: cursor.last_usn + 100,
+                    ..cursor
+                },
+                caught_up: true,
+            };
+            let mut repair = prepare_directory_repair(
+                &mut store,
+                &volume,
+                &cfg,
+                &batch,
+                &reader,
+                std::slice::from_ref(&resolved_parent),
+            )?
+            .unwrap();
+            assert!(
+                !repair.discovery_done,
+                "partially discovered ancestry was incorrectly considered complete"
+            );
+            // Simulate one bounded native MFT page. The first scan observes a
+            // child directory but misses its later descendants after a move.
+            repair.discovery = Some(Box::new(vec![Ok(page)].into_iter()));
+            let mut done = false;
+            for _ in 0..50 {
+                done = apply_directory_turn(
+                    &mut store,
+                    &volume,
+                    &cfg,
+                    &mut repair,
+                    async |keys| {
+                        Ok(keys
+                            .into_iter()
+                            .map(|candidate| current_files.get(&candidate).cloned())
+                            .collect())
+                    },
+                    commit_directory_fixture,
+                )
+                .await?;
+                if done {
+                    break;
+                }
+            }
+            assert!(done);
+            cursor = batch.cursor;
+            assert!(
+                store
+                    .volume(volume.id)?
+                    .unsettled_directories
+                    .contains(&entered)
+            );
+            assert!(
+                store
+                    .volume(volume.id)?
+                    .unsettled_directories
+                    .contains(&key)
+            );
+            assert!(store.volume(volume.id)?.directory_repair.is_none());
+            let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+            assert!(meta_index::file_meta(&index, child)?.is_some());
+            if key == entered {
+                assert!(meta_index::file_meta(&index, first_leaf)?.is_none());
+                assert!(meta_index::file_meta(&index, escaped_leaf)?.is_none());
+            } else if key == ancestor {
+                assert_eq!(
+                    meta_index::file_meta(&index, first_leaf)?
+                        .unwrap()
+                        .path
+                        .as_deref(),
+                    Some(r"C:\movedparent\entry\latearrival.txt")
+                );
+                assert!(meta_index::file_meta(&index, escaped_leaf)?.is_none());
+            } else {
+                assert_eq!(
+                    meta_index::file_meta(&index, escaped_leaf)?
+                        .unwrap()
+                        .path
+                        .as_deref(),
+                    Some(r"C:\escapedchild\escapedarrival.txt")
+                );
+            }
+            show_directories(volume.id);
+            drop(repair);
+            drop(store);
+            store = StateStore::open(&cfg)?;
+            assert!(
+                store
+                    .volume(volume.id)?
+                    .unsettled_directories
+                    .contains(&entered)
+            );
+        }
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor,
+                caught_up: true,
+            },
+            commit_directory_fixture,
+        )
+        .await?;
+        assert!(store.volume(volume.id)?.unsettled_directories.is_empty());
+        assert!(!store.volume(volume.id)?.catching_up);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "latearrival", SearchMode::Content).hits[0].key,
+            first_leaf
+        );
+        assert_eq!(
+            search(&handler, "escapedarrival", SearchMode::Content).hits[0].key,
+            escaped_leaf
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_page_restarts_after_probe_failure_and_waits_for_retry_capacity() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60033)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        let parent = DocKey::from_parts(volume.id, 5);
+        let folder = DocKey::from_parts(volume.id, 10);
+        let old = directory_meta(folder, parent, r"C:\before");
+        let renamed = directory_meta(folder, parent, r"C:\after");
+        let mut child = meta(DocKey::from_parts(volume.id, 50), "bounded.txt", 10);
+        child.path = Some(r"C:\before\bounded.txt".into());
+        seed_directory_fixture(
+            &mut store,
+            &volume,
+            &cfg,
+            &[directory_meta(parent, parent, r"C:\"), old, child.clone()],
+        )
+        .await?;
+        child.path = Some(r"C:\after\bounded.txt".into());
+        let current = BTreeMap::from([(folder, renamed.clone()), (child.key, child.clone())]);
+        for file in 1000..1000 + MAX_DEFERRED_FILES as u64 {
+            store.state.deferred.push(DeferredFile {
+                meta: meta(DocKey::from_parts(volume.id, file), "blocked.txt", 1),
+                attempts: 1,
+                retry_at: 999,
+            });
+        }
+        store.save()?;
+        let batch = JournalBatch {
+            events: vec![FileEvent::DirectoryRenamed {
+                doc: folder,
+                parent,
+                name: "before".into(),
+                current: Some(renamed),
+            }],
+            cursor: JournalCursor {
+                last_usn: before.last_usn + 100,
+                ..before
+            },
+            caught_up: true,
+        };
+        let config = ReaderConfig::default();
+        let mut repair = prepare_directory_repair(&mut store, &volume, &cfg, &batch, &config, &[])?
+            .context("bounded repair requested full scan")?;
+        let mut failed = false;
+        for _ in 0..50 {
+            let result = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |_| Err(NtfsError::Journal("metadata access denied".into()).into()),
+                commit_directory_fixture,
+            )
+            .await;
+            if result.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.volume(volume.id)?.cursor, Some(before));
+        // The production error branch discards the advanced volatile reader.
+        // Its durable anchors recreate a scan containing the unresolved child.
+        drop(repair);
+        let mut repair =
+            prepare_directory_repair(&mut store, &volume, &cfg, &batch, &config, &[])?.unwrap();
+        assert!(!repair.discovery_done);
+        repair.discovery = Some(Box::new(
+            vec![Ok(current.values().cloned().collect())].into_iter(),
+        ));
+        let mut rejected = false;
+        for _ in 0..50 {
+            let result = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| current.get(&key).cloned())
+                        .collect())
+                },
+                commit_directory_fixture,
+            )
+            .await;
+            if let Err(error) = result {
+                assert!(error.is::<state::DeferredCapacity>());
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        assert_eq!(
+            repair.page.as_ref().unwrap(),
+            &vec![MetadataChange::Upsert(child.clone())]
+        );
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.volume(volume.id)?.cursor, Some(before));
+        let error = apply_directory_turn(
+            &mut store,
+            &volume,
+            &cfg,
+            &mut repair,
+            async |_| panic!("retained page must not read or resolve ahead of admission"),
+            commit_directory_fixture,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<state::DeferredCapacity>());
+
+        // A normal deletion cancels one old retry and releases exactly one
+        // reserved slot. The retained child page can now commit unchanged.
+        let removed = store.state.deferred[0].meta.key;
+        store.begin(pending_for_volume(
+            &volume,
+            vec![MetadataChange::Delete(removed)],
+            None,
+            false,
+            &cfg,
+        ))?;
+        commit_directory_fixture(&mut store, &cfg).await?;
+        assert!(
+            !apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |_| panic!("admitting retained page must not repeat its native read"),
+                commit_directory_fixture,
+            )
+            .await?
+        );
+        let mut done = false;
+        for _ in 0..50 {
+            done = apply_directory_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &mut repair,
+                async |keys| {
+                    Ok(keys
+                        .into_iter()
+                        .map(|key| current.get(&key).cloned())
+                        .collect())
+                },
+                commit_directory_fixture,
+            )
+            .await?;
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        show_directories(volume.id);
+        let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+        assert_eq!(
+            meta_index::file_meta(&index, child.key)?.unwrap().path,
+            child.path
+        );
+        assert_eq!(store.volume(volume.id)?.cursor, Some(batch.cursor));
         Ok(())
     }
 
@@ -2262,6 +4078,310 @@ mod tests {
                 1
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_unavailable_retries_release_other_volumes_and_require_full_return_scan()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, source, source_start) = baseline_store(root.path(), 60_028)?;
+        cfg.volumes.push("Y:\\".into());
+        cfg.content_index_volumes = vec!["X:\\".into(), "Y:\\".into()];
+        let mut active = VolumeInfo {
+            id: 0,
+            guid_path: "active-with-saturated-offline-retries".into(),
+            drive_letters: vec!['Y'],
+        };
+        store.bind_volume(&mut active)?;
+        let active_start = JournalCursor {
+            journal_id: 71,
+            last_usn: 700,
+        };
+        for (id, cursor) in [(source.id, source_start), (active.id, active_start)] {
+            let checkpoint = store.volume_mut(id)?;
+            checkpoint.cursor = Some(cursor);
+            checkpoint.needs_scan = false;
+            checkpoint.catching_up = false;
+            show_volume(id);
+        }
+        store.save()?;
+        let old_source = meta(DocKey::from_parts(source.id, 2000), "offlinestale.txt", 10);
+        let removed_source = meta(DocKey::from_parts(source.id, 2001), "offlinegone.txt", 20);
+        let original = meta(DocKey::from_parts(active.id, 10), "activeretained.txt", 30);
+        let deleted = meta(DocKey::from_parts(active.id, 20), "activedeleted.txt", 40);
+        for (volume, snapshots) in [
+            (
+                &source,
+                vec![
+                    (&old_source, "offlinestaletoken"),
+                    (&removed_source, "offlinegonetoken"),
+                ],
+            ),
+            (
+                &active,
+                vec![
+                    (&original, "activeoldtoken"),
+                    (&deleted, "activedeletedtoken"),
+                ],
+            ),
+        ] {
+            let seed = pending_for_volume(
+                volume,
+                snapshots
+                    .iter()
+                    .map(|(meta, _)| MetadataChange::Upsert((*meta).clone()))
+                    .collect(),
+                None,
+                false,
+                &cfg,
+            );
+            store.begin(seed.clone())?;
+            worker_outcome(&cfg, &seed, &snapshots, &[])?;
+            finish(&mut store, &cfg, &seed)?;
+        }
+        // Model a valid, already-tombstoned retry ledger left by earlier
+        // bounded worker batches. Every slot belongs to the absent volume.
+        store.state.deferred = (1..=MAX_DEFERRED_FILES as u64)
+            .map(|id| DeferredFile {
+                meta: meta(DocKey::from_parts(source.id, id), "offlineheld.txt", 10),
+                attempts: 3,
+                retry_at: i64::MAX,
+            })
+            .collect();
+        store.save()?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "offlinestaletoken", SearchMode::Content).total,
+            1
+        );
+        let modified = meta(original.key, "activeretained.txt", 90);
+        let changes = ntfs_watcher::JournalBatch {
+            events: vec![
+                FileEvent::Modified(modified.clone()),
+                FileEvent::Deleted(deleted.key),
+            ],
+            cursor: JournalCursor {
+                last_usn: 800,
+                ..active_start
+            },
+            caught_up: true,
+        };
+        let error = apply_journal_batch(
+            &mut store,
+            &active,
+            &cfg,
+            changes.clone(),
+            async |_: &mut StateStore, _: &AppConfig| {
+                anyhow::bail!("full retry capacity unexpectedly admitted new work")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<state::DeferredCapacity>());
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.volume(active.id)?.cursor, Some(active_start));
+
+        // watch_changes masks unselected volumes, replays any global intent,
+        // then durably transfers their retries before admitting active work.
+        hide_volume(source.id);
+        let selected = BTreeSet::from([active.id]);
+        assert_eq!(
+            store.reclaim_unavailable_retries(&selected)?,
+            MAX_DEFERRED_FILES
+        );
+        assert!(store.state.deferred.is_empty());
+        drop(store);
+        let mut store = StateStore::open(&cfg)?;
+        assert!(store.state.retired_indices.is_empty());
+        assert!(store.volume(source.id)?.needs_scan);
+        assert!(store.volume(source.id)?.catching_up);
+        assert_eq!(store.volume(source.id)?.cursor, Some(source_start));
+        assert!(store.state.deferred.is_empty());
+        apply_journal_batch(
+            &mut store,
+            &active,
+            &cfg,
+            changes,
+            async |store: &mut StateStore, cfg: &AppConfig| {
+                let batch = store
+                    .state
+                    .pending
+                    .clone()
+                    .context("active intent missing")?;
+                hide_pending(&batch);
+                worker_commit(cfg, &batch, Some((&modified, "activeupdatedtoken")))?;
+                finish(store, cfg, &batch)
+            },
+        )
+        .await?;
+        assert_eq!(store.volume(active.id)?.cursor.unwrap().last_usn, 800);
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            let result = search(&handler, "activeretained", mode);
+            assert_eq!(result.total, 1);
+            assert_eq!(result.hits[0].key, original.key);
+            assert_eq!(result.hits[0].size, Some(90));
+            assert_eq!(search(&handler, "activedeleted", mode).total, 0);
+            assert_eq!(search(&handler, "offlinestale", mode).total, 0);
+        }
+        assert_eq!(
+            search(&handler, "activeoldtoken", SearchMode::Content).total,
+            0
+        );
+        assert_eq!(
+            search(&handler, "activeupdatedtoken", SearchMode::Content).total,
+            1
+        );
+
+        // Returning to selection cannot reveal the historical source cursor.
+        // Even an empty journal read is refused until the full scan completes.
+        assert_eq!(
+            store.reclaim_unavailable_retries(&BTreeSet::from([source.id, active.id]))?,
+            0
+        );
+        assert!(
+            apply_journal_batch(
+                &mut store,
+                &source,
+                &cfg,
+                ntfs_watcher::JournalBatch {
+                    events: Vec::new(),
+                    cursor: source_start,
+                    caught_up: true,
+                },
+                commit_metadata_batch,
+            )
+            .await
+            .is_err()
+        );
+        assert!(read_visibility().volumes.contains(&source.id));
+        let renamed = meta(old_source.key, "offlinerenamed.txt", 50);
+        let recovered = meta(DocKey::from_parts(source.id, 1), "offlinerecovered.txt", 60);
+        let mut scan = MftProgress::new(
+            JournalCursor {
+                last_usn: 500,
+                ..source_start
+            },
+            vec![Ok(vec![renamed.clone(), recovered.clone()])].into_iter(),
+        );
+        assert!(!metadata_turn(&mut store, &source, &cfg, &mut scan).await?);
+        assert!(read_visibility().volumes.contains(&source.id));
+        assert!(
+            !apply_mft_scan(
+                &mut store,
+                &source,
+                &cfg,
+                &mut scan,
+                async |store: &mut StateStore, cfg: &AppConfig| {
+                    let batch = store.state.pending.clone().context("source page missing")?;
+                    hide_pending(&batch);
+                    worker_outcome(
+                        cfg,
+                        &batch,
+                        &[
+                            (&renamed, "offlinerenamedtoken"),
+                            (&recovered, "offlinebaselinetoken"),
+                        ],
+                        &[],
+                    )?;
+                    finish(store, cfg, &batch)
+                },
+            )
+            .await?
+        );
+        assert!(metadata_turn(&mut store, &source, &cfg, &mut scan).await?);
+        assert!(!store.volume(source.id)?.needs_scan);
+        assert!(store.volume(source.id)?.catching_up);
+        assert_eq!(store.volume(source.id)?.cursor, Some(scan.start));
+        assert_eq!(
+            search(&handler, "offlinerenamed", SearchMode::NameOnly).total,
+            0
+        );
+        assert_eq!(
+            search(&handler, "offlinebaselinetoken", SearchMode::Content).total,
+            0
+        );
+        let current = meta(recovered.key, "offlinerecovered.txt", 80);
+        apply_journal_batch(
+            &mut store,
+            &source,
+            &cfg,
+            ntfs_watcher::JournalBatch {
+                events: vec![FileEvent::Modified(current.clone())],
+                cursor: JournalCursor {
+                    last_usn: 600,
+                    ..source_start
+                },
+                caught_up: true,
+            },
+            async |store: &mut StateStore, cfg: &AppConfig| {
+                let batch = store
+                    .state
+                    .pending
+                    .clone()
+                    .context("source catch-up missing")?;
+                hide_pending(&batch);
+                worker_commit(cfg, &batch, Some((&current, "offlinecurrenttoken")))?;
+                finish(store, cfg, &batch)
+            },
+        )
+        .await?;
+        assert!(store.volume(source.id)?.catching_up);
+        assert!(read_visibility().volumes.contains(&source.id));
+        let verification_cursor = store.volume(source.id)?.cursor.unwrap();
+        apply_journal_batch(
+            &mut store,
+            &source,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor: verification_cursor,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        assert!(!read_visibility().volumes.contains(&source.id));
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Hybrid,
+        ] {
+            let result = search(&handler, "offlinerecovered", mode);
+            assert_eq!(result.total, 1);
+            assert_eq!(result.hits[0].key, recovered.key);
+            assert_eq!(result.hits[0].size, Some(80));
+            assert_eq!(search(&handler, "offlinerenamed", mode).total, 1);
+            assert_eq!(search(&handler, "offlinestale", mode).total, 0);
+            assert_eq!(search(&handler, "offlinegone", mode).total, 0);
+            assert_eq!(search(&handler, "activeretained", mode).total, 1);
+        }
+        for token in [
+            "offlinestaletoken",
+            "offlinegonetoken",
+            "offlinebaselinetoken",
+        ] {
+            assert_eq!(search(&handler, token, SearchMode::Content).total, 0);
+        }
+        assert_eq!(
+            search(&handler, "offlinecurrenttoken", SearchMode::Content).total,
+            1
+        );
+        drop(store);
+        let store = StateStore::open(&cfg)?;
+        assert!(store.state.deferred.is_empty());
+        assert!(store.state.retired_indices.is_empty());
+        assert!(!store.volume(source.id)?.needs_scan);
+        assert!(!store.volume(source.id)?.catching_up);
+        assert_eq!(store.volume(source.id)?.cursor.unwrap().last_usn, 600);
+        assert_eq!(store.volume(active.id)?.cursor.unwrap().last_usn, 800);
         Ok(())
     }
 

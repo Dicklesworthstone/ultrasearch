@@ -10,6 +10,27 @@ pub type VolumeId = u16;
 pub type FileId = u64;
 pub type Timestamp = i64; // Unix timestamp (seconds); i64 for easy serde and fast fields.
 
+/// Canonical comparison form for indexed Windows paths. Keep the original
+/// display path separately; this form changes only separators, case and the
+/// trailing directory separator, without resolving filesystem identities.
+pub fn normalize_index_path(path: &str) -> String {
+    path.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+/// Match the directory itself or one of its descendants, using complete path
+/// components. A sibling such as `reports-old` is not below `reports`.
+pub fn index_path_matches(path: &str, directory: &str) -> bool {
+    let path = normalize_index_path(path);
+    let directory = normalize_index_path(directory);
+    !directory.is_empty()
+        && (path == directory
+            || path
+                .strip_prefix(&directory)
+                .is_some_and(|suffix| suffix.starts_with('\\')))
+}
+
 /// Lossless identifier combining a volume id and the full NTFS file reference number.
 ///
 /// NTFS uses the high 16 bits of a file reference for its sequence number. They
@@ -183,6 +204,32 @@ impl FileFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_paths_normalize_windows_names_and_match_component_boundaries() {
+        let displayed = r"\\?\Volume{ABCD}\Reports[2026](Final)+$^\";
+        let normalized = r"\\?\volume{abcd}\reports[2026](final)+$^";
+        assert_eq!(normalize_index_path(displayed), normalized);
+        assert_eq!(normalize_index_path(normalized), normalized);
+        assert!(index_path_matches(displayed, normalized));
+        assert!(index_path_matches(
+            r"//?/VOLUME{abcd}/REPORTS[2026](final)+$^/Child/File.TXT",
+            displayed
+        ));
+        assert!(!index_path_matches(
+            r"\\?\Volume{ABCD}\Reports[2026](Final)+$^-old\child.txt",
+            displayed
+        ));
+        assert!(!index_path_matches(
+            r"\\?\Volume{OTHER}\Reports[2026](Final)+$^\child.txt",
+            displayed
+        ));
+        assert!(index_path_matches(r"C:\folder\file.txt", "c:/"));
+        assert!(index_path_matches(r"C:\", "c:/"));
+        assert!(!index_path_matches(r"C:relative.txt", "c:/"));
+        assert!(!index_path_matches(r"C:\file.txt", ""));
+        assert!(!index_path_matches(r"C:\file.txt", r"\\"));
+    }
 
     #[test]
     fn doc_key_round_trips() {

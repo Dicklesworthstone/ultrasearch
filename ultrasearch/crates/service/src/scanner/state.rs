@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use core_types::{DocKey, FileMeta, VolumeId, config::AppConfig};
 use ntfs_watcher::{FileEvent, JournalCursor, VolumeInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use crate::scheduler_runtime::content_job_from_meta;
 
 pub(super) const BATCH_LIMIT: usize = 1024;
 pub(super) const MAX_DEFERRED_FILES: usize = 1024;
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETRY_DELAY_SECS: i64 = 300;
 
@@ -72,6 +72,24 @@ pub(super) struct VolumeCheckpoint {
     pub catching_up: bool,
     #[serde(default)]
     pub content_policy: Option<ContentPolicy>,
+    #[serde(default)]
+    pub directory_repair: Option<DirectoryRepairCheckpoint>,
+    /// A newly discovered subtree may move during its filtered MFT scan. Keep
+    /// its identity until journal catch-up so a later rename repeats discovery
+    /// even after the directory's own metadata has been committed.
+    #[serde(default)]
+    pub unsettled_directories: Vec<DocKey>,
+}
+
+/// Original path anchors outlive individual descendant commits. A restart
+/// replays the same journal range against a fresh index snapshot, including
+/// paths whose directory document has already been replaced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct DirectoryRepairCheckpoint {
+    pub from: JournalCursor,
+    pub through: JournalCursor,
+    pub paths: Vec<String>,
+    pub discover_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,12 +177,12 @@ impl StateStore {
             let mut state: Checkpoints = serde_json::from_reader(file.take(MAX_STATE_BYTES))
                 .context("invalid ingestion state; refusing to guess volume identities")?;
             ensure!(
-                matches!(state.version, 2 | STATE_VERSION),
+                matches!(state.version, 2 | 3 | STATE_VERSION),
                 "unsupported ingestion state version"
             );
             // Upgrade before publishing any deferred outcome. An older service
-            // rejects v3 rather than ignoring retry obligations and trusting its
-            // journal cursor. Keep the existing path and stable volume IDs.
+            // rejects v4 rather than ignoring directory-repair anchors or retry
+            // obligations. Keep the existing path and stable volume IDs.
             state.version = STATE_VERSION;
             validate_state(&state)?;
             Some(state)
@@ -298,6 +316,8 @@ impl StateStore {
                 volume.cursor = None;
                 volume.needs_scan = true;
                 volume.catching_up = true;
+                volume.directory_repair = None;
+                volume.unsettled_directories.clear();
             }
             for index_path in [&cfg.paths.meta_index, &cfg.paths.content_index] {
                 atomic_write(
@@ -359,6 +379,8 @@ impl StateStore {
             needs_scan: true,
             catching_up: true,
             content_policy: None,
+            directory_repair: None,
+            unsettled_directories: Vec::new(),
         });
         self.save()
     }
@@ -370,6 +392,8 @@ impl StateStore {
         volume.content_policy = Some(policy);
         volume.needs_scan = true;
         volume.catching_up = true;
+        volume.directory_repair = None;
+        volume.unsettled_directories.clear();
         self.save()
     }
 
@@ -407,6 +431,8 @@ impl StateStore {
         volume.cursor = Some(cursor);
         volume.needs_scan = false;
         volume.catching_up = true;
+        volume.directory_repair = None;
+        volume.unsettled_directories.clear();
         validate_state(&completed)?;
         let bytes = serde_json::to_vec(&completed)?;
         ensure!(
@@ -418,6 +444,59 @@ impl StateStore {
         Ok(())
     }
 
+    /// Persist every historical prefix before any descendant replacement. A
+    /// failed save cannot publish a volatile repair or retire its old anchors.
+    pub fn begin_directory_repair(
+        &mut self,
+        id: VolumeId,
+        repair: DirectoryRepairCheckpoint,
+        discovery_roots: &[DocKey],
+    ) -> Result<()> {
+        ensure!(self.state.pending.is_none(), "index work is pending");
+        let mut admitted = self.state.clone();
+        let volume = admitted
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.id == id)
+            .context("unknown volume identity")?;
+        ensure!(
+            !volume.needs_scan && volume.cursor == Some(repair.from),
+            "directory repair does not match the current journal checkpoint"
+        );
+        if let Some(previous) = &volume.directory_repair {
+            ensure!(
+                previous.from == repair.from
+                    && previous.through.journal_id == repair.through.journal_id
+                    && previous.through.last_usn <= repair.through.last_usn
+                    && previous
+                        .paths
+                        .iter()
+                        .all(|path| repair.paths.contains(path))
+                    && previous
+                        .discover_paths
+                        .iter()
+                        .all(|path| repair.discover_paths.contains(path)),
+                "directory replay would discard historical coverage"
+            );
+        }
+        volume.catching_up = true;
+        volume.directory_repair = Some(repair);
+        volume
+            .unsettled_directories
+            .extend_from_slice(discovery_roots);
+        volume.unsettled_directories.sort_unstable();
+        volume.unsettled_directories.dedup();
+        validate_state(&admitted)?;
+        reserve_existing_retry_capacity(&admitted)?;
+        let bytes = serde_json::to_vec(&admitted)?;
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(DeferredCapacity.into());
+        }
+        atomic_write(&self.path, &bytes)?;
+        self.state = admitted;
+        Ok(())
+    }
+
     pub fn begin(&mut self, pending: PendingBatch) -> Result<()> {
         ensure!(
             self.state.pending.is_none(),
@@ -425,6 +504,23 @@ impl StateStore {
         );
         reserve_retry_capacity(&self.state, &pending)?;
         let mut admitted = self.state.clone();
+        // A queued pathname may disappear after an ancestor moves, causing a
+        // successful worker tombstone to erase a still-live file's identity.
+        // Persist coverage debt with admission, including ordinary edits and
+        // retries, until a fresh journal read after this work proves catch-up.
+        if pending
+            .worker
+            .jobs
+            .iter()
+            .any(|job| job.operation == JobOperation::Reconcile)
+        {
+            admitted
+                .volumes
+                .iter_mut()
+                .find(|volume| volume.id == pending.volume)
+                .context("unknown volume identity")?
+                .catching_up = true;
+        }
         admitted.pending = Some(pending);
         validate_state(&admitted)?;
         let bytes = serde_json::to_vec(&admitted)?;
@@ -512,6 +608,14 @@ impl StateStore {
                 .find(|v| v.id == pending.volume)
                 .context("unknown volume identity")?;
             volume.cursor = Some(cursor);
+            if let Some(repair) = &volume.directory_repair {
+                ensure!(
+                    cursor.journal_id == repair.through.journal_id
+                        && cursor.last_usn >= repair.through.last_usn,
+                    "directory cursor cannot precede unfinished descendants"
+                );
+                volume.directory_repair = None;
+            }
         }
         completed.completed_batch = Some(pending.worker.id);
         completed.meta_commit = Some(receipts[0].commit_id);
@@ -528,9 +632,58 @@ impl StateStore {
         Ok(())
     }
 
+    /// Replace retries on unavailable or deselected volumes with a complete
+    /// reconciliation obligation. Keeping their per-file records indefinitely
+    /// would let one disconnected volume exhaust every mounted volume's retry
+    /// capacity. The caller must hide unselected volumes before this operation.
+    pub fn reclaim_unavailable_retries(&mut self, selected: &BTreeSet<VolumeId>) -> Result<usize> {
+        ensure!(
+            self.state.pending.is_none(),
+            "durable pending work must finish before reclaiming retry capacity"
+        );
+        let unavailable: BTreeSet<_> = self
+            .state
+            .deferred
+            .iter()
+            .map(|retry| retry.meta.key.volume())
+            .filter(|volume| !selected.contains(volume))
+            .collect();
+        if unavailable.is_empty() {
+            return Ok(0);
+        }
+
+        let mut reconciled = self.state.clone();
+        for volume in &mut reconciled.volumes {
+            if unavailable.contains(&volume.id) {
+                // Preserve the previous cursor as historical progress. It is
+                // unusable until reset, a new MFT scan, and journal catch-up
+                // replace this explicit full-volume obligation.
+                volume.needs_scan = true;
+                volume.catching_up = true;
+                volume.directory_repair = None;
+                volume.unsettled_directories.clear();
+            }
+        }
+        reconciled
+            .deferred
+            .retain(|retry| !unavailable.contains(&retry.meta.key.volume()));
+        let reclaimed = self.state.deferred.len() - reconciled.deferred.len();
+        validate_state(&reconciled)?;
+        let bytes = serde_json::to_vec(&reconciled)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_STATE_BYTES,
+            "reconciled ingestion state exceeds size limit"
+        );
+        // Release no in-memory capacity before the replacement obligation is
+        // durable. A failed save leaves the original per-file retries intact.
+        atomic_write(&self.path, &bytes)?;
+        self.state = reconciled;
+        Ok(reclaimed)
+    }
+
     /// Choose the oldest due obligation from the caller's admitted volumes.
-    /// Bound one attempt just like an ordinary mutation batch. Offline and
-    /// deselected volumes retain their obligations without blocking others.
+    /// Bound one attempt just like an ordinary mutation batch. Unavailable
+    /// volumes are retained as full scans by reclaim_unavailable_retries.
     pub fn due_retry(
         &self,
         volumes: &[VolumeInfo],
@@ -594,6 +747,26 @@ impl StateStore {
         }
         Some(pending)
     }
+}
+
+/// Growing durable repair history must not consume the space reserved for
+/// existing retries. Project the largest single-file retry through the same
+/// admission logic, including maximum counter, cursor and receipt widths.
+fn reserve_existing_retry_capacity(state: &Checkpoints) -> Result<()> {
+    let mut largest = None;
+    let mut largest_bytes = 0;
+    for retry in &state.deferred {
+        let candidate = largest_single_retry(&retry.meta)?;
+        let bytes = json_length(&candidate)?;
+        if bytes > largest_bytes {
+            largest_bytes = bytes;
+            largest = Some(candidate);
+        }
+    }
+    if let Some(retry) = largest {
+        reserve_retry_capacity(state, &retry)?;
+    }
+    Ok(())
 }
 
 /// Reserve for the worst permitted worker outcome before admitting any new
@@ -822,6 +995,46 @@ fn validate_state(state: &Checkpoints) -> Result<()> {
             guids.insert(volume.guid.to_ascii_lowercase()),
             "duplicate volume GUID"
         );
+        ensure!(
+            volume.unsettled_directories.len() <= BATCH_LIMIT
+                && volume
+                    .unsettled_directories
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                && volume
+                    .unsettled_directories
+                    .iter()
+                    .all(|key| key.volume() == volume.id),
+            "invalid or unbounded unsettled directory identities"
+        );
+        if let Some(repair) = &volume.directory_repair {
+            ensure!(
+                !volume.needs_scan
+                    && volume.catching_up
+                    && volume.cursor == Some(repair.from)
+                    && repair.from.journal_id == repair.through.journal_id
+                    && repair.from.last_usn < repair.through.last_usn,
+                "invalid directory-repair journal range"
+            );
+            for paths in [&repair.paths, &repair.discover_paths] {
+                ensure!(
+                    paths.len() <= BATCH_LIMIT
+                        && paths.windows(2).all(|pair| pair[0] < pair[1])
+                        && paths.iter().all(|path| {
+                            !path.is_empty() && *path == core_types::normalize_index_path(path)
+                        }),
+                    "invalid or unbounded directory-repair paths"
+                );
+            }
+            ensure!(
+                !repair.paths.is_empty()
+                    && repair
+                        .discover_paths
+                        .iter()
+                        .all(|path| repair.paths.contains(path)),
+                "directory discovery is outside its visibility mask"
+            );
+        }
     }
     ensure!(
         state.deferred.len() <= MAX_DEFERRED_FILES,
@@ -921,6 +1134,9 @@ pub(super) fn event_changes(events: &[FileEvent]) -> Result<Vec<MetadataChange>>
             }
             FileEvent::Deleted(key) => {
                 changes.insert(*key, MetadataChange::Delete(*key));
+            }
+            FileEvent::DirectoryRenamed { .. } => {
+                bail!("directory descendants must be reconciled before coalescing the rename")
             }
             FileEvent::RescanRequired { .. } => {
                 bail!("directory/link change requires volume reconciliation")
@@ -1187,6 +1403,97 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn directory_history_cannot_consume_reserved_existing_retry_space() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut cfg = config(root.path());
+        cfg.extract.max_bytes_per_file = u64::MAX;
+        cfg.extract.max_chars_per_file = u64::MAX;
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = volume("directory-headroom-volume");
+        store.bind_volume(&mut volume)?;
+        let cursor = JournalCursor {
+            journal_id: 7,
+            last_usn: 100,
+        };
+        let checkpoint = store.volume_mut(volume.id)?;
+        checkpoint.cursor = Some(cursor);
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        let key = DocKey::from_parts(volume.id, 42);
+        let mut held = meta(key, "retry.txt", 10);
+        held.path = Some(format!("X:\\{}retry.txt", "parent\\".repeat(512)));
+        store.state.deferred.push(DeferredFile {
+            meta: held.clone(),
+            attempts: 1,
+            retry_at: 1000,
+        });
+        let largest = largest_single_retry(&held)?;
+        let retry_bytes = json_length(&largest)?;
+        let ancestry = format!("x:\\{}", "directory\\".repeat(1024));
+        let history = DirectoryRepairCheckpoint {
+            from: cursor,
+            through: JournalCursor {
+                last_usn: 200,
+                ..cursor
+            },
+            paths: vec![format!("{ancestry}first"), format!("{ancestry}last")],
+            discover_paths: Vec::new(),
+        };
+        let with_history = |state: &Checkpoints| {
+            let mut proposed = state.clone();
+            let volume = proposed
+                .volumes
+                .iter_mut()
+                .find(|v| v.id == volume.id)
+                .unwrap();
+            volume.catching_up = true;
+            volume.directory_repair = Some(history.clone());
+            proposed
+        };
+        // Model a near-limit checkpoint without allocating hundreds of long
+        // file paths. The original state retains more than one retry's space;
+        // the proposed history fits but would leave less than that retry needs.
+        store.state.retired_indices.push(String::new());
+        let original_bytes = json_length(&store.state)?;
+        let growth = json_length(&with_history(&store.state))? - original_bytes;
+        assert!(growth > retry_bytes);
+        let filler = MAX_STATE_BYTES - original_bytes - growth - retry_bytes / 2;
+        store.state.retired_indices[0].extend(std::iter::repeat_n('a', filler as usize));
+        reserve_retry_capacity(&store.state, &largest)?;
+        store.save()?;
+        let before = fs::read(&store.path)?;
+        let retry = store
+            .due_retry(std::slice::from_ref(&volume), &cfg, 1000, 1)
+            .context("original retry must remain admissible")?;
+        {
+            let mut raw_admission = with_history(&store.state);
+            validate_state(&raw_admission)?;
+            assert!(json_length(&raw_admission)? <= MAX_STATE_BYTES);
+            raw_admission.pending = Some(retry);
+            assert!(json_length(&raw_admission)? > MAX_STATE_BYTES);
+        }
+        let error = store
+            .begin_directory_repair(volume.id, history, &[])
+            .unwrap_err();
+        assert!(error.is::<DeferredCapacity>(), "{error:#}");
+        assert_eq!(serde_json::to_vec(&store.state)?, before);
+        assert_eq!(fs::read(&store.path)?, before);
+        let retry = store
+            .due_retry(std::slice::from_ref(&volume), &cfg, 1000, 1)
+            .context("rejected history consumed retry capacity")?;
+        assert_eq!(retry.metadata.len(), 1);
+        assert_eq!(retry.metadata[0].key(), key);
+        assert!(retry.next_cursor.is_none());
+        store.begin(retry)?;
+        complete_at(&mut store, &cfg, &[], 1000)?;
+        assert!(store.state.deferred.is_empty());
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.volume(volume.id)?.cursor, Some(cursor));
+        assert!(store.volume(volume.id)?.directory_repair.is_none());
+        Ok(())
+    }
+
     fn copy_index_snapshot(source: &Path, target: &Path) -> Result<()> {
         fs::create_dir_all(target)?;
         for entry in fs::read_dir(source)? {
@@ -1435,6 +1742,173 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_retry_capacity_becomes_durable_full_volume_reconciliation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut unavailable = volume("unavailable-capacity-volume");
+        let mut active = volume("active-capacity-volume");
+        let mut unaffected = volume("unaffected-capacity-volume");
+        for volume in [&mut unavailable, &mut active, &mut unaffected] {
+            store.bind_volume(volume)?;
+            let checkpoint = store.volume_mut(volume.id)?;
+            checkpoint.cursor = Some(JournalCursor {
+                journal_id: 31,
+                last_usn: 100,
+            });
+            checkpoint.needs_scan = false;
+            checkpoint.catching_up = false;
+        }
+        let cursor = store.volume(active.id)?.cursor.unwrap();
+        store.state.deferred = (1..MAX_DEFERRED_FILES as u64)
+            .map(|id| DeferredFile {
+                meta: meta(DocKey::from_parts(unavailable.id, id), "offline.txt", 20),
+                attempts: 1,
+                retry_at: 1000,
+            })
+            .collect();
+        let active_retry = meta(DocKey::from_parts(active.id, 2000), "activeheld.txt", 30);
+        store.state.deferred.push(DeferredFile {
+            meta: active_retry.clone(),
+            attempts: 4,
+            retry_at: 2000,
+        });
+        store.save()?;
+        let generation = store.state.generation;
+        let receipts = (
+            store.state.completed_batch,
+            store.state.meta_commit,
+            store.state.content_commit,
+        );
+        let new = make_pending(
+            active.id,
+            vec![MetadataChange::Upsert(meta(
+                DocKey::from_parts(active.id, 2001),
+                "activefresh.txt",
+                40,
+            ))],
+            Some(JournalCursor {
+                last_usn: 200,
+                ..cursor
+            }),
+            false,
+            &cfg,
+        );
+        assert!(
+            store
+                .begin(new.clone())
+                .unwrap_err()
+                .is::<DeferredCapacity>()
+        );
+        assert!(store.state.pending.is_none());
+
+        let selected = BTreeSet::from([active.id]);
+        assert_eq!(
+            store.reclaim_unavailable_retries(&selected)?,
+            MAX_DEFERRED_FILES - 1
+        );
+        assert_eq!(store.state.deferred.len(), 1);
+        assert_eq!(store.state.deferred[0].meta, active_retry);
+        assert_eq!(store.state.deferred[0].attempts, 4);
+        assert_eq!(store.state.deferred[0].retry_at, 2000);
+        assert!(store.volume(unavailable.id)?.needs_scan);
+        assert!(store.volume(unavailable.id)?.catching_up);
+        assert_eq!(store.volume(unavailable.id)?.cursor, Some(cursor));
+        for id in [active.id, unaffected.id] {
+            assert!(!store.volume(id)?.needs_scan);
+            assert!(!store.volume(id)?.catching_up);
+            assert_eq!(store.volume(id)?.cursor, Some(cursor));
+        }
+        assert_eq!(
+            (
+                store.state.completed_batch,
+                store.state.meta_commit,
+                store.state.content_commit,
+            ),
+            receipts
+        );
+        let persisted = fs::read(&store.path)?;
+        assert_eq!(store.reclaim_unavailable_retries(&selected)?, 0);
+        assert_eq!(fs::read(&store.path)?, persisted);
+        drop(store);
+
+        let mut store = StateStore::open(&cfg)?;
+        assert_eq!(store.state.generation, generation);
+        assert!(store.state.retired_indices.is_empty());
+        assert!(store.volume(unavailable.id)?.needs_scan);
+        assert!(store.volume(unavailable.id)?.catching_up);
+        assert_eq!(store.volume(unavailable.id)?.cursor, Some(cursor));
+        assert_eq!(store.state.deferred[0].meta, active_retry);
+        store.begin(new)?;
+        complete_at(&mut store, &cfg, &[], 1001)?;
+        assert_eq!(store.volume(active.id)?.cursor.unwrap().last_usn, 200);
+        assert_eq!(store.state.deferred.len(), 1);
+
+        // Discovery can succeed with no selected volume at all. The same
+        // transfer must run before the scanner's empty-volume early return.
+        assert_eq!(store.reclaim_unavailable_retries(&BTreeSet::new())?, 1);
+        assert!(store.state.deferred.is_empty());
+        assert!(store.volume(active.id)?.needs_scan);
+        assert!(store.volume(active.id)?.catching_up);
+        assert_eq!(store.volume(active.id)?.cursor.unwrap().last_usn, 200);
+        assert!(!store.volume(unaffected.id)?.needs_scan);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_retry_reclamation_cannot_overtake_failed_save_or_pending_intent() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut unavailable = volume("unavailable-transaction-volume");
+        let mut active = volume("active-transaction-volume");
+        store.bind_volume(&mut unavailable)?;
+        store.bind_volume(&mut active)?;
+        let cursor = JournalCursor {
+            journal_id: 31,
+            last_usn: 100,
+        };
+        let checkpoint = store.volume_mut(unavailable.id)?;
+        checkpoint.cursor = Some(cursor);
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        store.state.deferred.push(DeferredFile {
+            meta: meta(DocKey::from_parts(unavailable.id, 42), "retained.txt", 10),
+            attempts: 3,
+            retry_at: 1000,
+        });
+        store.save()?;
+        let state_path = store.path.clone();
+        let persisted = fs::read(&state_path)?;
+        let before = serde_json::to_vec(&store.state)?;
+        let blocked_parent = root.path().join("checkpoint-parent-file");
+        fs::write(&blocked_parent, b"cannot contain a checkpoint")?;
+        store.path = blocked_parent.join("ingestion.json");
+        let selected = BTreeSet::from([active.id]);
+        assert!(store.reclaim_unavailable_retries(&selected).is_err());
+        assert_eq!(serde_json::to_vec(&store.state)?, before);
+        assert_eq!(fs::read(&state_path)?, persisted);
+        store.path = state_path;
+
+        let pending = make_pending(active.id, Vec::new(), None, false, &cfg);
+        store.begin(pending)?;
+        let persisted = fs::read(&store.path)?;
+        let before = serde_json::to_vec(&store.state)?;
+        let error = store.reclaim_unavailable_retries(&selected).unwrap_err();
+        assert!(format!("{error:#}").contains("durable pending work must finish"));
+        assert_eq!(serde_json::to_vec(&store.state)?, before);
+        assert_eq!(fs::read(&store.path)?, persisted);
+
+        complete_at(&mut store, &cfg, &[], 1001)?;
+        assert_eq!(store.reclaim_unavailable_retries(&selected)?, 1);
+        assert!(store.state.deferred.is_empty());
+        assert!(store.volume(unavailable.id)?.needs_scan);
+        assert!(store.volume(unavailable.id)?.catching_up);
+        assert_eq!(store.volume(unavailable.id)?.cursor, Some(cursor));
+        Ok(())
+    }
+
+    #[test]
     fn version_two_upgrade_preserves_bound_volume_and_physical_checkpoints() -> Result<()> {
         let root = tempfile::tempdir()?;
         let cfg = config(root.path());
@@ -1457,7 +1931,7 @@ mod tests {
         atomic_write(&store.path, &serde_json::to_vec(&old)?)?;
         drop(store);
         let reopened = StateStore::open(&cfg)?;
-        assert_eq!(reopened.state.version, 3);
+        assert_eq!(reopened.state.version, STATE_VERSION);
         assert_eq!(reopened.state.generation, generation);
         assert_eq!(reopened.state.content_commit, content_commit);
         assert_eq!(reopened.state.meta_commit, meta_commit);
@@ -1466,7 +1940,7 @@ mod tests {
         assert!(reopened.state.deferred.is_empty());
         assert!(reopened.state.retired_indices.is_empty());
         let disk: serde_json::Value = serde_json::from_slice(&fs::read(&reopened.path)?)?;
-        assert_eq!(disk["version"], 3);
+        assert_eq!(disk["version"], STATE_VERSION);
         Ok(())
     }
 
@@ -1901,6 +2375,92 @@ mod tests {
                 .count(),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_history_is_transactional_and_discovery_outlives_the_final_root_commit()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = volume("directory-history-checkpoint");
+        store.bind_volume(&mut volume)?;
+        let from = JournalCursor {
+            journal_id: 21,
+            last_usn: 100,
+        };
+        let through = JournalCursor {
+            last_usn: 200,
+            ..from
+        };
+        let directory = DocKey::from_parts(volume.id, 44);
+        let checkpoint = store.volume_mut(volume.id)?;
+        checkpoint.cursor = Some(from);
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        store.save()?;
+        let history = DirectoryRepairCheckpoint {
+            from,
+            through,
+            paths: vec![r"c:\new".into(), r"c:\old".into()],
+            discover_paths: vec![r"c:\new".into()],
+        };
+        let state_path = store.path.clone();
+        let before = fs::read(&state_path)?;
+        let blocked_parent = root.path().join("blocked-directory-history-parent");
+        fs::write(&blocked_parent, b"not a directory")?;
+        store.path = blocked_parent.join("checkpoint.json");
+        assert!(
+            store
+                .begin_directory_repair(volume.id, history.clone(), &[directory])
+                .is_err()
+        );
+        assert!(store.volume(volume.id)?.directory_repair.is_none());
+        assert!(store.volume(volume.id)?.unsettled_directories.is_empty());
+        assert!(!store.volume(volume.id)?.catching_up);
+        assert_eq!(fs::read(&state_path)?, before);
+        store.path = state_path;
+        store.begin_directory_repair(volume.id, history.clone(), &[directory])?;
+        let mut incomplete = history.clone();
+        incomplete.paths.pop();
+        assert!(
+            store
+                .begin_directory_repair(volume.id, incomplete, &[])
+                .is_err()
+        );
+        assert_eq!(
+            store.volume(volume.id)?.directory_repair,
+            Some(history.clone())
+        );
+
+        // Even an empty final page uses both exact physical receipts. Finishing
+        // it releases historical path masks, but cannot settle MFT discovery
+        // until the scanner has read the journal again after that enumeration.
+        store.begin(pending_for_volume(
+            &volume,
+            Vec::new(),
+            Some(through),
+            false,
+            &cfg,
+        ))?;
+        assert_eq!(store.volume(volume.id)?.cursor, Some(from));
+        assert!(store.finish().is_err());
+        complete_at(&mut store, &cfg, &[], 10)?;
+        assert_eq!(store.volume(volume.id)?.cursor, Some(through));
+        assert!(store.volume(volume.id)?.directory_repair.is_none());
+        assert_eq!(
+            store.volume(volume.id)?.unsettled_directories,
+            vec![directory]
+        );
+        drop(store);
+        let restored = StateStore::open(&cfg)?;
+        assert_eq!(restored.volume(volume.id)?.cursor, Some(through));
+        assert_eq!(
+            restored.volume(volume.id)?.unsettled_directories,
+            vec![directory]
+        );
+        assert!(restored.volume(volume.id)?.catching_up);
         Ok(())
     }
 
