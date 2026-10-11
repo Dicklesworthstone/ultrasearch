@@ -236,6 +236,26 @@ pub struct SearchResponse {
     pub served_by: Option<String>,
 }
 
+impl SearchResponse {
+    /// Validate a decoded search before a client publishes its rows or count.
+    /// The service uses its unavailable label for failed query execution and
+    /// failed response serialization; neither is a successful empty search.
+    /// Truncation alone remains valid, including count-only and bounded pages.
+    pub fn validate_for(&self, request_id: Uuid) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.id == request_id,
+            "IPC search response ID {} does not match request {}",
+            self.id,
+            request_id
+        );
+        anyhow::ensure!(
+            self.served_by.as_deref() != Some("service-unavailable"),
+            "UltraSearch could not complete this search; retry or check the service logs"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusRequest {
     pub id: Uuid,
@@ -361,6 +381,59 @@ mod tests {
         assert!(matches!(back.mode, SearchMode::Hybrid));
         assert_eq!(back.timeout, None);
         assert_eq!(back.offset, 0);
+    }
+
+    #[test]
+    fn failed_search_and_unrelated_response_are_rejected_after_wire_decode() {
+        let id = Uuid::new_v4();
+        let mut response = SearchResponse {
+            id,
+            hits: Vec::new(),
+            total: 0,
+            truncated: true,
+            took_ms: 7,
+            served_by: Some("service-unavailable".into()),
+        };
+        let payload = framing::serialize_search_response(&mut response).unwrap();
+        let message = framing::encode_message(framing::MessageKind::Search, &payload).unwrap();
+        let frame = framing::encode_frame(&message).unwrap();
+        let (message, remaining) = framing::decode_frame(&frame).unwrap();
+        assert!(remaining.is_empty());
+        let (kind, payload) = framing::decode_message(&message).unwrap();
+        assert_eq!(kind, framing::MessageKind::Search);
+        let mut decoded: SearchResponse = de(payload);
+        let failure = decoded.validate_for(id).unwrap_err().to_string();
+        assert!(failure.contains("could not complete this search"));
+
+        // A healthy response for an older query must not replace the current
+        // query's results just because the framing and message kind are valid.
+        decoded.served_by = Some("service".into());
+        let failure = decoded
+            .validate_for(Uuid::new_v4())
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("does not match request"));
+    }
+
+    #[test]
+    fn valid_empty_and_truncated_searches_are_not_misclassified_as_failures() {
+        let id = Uuid::new_v4();
+        for (total, truncated) in [(0, false), (42, true), (42, false)] {
+            for served_by in [None, Some("service".to_string())] {
+                let response = SearchResponse {
+                    id,
+                    hits: Vec::new(),
+                    total,
+                    truncated,
+                    took_ms: 0,
+                    served_by,
+                };
+                let decoded: SearchResponse = de(&ser(&response));
+                decoded.validate_for(id).unwrap();
+                assert_eq!(decoded.total, total);
+                assert_eq!(decoded.truncated, truncated);
+            }
+        }
     }
 
     #[test]

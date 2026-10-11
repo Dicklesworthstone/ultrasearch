@@ -139,6 +139,30 @@ same batch restored underneath a newer checkpoint. The batch UUID alone cannot
 distinguish those attempts. New empty indices receive complete receipts for a
 shared seed batch and retain their individual physical commit identities.
 
+### Startup recovery from damaged index files
+
+Startup now opens each index's committed segment readers as well as validating
+its schema, generation marker, and ingestion receipt. A readable `meta.json`
+and receipt do not establish that referenced segment files are present. Missing
+committed components, malformed index metadata, and incompatible index formats
+require preserved-index reconciliation instead of failing later while starting
+the search handler.
+
+Both index destinations are inspected before either is archived. Permission,
+sharing, lock, timeout, device, and system errors remain startup errors; they do
+not authorize retiring an otherwise usable index. Checkpoint and index existence
+checks are fallible, and generation-marker access failures also remain errors.
+An unreadable or invalid checkpoint cannot silently allocate new volume IDs.
+
+When definite damage requires rebuilding, every nonempty surviving index
+directory is preserved, including a directory whose `meta.json` is missing.
+Replacement indices receive exact paired seed receipts, retain the existing
+volume GUID bindings, discard obligations belonging to the damaged generation,
+and require a new baseline and journal catch-up before becoming visible. Replayed
+replacement documents retain their full file reference identities. The startup
+probe opens committed readers; it does not checksum-scan every stored body or
+establish exhaustive detection of latent bit rot.
+
 ## Stable, bounded search pagination
 
 Auto and Hybrid search count the complete visible union of metadata and content
@@ -184,6 +208,43 @@ An individually unencodable first hit, invalid serialized identity, or oversized
 response label produces a bounded `service-unavailable` response instead of
 breaking the pipe with an oversized frame or reporting healthy empty results.
 The frame limit and protocol version are unchanged.
+
+The shared Windows pipe client validates the response UUID against its request
+and rejects the service's unavailable label before either the UI or CLI accepts
+rows and counts. This validation runs after the transport retry loop, so an
+explicit failed search does not trigger repeated expensive query execution.
+Healthy empty results, count-only requests, and explicitly truncated pages remain
+valid. On non-Windows platforms the CLI's search, status, rescan, and reload
+commands now fail with a nonzero exit and no fabricated success payload;
+configuration-file commands remain available. The UI's separate non-Windows
+development stubs and its treatment of previously displayed rows after an error
+are not changed by this shared Windows client fix.
+
+### Structured range and literal queries
+
+The typed IPC query AST now executes numeric ranges instead of substituting an
+empty query. `Size`, `Volume`, and `Flags` accept unsigned 64-bit bounds;
+`Created` and `Modified` accept signed 64-bit timestamps. `Gt`, `Ge`, `Lt`, and
+`Le` preserve strict or inclusive bounds at both integer extrema. `Between`
+requires two ordered inclusive bounds. Mismatched types, nonnumeric fields,
+missing upper bounds, or unused extra bounds reject the entire request before
+Tantivy range execution.
+
+Typed `Prefix`, `Phrase`, and `Fuzzy` terms use the targeted field's indexing
+analyzer. Prefix matches complete dictionary membership with a zero-edit prefix
+automaton. Phrase requires indexed token positions. Fuzzy accepts zero, one,
+or two edits and counts a transposition once. Multiple analyzed prefix or fuzzy
+tokens must all match within a targeted field. These values are literals, so
+text such as `name: blue OR content: moon` is not reparsed as query syntax.
+Extension fields retain their schema's raw analysis.
+
+These predicates participate in the same visibility masks, exact hybrid counts,
+stable identity ordering, and replay rules as ordinary searches. Unsupported
+fuzzy distances and malformed ranges cannot turn a disjunction into a successful
+partial result. This implements the existing typed protocol operations; it does
+not change raw-Term parser fallback or cross-index negation semantics. The
+desktop search box and existing CLI positional query currently still send raw
+Term input unless a caller constructs the structured AST explicitly.
 
 ## Reconciliation and exclusions
 
@@ -812,6 +873,44 @@ have the documented `pkg-config`/GLib blocker. Native Windows execution, install
 MSI acceptance, and native performance qualification remain outstanding. No
 GitHub Actions were used.
 
+### Damaged-index recovery, typed predicates, and client failure verification
+
+The next October 11 pass adds three recovery regressions using real index files,
+seven query regressions using real metadata/content documents, and three portable
+client/CLI regressions. Recovery cases damage either index's metadata or move a
+committed store component to a retained filename, then check preservation, exact
+seed receipts, required reconciliation, and full-FRN replacement replay without
+obsolete body terms. Injected second-index access, lock, timeout, and system
+failures leave the damaged first index and checkpoint untouched.
+
+The query tests cover every search mode, signed and unsigned integer extrema,
+malformed bounds in otherwise valid disjunctions, analyzed Unicode prefixes with
+65 dictionary expansions, phrase positions, fuzzy distance, split-commit masks,
+replacement, replay, deletion, and reopening. Client regressions exercise real
+bincode/versioned framing before response validation and verify that unsupported
+CLI service operations cannot report success. Two additional Windows tests use
+actual local named pipes, with bounded client and outer exchange deadlines.
+
+| Gate | Result |
+| --- | --- |
+| Final host all-target tests for `service`, `ipc`, and `cli` | All 114 passed: 91 service, 22 IPC, and 1 CLI test. All 13 new host regressions passed; zero failed or ignored tests. |
+| Built CLI process checks on Linux | Search, status, rescan, and reload-config with `--json` each exited 1, produced empty stdout, and explained the Windows named-pipe requirement. `config --help` exited 0. |
+| Scoped host all-target check and strict Clippy | Both passed with locked dependencies and `-D warnings` for Clippy. |
+| Windows GNU all-target check and strict Clippy for `service`, `index-worker`, `ipc`, and `cli`, with `service/e2e-windows` | Both passed, including compilation/lint of the new native named-pipe tests and existing NTFS integration targets. |
+| Whole-workspace formatting and Git whitespace checks | Passed. |
+| Mandatory whole-workspace Linux check and strict Clippy | Both attempted; both failed in unchanged `glib-sys 0.18.1` because `pkg-config` is unavailable and `glib-2.0 >= 2.56` cannot be located. Neither whole-workspace gate passed. |
+| Native Windows, NTFS, MSI, and native performance execution | Not run; this Linux environment has no Windows runtime. |
+
+All final gates retained aggregate tracked-source SHA-256
+`e80a3a33aa79a8a849a5821d72daaf8ed0a9d4e2959f3e34084c46a07ece6b34`.
+Verification reused the pinned Rust and official LLVM-MinGW toolchains described
+above. The Windows check downloaded the already-locked `encode_unicode 1.0.0`
+after an offline cache miss; no dependency or feature changed. The host linker
+emitted its existing gold deprecation notice, and scoped source checks/lints had
+no warnings. No protocol, schema, state, receipt, or workflow format changed.
+UBS and RCH were unavailable. Native acceptance remains open, and no GitHub
+Actions were used.
+
 ## Native NTFS acceptance
 
 Use an **elevated Windows developer PowerShell** with an isolated mounted NTFS
@@ -833,6 +932,7 @@ cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc native_ntfs_lifecycle
 cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc held_backup_privilege_is_enabled_idempotently_on_a_copied_token -- --ignored --nocapture --test-threads=1
 cargo test -p ntfs-watcher --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
 cargo test -p index-worker --bin index-worker --target x86_64-pc-windows-msvc -- --nocapture --test-threads=1
+cargo test -p ipc --target x86_64-pc-windows-msvc native_pipe_ -- --nocapture --test-threads=1
 cargo test -p service --target x86_64-pc-windows-msvc --features e2e-windows --test ntfs_incremental -- --ignored --nocapture --test-threads=1
 ```
 

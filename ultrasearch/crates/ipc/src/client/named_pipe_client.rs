@@ -81,7 +81,12 @@ impl PipeClient {
     }
 
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse> {
-        self.request(framing::MessageKind::Search, &req).await
+        let response: SearchResponse = self.request(framing::MessageKind::Search, &req).await?;
+        // Transport success does not establish successful query execution.
+        // Validate outside the transport retry loop so an explicit service
+        // failure does not replay an expensive query on every reconnect turn.
+        response.validate_for(req.id)?;
+        Ok(response)
     }
 
     pub async fn reload_config(&self, req: ReloadConfigRequest) -> Result<ReloadConfigResponse> {
@@ -204,5 +209,100 @@ impl PipeClient {
                 self.pipe_name
             )
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use uuid::Uuid;
+
+    /// Exercise the real client, versioned framing, and a local native pipe.
+    /// The outer deadline also bounds a server waiting after client failure.
+    async fn exchange_search_response(
+        request_id: Uuid,
+        mut response: SearchResponse,
+    ) -> Result<Result<SearchResponse>> {
+        let pipe_name = format!(r"\\.\pipe\ultrasearch-search-validation-{}", Uuid::new_v4());
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
+        let client = PipeClient::new(pipe_name)
+            .with_request_timeout(Duration::from_secs(2))
+            .with_retries(0);
+        let request = SearchRequest {
+            id: request_id,
+            ..SearchRequest::default()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let serve = async {
+                server.connect().await?;
+                let mut length = [0; 4];
+                server.read_exact(&mut length).await?;
+                let length = u32::from_le_bytes(length) as usize;
+                ensure!(length <= framing::MAX_FRAME, "oversized test request");
+                let mut message = vec![0; length];
+                server.read_exact(&mut message).await?;
+                let (kind, payload) = framing::decode_message(&message)?;
+                ensure!(kind == framing::MessageKind::Search, "expected search");
+                let decoded: SearchRequest = bincode::deserialize(payload)?;
+                ensure!(decoded.id == request_id, "incorrect request identity");
+                let payload = framing::serialize_search_response(&mut response)?;
+                let message = framing::encode_message(kind, &payload)?;
+                server.write_all(&framing::encode_frame(&message)?).await?;
+                Ok::<(), anyhow::Error>(())
+            };
+            let (served, result) = tokio::join!(serve, client.search(request));
+            served?;
+            Ok(result)
+        })
+        .await
+        .context("native named-pipe search exchange timed out")?
+    }
+
+    #[tokio::test]
+    async fn native_pipe_rejects_failed_and_mismatched_search_responses() -> Result<()> {
+        let request_id = Uuid::new_v4();
+        for (response_id, served_by, expected_error) in [
+            (request_id, "service-unavailable", "could not complete"),
+            (Uuid::new_v4(), "service", "does not match request"),
+        ] {
+            let response = SearchResponse {
+                id: response_id,
+                hits: Vec::new(),
+                total: 0,
+                truncated: true,
+                took_ms: 0,
+                served_by: Some(served_by.into()),
+            };
+            let error = exchange_search_response(request_id, response)
+                .await?
+                .unwrap_err();
+            ensure!(error.to_string().contains(expected_error), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_pipe_accepts_empty_and_bounded_search_responses() -> Result<()> {
+        let request_id = Uuid::new_v4();
+        for (total, truncated) in [(0, false), (100_000, true)] {
+            let response = SearchResponse {
+                id: request_id,
+                hits: Vec::new(),
+                total,
+                truncated,
+                took_ms: 3,
+                served_by: Some("service".into()),
+            };
+            let decoded = exchange_search_response(request_id, response).await??;
+            assert_eq!(decoded.id, request_id);
+            assert_eq!(decoded.total, total);
+            assert_eq!(decoded.truncated, truncated);
+            assert!(decoded.hits.is_empty());
+        }
+        Ok(())
     }
 }

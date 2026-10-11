@@ -2,8 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use console::style;
 use core_types::config::{default_config_path, load_or_create_config};
-#[cfg(not(windows))]
-use ipc::MetricsSnapshot;
 use ipc::{
     QueryExpr, ReloadConfigRequest, RescanRequest, SearchMode, SearchRequest, SearchResponse,
     StatusRequest, StatusResponse, TermExpr, TermModifier,
@@ -237,8 +235,8 @@ fn pipe(cli: &Cli) -> PipeClient {
 }
 
 #[cfg(not(windows))]
-fn pipe(_cli: &Cli) -> StubClient {
-    StubClient
+fn pipe(_cli: &Cli) -> UnsupportedClient {
+    UnsupportedClient
 }
 
 fn build_search_request(
@@ -345,69 +343,59 @@ where
 }
 
 #[cfg(not(windows))]
-struct StubClient;
+struct UnsupportedClient;
 
 #[cfg(not(windows))]
-impl StubClient {
+impl UnsupportedClient {
     async fn status(&self, _: StatusRequest) -> Result<StatusResponse> {
-        stub_status(StatusRequest { id: Uuid::new_v4() }).await
+        unsupported_service()
     }
-    async fn search(&self, req: SearchRequest) -> Result<SearchResponse> {
-        stub_search(req).await
+    async fn search(&self, _: SearchRequest) -> Result<SearchResponse> {
+        unsupported_service()
     }
     async fn reload_config(&self, _: ReloadConfigRequest) -> Result<ipc::ReloadConfigResponse> {
-        Ok(ipc::ReloadConfigResponse {
-            id: Uuid::new_v4(),
-            success: true,
-            message: Some("stub".into()),
-        })
+        unsupported_service()
     }
     async fn rescan(&self, _: RescanRequest) -> Result<ipc::RescanResponse> {
-        Ok(ipc::RescanResponse {
-            id: Uuid::new_v4(),
-            success: true,
-            message: Some("stub".into()),
-        })
+        unsupported_service()
     }
 }
 
 #[cfg(not(windows))]
-async fn stub_search(req: SearchRequest) -> Result<SearchResponse> {
-    println!(
-        "{}",
-        style("Warning: Running on non-Windows (stub mode)").red()
-    );
-    Ok(SearchResponse {
-        id: req.id,
-        hits: Vec::new(),
-        total: 0,
-        truncated: false,
-        took_ms: 0,
-        served_by: Some("cli-linux-stub".into()),
-    })
+fn unsupported_service<T>() -> Result<T> {
+    anyhow::bail!(
+        "UltraSearch service commands require Windows named-pipe IPC; run this command on Windows with the UltraSearch service installed"
+    )
 }
 
-#[cfg(not(windows))]
-async fn stub_status(req: StatusRequest) -> Result<StatusResponse> {
-    println!(
-        "{}",
-        style("Warning: Running on non-Windows (stub mode)").red()
-    );
-    Ok(StatusResponse {
-        id: req.id,
-        volumes: vec![],
-        last_index_commit_ts: None,
-        scheduler_state: "stubbed".into(),
-        metrics: Some(MetricsSnapshot {
-            search_latency_ms_p50: None,
-            search_latency_ms_p95: None,
-            worker_cpu_pct: None,
-            worker_mem_bytes: None,
-            queue_depth: Some(0),
-            active_workers: Some(0),
-            content_enqueued: Some(0),
-            content_dropped: Some(0),
-        }),
-        served_by: Some("cli-linux-stub".into()),
-    })
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_service_operations_cannot_report_success() {
+        let client = UnsupportedClient;
+        let failures = [
+            client.search(SearchRequest::default()).await.unwrap_err(),
+            client
+                .status(StatusRequest { id: Uuid::new_v4() })
+                .await
+                .unwrap_err(),
+            client
+                .reload_config(ReloadConfigRequest { id: Uuid::new_v4() })
+                .await
+                .unwrap_err(),
+            client
+                .rescan(RescanRequest { id: Uuid::new_v4() })
+                .await
+                .unwrap_err(),
+        ];
+        for failure in failures {
+            assert!(
+                failure
+                    .to_string()
+                    .contains("require Windows named-pipe IPC")
+            );
+        }
+    }
 }
