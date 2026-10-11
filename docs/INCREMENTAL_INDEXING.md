@@ -139,6 +139,40 @@ same batch restored underneath a newer checkpoint. The batch UUID alone cannot
 distinguish those attempts. New empty indices receive complete receipts for a
 shared seed batch and retain their individual physical commit identities.
 
+## Stable, bounded search pagination
+
+Auto and Hybrid search count the complete visible union of metadata and content
+matches before pagination. An identity found in both sources counts once.
+Each source ranks enough candidates for the requested offset and accepted page
+size, using descending score and ascending full `DocKey` to break ties inside
+both segment and global collectors. The merge uses the maximum source score for
+each identity and the same tie-break. Equal-score pages therefore remain stable
+across replacements, segment merges, and reopening the index.
+
+Published content rows share their exact committed metadata with the matching
+metadata row; pending document, volume, and directory masks protect split
+commits. With that invariant, the union count is the metadata count plus content
+matches that do not satisfy the metadata predicate. The handler clones the
+already-parsed metadata query and verifies that shared schema fields have
+identical IDs and definitions before using it in the content index. Reparsing
+against content's larger schema could change the meaning of field-qualified
+terms and is deliberately avoided. Both readers remain fixed throughout ranking,
+counting, and stored-field reads under the existing visibility guard.
+
+Pages accept at most 1,000 hits and rank at most the first 10,000 positions per
+source. Requests crossing either bound retain the exact visible total and set
+`truncated=true`; offsets beyond the ranking window return a count-only,
+explicitly truncated response. Only the final page's stored paths and names are
+loaded. The service merges at most two capped candidate windows, while Tantivy
+also uses its normal per-segment ranking and query structures. Exact counts
+still scan matching postings; these limits are not a constant-time or fixed
+process-memory guarantee.
+
+Reader, collector, stored-field, and propagated query execution errors reject
+the complete response with `served_by="service-unavailable"` and
+`truncated=true`. They cannot become a successful partial union or a healthy
+empty result. Existing query-parser fallback behavior is unchanged.
+
 ## Reconciliation and exclusions
 
 A new index, incompatible index generation/schema, journal gap, or requested
@@ -652,6 +686,30 @@ These final gates used the pinned `nightly-2026-08-31` toolchain and official
 LLVM-MinGW 20261006 MSVCRT cross toolchain described above. No dependency,
 protocol, index schema, or durable state format changed. The Bead remains open
 for native NTFS and installed-service acceptance; no GitHub Actions were used.
+
+### Complete hybrid search pagination verification
+
+The same October 11 follow-up replaces truncated-prefix union counts and
+unstable tie ordering with the bounded, exact pagination described above. Seven
+new real-index regressions cover overlapping metadata/content membership, deep
+pages, full-FRN and volume tie order, replacement and deletion replay, segment
+merge/reopen, split-commit visibility masks, shared-query field resolution,
+oversized request windows, and rejection of corrupt matching identities.
+
+| Gate | Result |
+| --- | --- |
+| Host tests across `service`, `ntfs-watcher`, `core-types`, `meta-index`, `content-index`, `index-worker`, and `content-extractor` | All 202 distinct tests passed, including all 78 service tests and the ten new watcher/search regressions. No failed or ignored host tests. |
+| Final all-target host check and strict Clippy for those seven packages | Both passed with locked dependencies and `-D warnings` for Clippy. |
+| Final Windows GNU all-target check and strict Clippy for `service`, `index-worker`, and `content-extractor`, with `service/e2e-windows` | Both passed, including the native integration test target. Compilation and lint only. |
+| Workspace formatting | `cargo fmt --all -- --check` passed. |
+| Whole-workspace Linux check and strict Clippy | Both attempted; both exited 101 in unchanged `glib-sys 0.18.1` because `pkg-config` is absent and `glib-2.0 >= 2.56` cannot be located. Neither gate passed. |
+| Native Windows, MSI, and native performance qualification | Not run; no Windows runtime is available here. |
+
+Verification used the same pinned Rust and official LLVM-MinGW toolchains and
+locked dependencies as the preceding follow-up. Two unnecessary mutable test
+bindings reported by the initial host run were removed before the final clean
+check/lint gates. No protocol, state format, index schema, dependency, or workflow
+file changed. GitHub Actions were not used; native qualification remains open.
 
 ## Native NTFS acceptance
 

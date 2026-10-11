@@ -1,19 +1,142 @@
 use crate::scanner::{Visibility, read_visibility};
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use content_index::{ContentIndex, open_or_create as open_content};
+use core_types::DocKey;
 use ipc::{
     FieldKind, QueryExpr, SearchHit, SearchMode, SearchRequest, SearchResponse, TermExpr,
     TermModifier,
 };
 use meta_index::{MetaFields, MetaIndex, open_or_create_index, open_reader};
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Count, ScoreSegmentTweaker, ScoreTweaker, TopDocs};
+use tantivy::columnar::StrColumn;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{Document, IndexRecordOption, TantivyDocument, Value};
-use tantivy::{IndexReader, Score, Term};
+use tantivy::{DocAddress, DocId, IndexReader, Score, Searcher, SegmentReader, Term};
 use tracing::warn;
+
+// Offset pagination keeps only bounded ranked candidates, never every matching
+// document or its stored paths. Requests crossing either bound retain their
+// exact total and explicitly report truncation; callers can narrow the query.
+const MAX_SEARCH_WINDOW: usize = 10_000;
+const MAX_SEARCH_PAGE: usize = 1_000;
+
+struct SearchWindow {
+    offset: usize,
+    limit: usize,
+    candidates: usize,
+    truncated: bool,
+}
+
+impl SearchWindow {
+    fn for_request(req: &SearchRequest) -> Self {
+        let offset = req.offset as usize;
+        let requested = req.limit.max(1) as usize;
+        let limit = requested
+            .min(MAX_SEARCH_PAGE)
+            .min(MAX_SEARCH_WINDOW.saturating_sub(offset));
+        Self {
+            offset,
+            limit,
+            candidates: if limit == 0 { 0 } else { offset + limit },
+            truncated: limit < requested,
+        }
+    }
+}
+
+type StableScore = (Score, Reverse<DocKey>);
+type RankedDocument = (StableScore, DocAddress);
+
+struct StableScoring {
+    invalid: Arc<AtomicBool>,
+}
+
+struct StableSegmentScoring {
+    keys: StrColumn,
+    encoded: String,
+    invalid: Arc<AtomicBool>,
+}
+
+impl ScoreTweaker<StableScore> for StableScoring {
+    type Child = StableSegmentScoring;
+
+    fn segment_tweaker(&self, reader: &SegmentReader) -> tantivy::Result<Self::Child> {
+        let keys = reader.fast_fields().str("doc_key")?.ok_or_else(|| {
+            tantivy::TantivyError::SchemaError("document identity fast field is missing".into())
+        })?;
+        Ok(StableSegmentScoring {
+            keys,
+            encoded: String::new(),
+            invalid: Arc::clone(&self.invalid),
+        })
+    }
+}
+
+impl ScoreSegmentTweaker<StableScore> for StableSegmentScoring {
+    fn score(&mut self, doc: DocId, score: Score) -> StableScore {
+        let mut ordinals = self.keys.term_ords(doc);
+        let key = ordinals.next().and_then(|ordinal| {
+            if ordinals.next().is_some()
+                || !self.keys.ord_to_str(ordinal, &mut self.encoded).ok()?
+            {
+                return None;
+            }
+            self.encoded.parse::<DocKey>().ok()
+        });
+        if let Some(key) = key
+            && score.is_finite()
+        {
+            // PartialOrd in Tantivy's tuple collector treats both signed zero
+            // scores as equal. Canonicalize them so the final total_cmp uses
+            // exactly the same order at pagination boundaries.
+            let score = if score == 0.0 { 0.0 } else { score };
+            (score, Reverse(key))
+        } else {
+            // Tantivy's per-document score callback cannot return an error.
+            // Retain failure across segment collectors and reject the complete
+            // response afterward instead of returning a corrupt partial page.
+            self.invalid.store(true, Ordering::Relaxed);
+            (Score::NEG_INFINITY, Reverse(DocKey(u128::MAX)))
+        }
+    }
+}
+
+fn ranked_documents(
+    searcher: &Searcher,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<(Vec<RankedDocument>, usize)> {
+    if limit == 0 {
+        return Ok((Vec::new(), searcher.search(query, &Count)?));
+    }
+    let invalid = Arc::new(AtomicBool::new(false));
+    let collector = TopDocs::with_limit(limit).tweak_score(StableScoring {
+        invalid: Arc::clone(&invalid),
+    });
+    let found = searcher.search(query, &(collector, Count))?;
+    ensure!(
+        !invalid.load(Ordering::Relaxed),
+        "search encountered an invalid document identity or score"
+    );
+    Ok(found)
+}
+
+#[derive(Clone, Copy)]
+enum HitSource {
+    Metadata(DocAddress),
+    Content(DocAddress),
+}
+
+struct RankedHit {
+    key: DocKey,
+    score: Score,
+    source: HitSource,
+}
 
 /// Trait for handling search requests.
 pub trait SearchHandler: Send + Sync {
@@ -60,6 +183,19 @@ impl UnifiedSearchHandler {
                     content_path
                 );
                 let reader = content_index::open_reader(&idx)?;
+                // Hybrid union counting runs the already-parsed metadata
+                // predicate on content rows. The shared fields must have the
+                // same IDs, types, indexing options, and analyzers; parsing the
+                // text again against the larger schema could change meaning.
+                let content_schema = idx.index.schema();
+                for (field, definition) in meta.index.schema().fields() {
+                    let content_field = content_schema.get_field(definition.name())?;
+                    ensure!(
+                        field == content_field
+                            && definition == content_schema.get_field_entry(content_field),
+                        "content metadata fields cannot preserve the metadata query predicate"
+                    );
+                }
                 Some((idx, reader))
             }
             Err(e) => {
@@ -256,183 +392,155 @@ impl UnifiedSearchHandler {
         Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
-    fn search_meta(&self, req: &SearchRequest, visibility: &Visibility) -> SearchResponse {
+    fn search_visible(
+        &self,
+        req: &SearchRequest,
+        visibility: &Visibility,
+    ) -> Result<SearchResponse> {
         let start = Instant::now();
-        let limit = req.limit.max(1) as usize;
-        let offset = req.offset as usize;
+        let window = SearchWindow::for_request(req);
+        // Freeze each reader once for ranking, counting, and stored-field reads.
+        // The caller holds the visibility guard through this whole operation.
+        let meta_searcher = self.meta_reader.searcher();
+        let content_searcher = self.content.as_ref().map(|(_, reader)| reader.searcher());
+        let mut ranked = HashMap::<DocKey, RankedHit>::new();
+        let mut total = 0u64;
+        let mut metadata_predicate = None;
 
-        let searcher = self.meta_reader.searcher();
-        let query = match self.build_meta_query(&req.query).and_then(|q| {
-            visible_query(
-                q,
+        if req.mode != SearchMode::Content {
+            let query = self.build_meta_query(&req.query)?;
+            metadata_predicate = Some(query.box_clone());
+            let visible = visible_query(
+                query,
                 self.meta.fields.doc_key,
                 self.meta.fields.volume,
                 self.meta.fields.path_exact,
                 visibility,
-            )
-        }) {
-            Ok(query) => query,
-            Err(err) => {
-                warn!(error = %err, "failed to build meta query");
-                return StubSearchHandler.search(req.clone());
+            )?;
+            let (documents, count) =
+                ranked_documents(&meta_searcher, visible.as_ref(), window.candidates)?;
+            total = count as u64;
+            for ((score, Reverse(key)), address) in documents {
+                ranked.insert(
+                    key,
+                    RankedHit {
+                        key,
+                        score,
+                        source: HitSource::Metadata(address),
+                    },
+                );
             }
-        };
-
-        tracing::info!("executing meta query: {:?}", query);
-
-        let top_k = limit.saturating_add(offset);
-        let (hits, total) = match searcher.search(&query, &(TopDocs::with_limit(top_k), Count)) {
-            Ok(r) => r,
-            Err(err) => {
-                warn!(error = %err, "meta search execution failed");
-                return StubSearchHandler.search(req.clone());
-            }
-        };
-
-        tracing::info!(
-            "meta search found {} total hits (returned {})",
-            total,
-            hits.len()
-        );
-
-        let out = hits
-            .into_iter()
-            .skip(offset)
-            .filter_map(|(score, addr)| {
-                let retrieved = searcher.doc::<TantivyDocument>(addr).ok()?;
-                to_hit(&retrieved, &self.meta.fields, score)
-            })
-            .collect();
-
-        SearchResponse {
-            id: req.id,
-            hits: out,
-            total: total as u64,
-            truncated: false, // MVP
-            took_ms: start.elapsed().as_millis().min(u32::MAX as u128) as u32,
-            served_by: None,
         }
-    }
 
-    fn search_content(&self, req: &SearchRequest, visibility: &Visibility) -> SearchResponse {
-        let Some((content_idx, reader)) = &self.content else {
-            return StubSearchHandler.search(req.clone());
-        };
-
-        let start = Instant::now();
-        let limit = req.limit.max(1) as usize;
-        let offset = req.offset as usize;
-
-        let searcher = reader.searcher();
-        let query = match self.build_content_query(&req.query).and_then(|q| {
-            visible_query(
-                q,
-                content_idx.fields.doc_key,
-                content_idx.fields.volume,
-                content_idx.fields.path_exact,
+        if req.mode != SearchMode::NameOnly {
+            let (content, _) = self
+                .content
+                .as_ref()
+                .context("content index is unavailable")?;
+            let searcher = content_searcher
+                .as_ref()
+                .context("content reader is unavailable")?;
+            let query = self.build_content_query(&req.query)?;
+            let additions = metadata_predicate.map(|metadata| {
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, query.box_clone()),
+                    (Occur::MustNot, metadata),
+                ])) as Box<dyn Query>
+            });
+            let visible = visible_query(
+                query,
+                content.fields.doc_key,
+                content.fields.volume,
+                content.fields.path_exact,
                 visibility,
-            )
-        }) {
-            Ok(query) => query,
-            Err(err) => {
-                warn!(error = %err, "failed to build content query");
-                return StubSearchHandler.search(req.clone());
+            )?;
+            let (documents, count) =
+                ranked_documents(searcher, visible.as_ref(), window.candidates)?;
+            if let Some(additions) = additions {
+                // Published content rows have the same metadata as their one
+                // same-key metadata row: apply_metadata copies the committed
+                // worker snapshot or removes both rows, and pending mutations
+                // are masked. Shared field IDs/options were verified on open.
+                // Thus |M union C| = |M| + |C and not M| without collecting an
+                // unbounded set of document identities. Scores do not affect
+                // membership in this cloned metadata predicate.
+                let additions = visible_query(
+                    additions,
+                    content.fields.doc_key,
+                    content.fields.volume,
+                    content.fields.path_exact,
+                    visibility,
+                )?;
+                total += searcher.search(additions.as_ref(), &Count)? as u64;
+            } else {
+                total = count as u64;
             }
-        };
-
-        let top_k = limit.saturating_add(offset);
-        let (hits, total) = match searcher.search(&query, &(TopDocs::with_limit(top_k), Count)) {
-            Ok(r) => r,
-            Err(err) => {
-                warn!(error = %err, "content search execution failed");
-                return StubSearchHandler.search(req.clone());
-            }
-        };
-
-        let out = hits
-            .into_iter()
-            .skip(offset)
-            .filter_map(|(score, addr)| {
-                let retrieved = searcher.doc::<TantivyDocument>(addr).ok()?;
-                // We need to_hit equivalent for content fields
-                to_hit_content(&retrieved, &content_idx.fields, score)
-            })
-            .collect();
-
-        SearchResponse {
-            id: req.id,
-            hits: out,
-            total: total as u64,
-            truncated: false,
-            took_ms: start.elapsed().as_millis().min(u32::MAX as u128) as u32,
-            served_by: None,
-        }
-    }
-
-    fn search_hybrid(&self, req: &SearchRequest, visibility: &Visibility) -> SearchResponse {
-        // Parallel execution? For MVP, sequential.
-        // 1. Meta search
-        // 2. Content search
-        // 3. Merge by DocKey
-
-        let start = Instant::now();
-        let limit = req.limit.max(1) as usize;
-
-        // Fetch more to allow merging
-        let fetch_limit = limit * 2;
-
-        // Create sub-requests
-        let mut meta_req = req.clone();
-        meta_req.limit = fetch_limit as u32;
-        meta_req.offset = 0; // We handle paging after merge? Or simple approach: no deep paging in hybrid for now.
-
-        let meta_resp = self.search_meta(&meta_req, visibility);
-
-        let mut hits_map: std::collections::HashMap<core_types::DocKey, SearchHit> =
-            std::collections::HashMap::new();
-
-        for hit in meta_resp.hits {
-            hits_map.insert(hit.key, hit);
-        }
-
-        if self.content.is_some() {
-            let mut content_req = req.clone();
-            content_req.limit = fetch_limit as u32;
-            content_req.offset = 0;
-            let content_resp = self.search_content(&content_req, visibility);
-
-            for hit in content_resp.hits {
-                hits_map
-                    .entry(hit.key)
-                    .and_modify(|e| {
-                        e.score = e.score.max(hit.score); // Max score strategy? Or sum? Max is safer for boolean queries.
-                        if e.snippet.is_none() {
-                            e.snippet = hit.snippet.clone();
-                        }
-                    })
-                    .or_insert(hit);
+            for ((score, Reverse(key)), address) in documents {
+                ranked
+                    .entry(key)
+                    .and_modify(|hit| hit.score = hit.score.max(score))
+                    .or_insert(RankedHit {
+                        key,
+                        score,
+                        source: HitSource::Content(address),
+                    });
             }
         }
 
-        let mut merged: Vec<SearchHit> = hits_map.into_values().collect();
-        merged.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        // With max-score merging, a union top-k hit must occur in at least one
+        // source's top-k: that source's k preceding distinct keys would
+        // otherwise precede it in the union too. Both source collectors use the
+        // identical full-key tie-break, including at the candidate boundary.
+        let mut ranked: Vec<_> = ranked.into_values().collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.key.cmp(&right.key))
         });
+        let hits = ranked
+            .into_iter()
+            .skip(window.offset)
+            .take(window.limit)
+            .map(|hit| {
+                let loaded = match hit.source {
+                    HitSource::Metadata(address) => to_hit(
+                        &meta_searcher.doc::<TantivyDocument>(address)?,
+                        &self.meta.fields,
+                        hit.score,
+                    ),
+                    HitSource::Content(address) => {
+                        let (content, _) = self
+                            .content
+                            .as_ref()
+                            .context("content index is unavailable")?;
+                        let searcher = content_searcher
+                            .as_ref()
+                            .context("content reader is unavailable")?;
+                        to_hit_content(
+                            &searcher.doc::<TantivyDocument>(address)?,
+                            &content.fields,
+                            hit.score,
+                        )
+                    }
+                }
+                .context("search result has no valid stored identity")?;
+                ensure!(
+                    loaded.key == hit.key,
+                    "stored and ranked document identities differ"
+                );
+                Ok(loaded)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let offset = req.offset as usize;
-        let total = merged.len();
-        let hits = merged.into_iter().skip(offset).take(limit).collect();
-
-        SearchResponse {
+        Ok(SearchResponse {
             id: req.id,
             hits,
-            total: total as u64, // Approx
-            truncated: false,
+            total,
+            truncated: window.truncated,
             took_ms: start.elapsed().as_millis().min(u32::MAX as u128) as u32,
             served_by: None,
-        }
+        })
     }
 }
 
@@ -453,12 +561,18 @@ impl SearchHandler for UnifiedSearchHandler {
             ));
             let mut response = StubSearchHandler.search(req);
             response.served_by = Some("service-unavailable".into());
+            response.truncated = true;
             return response;
         }
-        match req.mode {
-            SearchMode::NameOnly => self.search_meta(&req, &visibility),
-            SearchMode::Content => self.search_content(&req, &visibility),
-            SearchMode::Hybrid | SearchMode::Auto => self.search_hybrid(&req, &visibility),
+        match self.search_visible(&req, &visibility) {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(%error, "search failed; refusing a partial or healthy-empty response");
+                let mut response = StubSearchHandler.search(req);
+                response.served_by = Some("service-unavailable".into());
+                response.truncated = true;
+                response
+            }
         }
     }
 }
@@ -631,4 +745,478 @@ fn to_hit<D: Document>(doc: &D, fields: &MetaFields, score: Score) -> Option<Sea
         modified,
         snippet: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_types::{FileFlags, FileMeta};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use tantivy::IndexWriter;
+    use tantivy::merge_policy::NoMergePolicy;
+
+    struct SearchFixture {
+        root: PathBuf,
+        handler: UnifiedSearchHandler,
+        metadata: IndexWriter,
+        content: IndexWriter,
+    }
+
+    impl SearchFixture {
+        fn new() -> Result<Self> {
+            let root = tempfile::tempdir()?.keep();
+            let handler = UnifiedSearchHandler::try_new(&root.join("meta"), &root.join("content"))?;
+            let metadata = meta_index::create_writer(
+                &handler.meta,
+                &meta_index::WriterConfig {
+                    heap_size_bytes: 20_000_000,
+                    num_threads: 1,
+                },
+            )?;
+            let content = content_index::create_writer(
+                &handler.content.as_ref().unwrap().0,
+                &content_index::WriterConfig {
+                    heap_size_bytes: 20_000_000,
+                    num_threads: 1,
+                },
+            )?;
+            metadata.set_merge_policy(Box::new(NoMergePolicy));
+            content.set_merge_policy(Box::new(NoMergePolicy));
+            Ok(Self {
+                root,
+                handler,
+                metadata,
+                content,
+            })
+        }
+
+        fn put_metadata(&mut self, meta: &FileMeta) -> Result<()> {
+            meta_index::add_file_meta_batch(
+                &mut self.metadata,
+                &self.handler.meta.fields,
+                [meta.clone()],
+            )
+        }
+
+        fn put_content(&mut self, meta: &FileMeta, body: Option<&str>) -> Result<()> {
+            let fields = &self.handler.content.as_ref().unwrap().0.fields;
+            if let Some(body) = body {
+                content_index::add_content_doc(
+                    &mut self.content,
+                    fields,
+                    &content_index::ContentDoc {
+                        key: meta.key,
+                        volume: meta.volume,
+                        name: Some(meta.name.clone()),
+                        path: meta.path.clone(),
+                        ext: meta.ext.clone(),
+                        size: meta.size,
+                        created: meta.created,
+                        modified: meta.modified,
+                        flags: u64::from(meta.flags.bits()),
+                        content_lang: None,
+                        content: body.to_string(),
+                    },
+                )?;
+            } else {
+                content_index::delete_doc(&mut self.content, fields, meta.key);
+            }
+            Ok(())
+        }
+
+        fn put(&mut self, meta: &FileMeta, body: Option<&str>) -> Result<()> {
+            self.put_metadata(meta)?;
+            self.put_content(meta, body)
+        }
+
+        fn delete(&mut self, key: DocKey) {
+            meta_index::delete_doc(&mut self.metadata, &self.handler.meta.fields, key);
+            content_index::delete_doc(
+                &mut self.content,
+                &self.handler.content.as_ref().unwrap().0.fields,
+                key,
+            );
+        }
+
+        fn commit(&mut self) -> Result<()> {
+            self.content.commit()?;
+            self.metadata.commit()?;
+            self.reload()
+        }
+
+        fn reload(&self) -> Result<()> {
+            self.handler.meta_reader.reload()?;
+            self.handler.content.as_ref().unwrap().1.reload()?;
+            Ok(())
+        }
+
+        fn search(&self, req: &SearchRequest, visibility: &Visibility) -> Result<SearchResponse> {
+            self.handler.search_visible(req, visibility)
+        }
+    }
+
+    fn file(volume: u16, identity: u64, name: &str, path: &str) -> FileMeta {
+        FileMeta {
+            key: DocKey::from_parts(volume, identity),
+            volume,
+            parent: None,
+            name: name.to_string(),
+            path: Some(path.to_string()),
+            ext: Some("txt".to_string()),
+            size: 100,
+            created: 100,
+            modified: 200,
+            flags: FileFlags::empty(),
+        }
+    }
+
+    fn request(value: &str, field: Option<FieldKind>, mode: SearchMode) -> SearchRequest {
+        SearchRequest::with_query(QueryExpr::Term(TermExpr {
+            field,
+            value: value.to_string(),
+            modifier: TermModifier::Term,
+        }))
+        .with_mode(mode)
+        .with_limit(200)
+    }
+
+    fn keys(response: &SearchResponse) -> Vec<DocKey> {
+        response.hits.iter().map(|hit| hit.key).collect()
+    }
+
+    #[test]
+    fn hybrid_pages_count_the_complete_union_with_overlapping_sources() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        for identity in 0..90u64 {
+            let name = if identity < 60 {
+                "needle candidate"
+            } else {
+                "plain candidate"
+            };
+            let meta = file(
+                7,
+                identity,
+                name,
+                &format!(r"C:\search\file-{identity}.txt"),
+            );
+            fixture.put(&meta, (identity >= 30).then_some("needle body"))?;
+        }
+        fixture.commit()?;
+        let visibility = Visibility::default();
+        let metadata =
+            fixture.search(&request("needle", None, SearchMode::NameOnly), &visibility)?;
+        let content = fixture.search(&request("needle", None, SearchMode::Content), &visibility)?;
+        assert_eq!(metadata.total, 60);
+        assert_eq!(content.total, 60);
+        // Independent union oracle from complete per-source results. The hybrid
+        // page must retain maximum score and the full-key tie-break even where
+        // the two top lists overlap heavily.
+        let mut oracle = std::collections::BTreeMap::<DocKey, Score>::new();
+        for hit in metadata.hits.into_iter().chain(content.hits) {
+            oracle
+                .entry(hit.key)
+                .and_modify(|score| *score = score.max(hit.score))
+                .or_insert(hit.score);
+        }
+        let mut oracle: Vec<_> = oracle.into_iter().collect();
+        oracle.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let expected: Vec<_> = oracle.iter().map(|(key, _)| *key).collect();
+        assert_eq!(expected.len(), 90);
+        for mode in [SearchMode::Auto, SearchMode::Hybrid] {
+            let mut combined = Vec::new();
+            for offset in (0..98).step_by(7) {
+                let req = request("needle", None, mode)
+                    .with_limit(7)
+                    .with_offset(offset);
+                let page = fixture.search(&req, &visibility)?;
+                assert_eq!(
+                    page.total, 90,
+                    "total must not shrink to the candidate window"
+                );
+                assert!(!page.truncated);
+                assert_eq!(
+                    keys(&page),
+                    expected
+                        .iter()
+                        .copied()
+                        .skip(offset as usize)
+                        .take(7)
+                        .collect::<Vec<_>>()
+                );
+                for hit in &page.hits {
+                    assert_eq!(
+                        hit.score,
+                        oracle.iter().find(|(key, _)| *key == hit.key).unwrap().1
+                    );
+                }
+                combined.extend(keys(&page));
+            }
+            assert_eq!(combined, expected);
+            assert_eq!(combined.iter().copied().collect::<BTreeSet<_>>().len(), 90);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tied_pages_keep_full_identity_order_across_replacement_merge_and_reopen() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut files = Vec::new();
+        for volume in [10, 2] {
+            for identity in (0..35).rev() {
+                let reference = 0xabcd_0000_0000_0000 | identity;
+                files.push(file(volume, reference, "needle", r"C:\ties\entry.txt"));
+            }
+        }
+        for page in files.chunks(11) {
+            for meta in page {
+                fixture.put(meta, Some("plain"))?;
+            }
+            fixture.commit()?;
+        }
+        let mut expected: Vec<_> = files.iter().map(|meta| meta.key).collect();
+        expected.sort_unstable();
+        let assert_pages = |fixture: &SearchFixture| -> Result<()> {
+            for mode in [SearchMode::Auto, SearchMode::NameOnly, SearchMode::Content] {
+                let mut actual = Vec::new();
+                for offset in (0..70).step_by(3) {
+                    let page = fixture.search(
+                        &request("needle", Some(FieldKind::Name), mode)
+                            .with_limit(3)
+                            .with_offset(offset),
+                        &Visibility::default(),
+                    )?;
+                    assert_eq!(page.total, 70);
+                    actual.extend(keys(&page));
+                }
+                assert_eq!(actual, expected);
+            }
+            Ok(())
+        };
+        assert_pages(&fixture)?;
+        for page in files.iter().rev().collect::<Vec<_>>().chunks(13) {
+            for meta in page {
+                fixture.put(meta, Some("plain"))?;
+            }
+            fixture.commit()?;
+        }
+        let segments = fixture.handler.meta.index.searchable_segment_ids()?;
+        fixture.metadata.merge(&segments).wait()?;
+        let segments = fixture
+            .handler
+            .content
+            .as_ref()
+            .unwrap()
+            .0
+            .index
+            .searchable_segment_ids()?;
+        fixture.content.merge(&segments).wait()?;
+        fixture.handler = UnifiedSearchHandler::try_new(
+            &fixture.root.join("meta"),
+            &fixture.root.join("content"),
+        )?;
+        assert_pages(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_union_remains_exact_during_masked_replacement_and_delete_replay() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let original = file(5, 1, "needle original", r"C:\before\original.txt");
+        let stable = file(5, 2, "needle stable", r"C:\stable.txt");
+        let deleted = file(5, 3, "plain", r"C:\deleted.txt");
+        let metadata_only = file(5, 4, "needle metadata", r"C:\metadata.txt");
+        for (meta, body) in [
+            (&original, Some("obsolete")),
+            (&stable, Some("needle steady")),
+            (&deleted, Some("needle")),
+            (&metadata_only, None),
+        ] {
+            fixture.put(meta, body)?;
+        }
+        fixture.commit()?;
+        let query = request("needle", None, SearchMode::Auto);
+        assert_eq!(fixture.search(&query, &Visibility::default())?.total, 4);
+
+        let mut replacement = original.clone();
+        replacement.name = "renamed survivor".into();
+        replacement.path = Some(r"C:\after\renamed.txt".into());
+        replacement.size = 123;
+        replacement.modified = 900;
+        fixture.put_content(&replacement, Some("fresh body"))?;
+        fixture.content.commit()?;
+        fixture.reload()?;
+        let mut pending = Visibility::default();
+        pending.documents.insert(original.key);
+        let masked = fixture.search(&query, &pending)?;
+        assert_eq!(masked.total, 3);
+        assert!(!keys(&masked).contains(&original.key));
+        assert_eq!(
+            fixture
+                .search(&request("fresh", None, SearchMode::Auto), &pending)?
+                .total,
+            0
+        );
+
+        fixture.put_metadata(&replacement)?;
+        fixture.metadata.commit()?;
+        for _ in 0..2 {
+            fixture.put(&replacement, Some("fresh body"))?;
+            fixture.delete(deleted.key);
+            fixture.commit()?;
+        }
+        let complete = fixture.search(&query, &Visibility::default())?;
+        assert_eq!(complete.total, 2);
+        assert_eq!(
+            keys(&complete).into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([stable.key, metadata_only.key])
+        );
+        assert_eq!(
+            fixture
+                .search(
+                    &request("obsolete", None, SearchMode::Auto),
+                    &Visibility::default()
+                )?
+                .total,
+            0
+        );
+        let fresh = fixture.search(
+            &request("fresh", None, SearchMode::Auto),
+            &Visibility::default(),
+        )?;
+        assert_eq!(fresh.total, 1);
+        assert_eq!(keys(&fresh), vec![original.key]);
+        assert_eq!(fresh.hits[0].path, replacement.path);
+        assert_eq!(fresh.hits[0].size, Some(123));
+        assert_eq!(fresh.hits[0].modified, Some(900));
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_counts_apply_document_volume_and_directory_masks_before_paging() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let masked = file(3, 1, "needle", r"C:\root\Moved\child.txt");
+        let sibling = file(3, 2, "needle", r"C:\root\Moved-elsewhere\child.txt");
+        let other_volume = file(4, 3, "needle", r"C:\root\Moved\child.txt");
+        let masked_doc = file(3, 4, "needle", r"C:\root\clear.txt");
+        let hidden_volume = file(8, 5, "needle", r"C:\root\another.txt");
+        for meta in [
+            &masked,
+            &sibling,
+            &other_volume,
+            &masked_doc,
+            &hidden_volume,
+        ] {
+            fixture.put(meta, Some("needle"))?;
+        }
+        fixture.commit()?;
+        let mut visibility = Visibility::default();
+        visibility
+            .directories
+            .insert(3, vec!["c:/ROOT/moved".into()]);
+        visibility.documents.insert(masked_doc.key);
+        visibility.volumes.insert(hidden_volume.volume);
+        for mode in [
+            SearchMode::Auto,
+            SearchMode::Hybrid,
+            SearchMode::NameOnly,
+            SearchMode::Content,
+        ] {
+            let req = request("needle", None, mode).with_limit(1);
+            let first = fixture.search(&req, &visibility)?;
+            let second = fixture.search(&req.with_offset(1), &visibility)?;
+            assert_eq!(first.total, 2);
+            assert_eq!(second.total, 2);
+            assert_eq!(first.hits.len(), 1);
+            assert_eq!(second.hits.len(), 1);
+            assert_eq!(
+                keys(&first)
+                    .into_iter()
+                    .chain(keys(&second))
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([sibling.key, other_volume.key])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_count_preserves_metadata_parser_field_resolution() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        fixture.put(&file(2, 1, "plain", r"C:\plain.txt"), Some("needle"))?;
+        fixture.commit()?;
+        // This syntax names a field absent from the metadata parser's schema.
+        // Re-parsing against the content schema when calculating overlap would
+        // incorrectly treat this content-only match as already counted there.
+        let req = request("content:needle", Some(FieldKind::Name), SearchMode::Auto);
+        let response = fixture.search(&req, &Visibility::default())?;
+        assert_eq!(response.total, 1);
+        assert_eq!(response.hits.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_windows_are_bounded_and_report_exact_totals_with_truncation() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        for identity in 0..MAX_SEARCH_PAGE as u64 + 5 {
+            fixture.put(
+                &file(9, identity, "needle", r"C:\bounded.txt"),
+                Some("plain"),
+            )?;
+        }
+        fixture.commit()?;
+        for mode in [SearchMode::Auto, SearchMode::NameOnly, SearchMode::Content] {
+            let req = request("needle", Some(FieldKind::Name), mode).with_limit(u32::MAX);
+            let response = fixture.search(&req, &Visibility::default())?;
+            assert_eq!(response.hits.len(), MAX_SEARCH_PAGE);
+            assert_eq!(response.total, MAX_SEARCH_PAGE as u64 + 5);
+            assert!(response.truncated);
+            let beyond = fixture.search(&req.with_offset(u32::MAX), &Visibility::default())?;
+            assert!(beyond.hits.is_empty());
+            assert_eq!(beyond.total, MAX_SEARCH_PAGE as u64 + 5);
+            assert!(
+                beyond.truncated,
+                "an unserved window must never look exhausted"
+            );
+        }
+        let edge = SearchWindow::for_request(
+            &request("needle", None, SearchMode::Auto)
+                .with_offset((MAX_SEARCH_WINDOW - 3) as u32)
+                .with_limit(7),
+        );
+        assert_eq!(edge.candidates, MAX_SEARCH_WINDOW);
+        assert_eq!(edge.limit, 3);
+        assert!(edge.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_collector_failure_cannot_become_successful_partial_results() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let good = file(65534, 1, "unverifiableuniquetoken", r"C:\healthy.txt");
+        fixture.put(&good, Some("plain"))?;
+        let fields = &fixture.handler.content.as_ref().unwrap().0.fields;
+        // A corrupt content row matches the query but has no stable identity.
+        // Metadata already has a valid hit; returning that subset would hide
+        // the broken source and fabricate a successful union response.
+        fixture.content.add_document(tantivy::doc!(
+            fields.volume => 65534u64,
+            fields.name => "unverifiableuniquetoken",
+            fields.path => r"C:\invalid.txt",
+            fields.content => "plain"
+        ))?;
+        fixture.commit()?;
+        let req = request("unverifiableuniquetoken", None, SearchMode::Auto);
+        assert!(fixture.search(&req, &Visibility::default()).is_err());
+        let response = fixture.handler.search(req);
+        assert!(response.hits.is_empty());
+        assert_eq!(response.served_by.as_deref(), Some("service-unavailable"));
+        assert!(response.truncated);
+        Ok(())
+    }
 }
