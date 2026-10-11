@@ -158,6 +158,13 @@ impl StateStore {
     /// Open the state and explicitly rebuild incompatible or replaced indices.
     /// Old index directories are retained, never interpreted using the new schema.
     pub fn open(cfg: &AppConfig) -> Result<Self> {
+        Self::open_with_index_probe(cfg, probe_index_receipt)
+    }
+
+    fn open_with_index_probe(
+        cfg: &AppConfig,
+        mut probe: impl FnMut(&Path, bool) -> Result<Option<content_index::BatchReceipt>>,
+    ) -> Result<Self> {
         fs::create_dir_all(&cfg.paths.state_dir)?;
         let lock = OpenOptions::new()
             .create(true)
@@ -168,7 +175,7 @@ impl StateStore {
         lock.try_lock()
             .context("another service owns this ingestion state")?;
         let path = Path::new(&cfg.paths.state_dir).join("ingestion-v2.json");
-        let previous = if path.exists() {
+        let previous = if path.try_exists()? {
             let file = File::open(&path)?;
             ensure!(
                 file.metadata()?.len() <= MAX_STATE_BYTES,
@@ -195,36 +202,47 @@ impl StateStore {
         });
         let mut meta_batch = None;
         let mut content_batch = None;
+        let mut preserve_indices = Vec::with_capacity(2);
         for (index_path, is_content) in [
             (&cfg.paths.meta_index, false),
             (&cfg.paths.content_index, true),
         ] {
             let index_path = Path::new(index_path);
-            if index_path.join("meta.json").exists() {
-                let index = tantivy::Index::open_in_dir(index_path)
-                    .with_context(|| format!("cannot open index {}", index_path.display()))?;
-                let schema_valid = if is_content {
-                    content_index::validate_schema(&index)
-                } else {
-                    meta_index::validate_schema(&index)
-                };
-                if schema_valid.is_err() {
-                    rebuild = true;
-                }
-                match content_index::batch_receipt(&index) {
-                    Ok(batch) if is_content => content_batch = batch,
-                    Ok(batch) => meta_batch = batch,
-                    Err(error) => {
-                        tracing::warn!(path = %index_path.display(), %error, "invalid ingestion commit payload; reconciliation required");
-                        rebuild = true;
-                    }
-                }
+            // Inspect both destinations before preserving or replacing either.
+            // In particular, a denied second directory cannot retire a first
+            // index that happened to have a detectable corruption error.
+            let exists = index_path.try_exists()?;
+            preserve_indices
+                .push(exists && fs::read_dir(index_path)?.next().transpose()?.is_some());
+            let receipt = if exists {
+                probe(index_path, is_content)?
             } else {
-                rebuild = true;
+                None
+            };
+            rebuild |= receipt.is_none();
+            if is_content {
+                content_batch = receipt;
+            } else {
+                meta_batch = receipt;
             }
-            let marker = fs::read_to_string(index_path.join("ingestion-generation"));
+            let marker = match fs::read_to_string(index_path.join("ingestion-generation")) {
+                Ok(marker) => Some(marker),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot read index generation at {}", index_path.display())
+                    });
+                }
+            };
             if previous.as_ref().is_none_or(|state| {
-                marker.as_deref().ok() != Some(state.generation.to_string().as_str())
+                marker.as_deref() != Some(state.generation.to_string().as_str())
             }) {
                 rebuild = true;
             }
@@ -256,9 +274,15 @@ impl StateStore {
         });
         if rebuild {
             state.generation = Uuid::new_v4();
-            for index_path in [&cfg.paths.meta_index, &cfg.paths.content_index] {
+            for (index_path, preserve) in [&cfg.paths.meta_index, &cfg.paths.content_index]
+                .into_iter()
+                .zip(preserve_indices)
+            {
                 let index_path = Path::new(index_path);
-                if index_path.join("meta.json").exists() {
+                // Missing meta.json does not make surviving segment files or
+                // the managed-file manifest disposable. Preserve the complete
+                // directory before initializing the replacement generation.
+                if preserve {
                     let archive = index_path
                         .with_extension(format!("before-ingestion-v2-{}", Uuid::new_v4()));
                     fs::rename(index_path, &archive)
@@ -756,6 +780,81 @@ impl StateStore {
             return None;
         }
         Some(pending)
+    }
+}
+
+/// Only definite on-disk damage or an unsupported index representation permits
+/// rebuilding. Permission, sharing, lock, device, and other I/O failures leave
+/// both existing indices and their checkpoint untouched for a later restart.
+fn rebuildable_index_error(error: &tantivy::TantivyError) -> bool {
+    use tantivy::TantivyError;
+    use tantivy::directory::error::OpenReadError;
+
+    matches!(
+        error,
+        TantivyError::DataCorruption(_)
+            | TantivyError::IncompatibleIndex(_)
+            | TantivyError::OpenReadError(
+                OpenReadError::FileDoesNotExist(_) | OpenReadError::IncompatibleIndex(_)
+            )
+    )
+}
+
+/// Validate the actual committed segment readers as well as metadata. Opening
+/// Index alone does not touch referenced segment files, so otherwise a missing
+/// store or term dictionary survives checkpoint validation and stops startup
+/// later, after the ingestion writer has already started.
+fn probe_index_receipt(path: &Path, content: bool) -> Result<Option<content_index::BatchReceipt>> {
+    let index = match tantivy::Index::open_in_dir(path) {
+        Ok(index) => index,
+        Err(error) if rebuildable_index_error(&error) => {
+            tracing::warn!(path = %path.display(), %error, "damaged index metadata; preserved reconciliation required");
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot open index {}", path.display()));
+        }
+    };
+    let schema = if content {
+        content_index::validate_schema(&index)
+    } else {
+        meta_index::validate_schema(&index)
+    };
+    if let Err(error) = schema {
+        tracing::warn!(path = %path.display(), %error, "incompatible index schema; preserved reconciliation required");
+        return Ok(None);
+    }
+    match index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()
+    {
+        Ok(reader) => drop(reader),
+        Err(error) if rebuildable_index_error(&error) => {
+            tracing::warn!(path = %path.display(), %error, "damaged committed index segment; preserved reconciliation required");
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read committed index {}", path.display()));
+        }
+    }
+    match content_index::batch_receipt(&index) {
+        Ok(receipt) => Ok(receipt),
+        Err(error)
+            if error
+                .downcast_ref::<tantivy::TantivyError>()
+                .is_some_and(|error| !rebuildable_index_error(error)) =>
+        {
+            Err(error).with_context(|| format!("cannot read index receipt at {}", path.display()))
+        }
+        Err(error) => {
+            // The shared receipt parser rejects malformed identities, partial
+            // outcome lists, and oversized payloads. Its I/O errors were kept
+            // distinct above, including failures of the second metadata read.
+            tracing::warn!(path = %path.display(), %error, "invalid ingestion commit payload; preserved reconciliation required");
+            Ok(None)
+        }
     }
 }
 
@@ -1332,6 +1431,340 @@ mod tests {
         commit_outcome(&cfg.paths.content_index, id, deferred)?;
         commit_marker(&cfg.paths.meta_index, id)?;
         store.finish_at(now)
+    }
+
+    fn commit_recovery_document(
+        store: &mut StateStore,
+        cfg: &AppConfig,
+        volume: &VolumeInfo,
+        meta: &FileMeta,
+        text: &str,
+    ) -> Result<()> {
+        let batch = pending_for_volume(
+            volume,
+            vec![MetadataChange::Upsert(meta.clone())],
+            Some(JournalCursor {
+                journal_id: 47,
+                last_usn: 100,
+            }),
+            false,
+            cfg,
+        );
+        store.begin(batch.clone())?;
+        {
+            let index = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+            let mut writer = content_index::create_writer(
+                &index,
+                &content_index::WriterConfig {
+                    heap_size_bytes: 20_000_000,
+                    num_threads: 1,
+                },
+            )?;
+            content_index::add_content_doc(
+                &mut writer,
+                &index.fields,
+                &content_index::ContentDoc {
+                    key: meta.key,
+                    volume: meta.volume,
+                    name: Some(meta.name.clone()),
+                    path: meta.path.clone(),
+                    ext: meta.ext.clone(),
+                    size: meta.size,
+                    created: meta.created,
+                    modified: meta.modified,
+                    flags: u64::from(meta.flags.bits()),
+                    content_lang: None,
+                    content: text.into(),
+                },
+            )?;
+            content_index::commit_batch(&mut writer, batch.worker.id)?;
+        }
+        super::super::apply_metadata(cfg, &batch)?;
+        store.finish()?;
+        Ok(())
+    }
+
+    fn recovery_fixture(root: &Path) -> Result<(AppConfig, StateStore, VolumeInfo, FileMeta)> {
+        let cfg = config(root);
+        let mut store = StateStore::open(&cfg)?;
+        let mut volume = volume("corrupt-index-volume");
+        store.bind_volume(&mut volume)?;
+        let key = DocKey::from_parts(volume.id, 0xabcd_0000_0000_1234);
+        let meta = meta(key, "before-recovery.txt", 10);
+        commit_recovery_document(&mut store, &cfg, &volume, &meta, "obsoletebody")?;
+        let checkpoint = store.volume_mut(volume.id)?;
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        checkpoint.content_policy = Some(ContentPolicy::for_volume(&volume, &cfg));
+        store.save()?;
+        Ok((cfg, store, volume, meta))
+    }
+
+    fn assert_preserved_rebuild(
+        store: &StateStore,
+        cfg: &AppConfig,
+        volume: &VolumeInfo,
+        previous_generation: Uuid,
+    ) -> Result<()> {
+        assert_ne!(store.state.generation, previous_generation);
+        assert_eq!(store.volume(volume.id)?.guid, volume.guid_path);
+        assert!(store.volume(volume.id)?.cursor.is_none());
+        assert!(store.volume(volume.id)?.needs_scan);
+        assert!(store.volume(volume.id)?.catching_up);
+        assert!(store.state.pending.is_none());
+        assert!(store.state.deferred.is_empty());
+        assert_eq!(store.state.retired_indices.len(), 2);
+        for (path, expected_commit) in [
+            (&cfg.paths.meta_index, store.state.meta_commit),
+            (&cfg.paths.content_index, store.state.content_commit),
+        ] {
+            let index = tantivy::Index::open_in_dir(path)?;
+            let reader = index
+                .reader_builder()
+                .reload_policy(tantivy::ReloadPolicy::Manual)
+                .try_into()?;
+            assert_eq!(reader.searcher().num_docs(), 0);
+            let receipt = content_index::batch_receipt(&index)?.context("new seed receipt")?;
+            assert!(receipt.complete);
+            assert_eq!(Some(receipt.batch_id), store.state.completed_batch);
+            assert_eq!(Some(receipt.commit_id), expected_commit);
+        }
+        Ok(())
+    }
+
+    fn archived_index<'a>(store: &'a StateStore, original: &Path) -> Result<&'a Path> {
+        let prefix = original.with_extension("before-ingestion-v2-");
+        let prefix = prefix
+            .file_name()
+            .context("archive prefix")?
+            .to_string_lossy();
+        store
+            .state
+            .retired_indices
+            .iter()
+            .map(Path::new)
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(prefix.as_ref()))
+            })
+            .context("preserved index directory")
+    }
+
+    #[test]
+    fn corrupted_index_metadata_rebuilds_both_views_and_replays_original_identity() -> Result<()> {
+        for content in [false, true] {
+            for filename in ["meta.json", ".managed.json"] {
+                let root = tempfile::tempdir()?.keep();
+                let (cfg, mut store, volume, old) = recovery_fixture(&root)?;
+                let generation = store.state.generation;
+                // Existing pending/deferred work belongs to the damaged pair.
+                // A full baseline must replace it, retaining its volume binding.
+                let retry = meta(DocKey::from_parts(volume.id, 55), "held.txt", 1);
+                store.state.deferred.push(DeferredFile {
+                    meta: retry,
+                    attempts: 3,
+                    retry_at: 1_000,
+                });
+                store.begin(pending_for_volume(
+                    &volume,
+                    vec![MetadataChange::Delete(old.key)],
+                    Some(JournalCursor {
+                        journal_id: 47,
+                        last_usn: 200,
+                    }),
+                    false,
+                    &cfg,
+                ))?;
+                drop(store);
+                let damaged = Path::new(if content {
+                    &cfg.paths.content_index
+                } else {
+                    &cfg.paths.meta_index
+                });
+                let other = Path::new(if content {
+                    &cfg.paths.meta_index
+                } else {
+                    &cfg.paths.content_index
+                });
+                let original_other_metadata = fs::read(other.join("meta.json"))?;
+                let corrupt_bytes = br#"{"incomplete": ["#;
+                atomic_write(&damaged.join(filename), corrupt_bytes)?;
+                assert!(matches!(
+                    tantivy::Index::open_in_dir(damaged),
+                    Err(tantivy::TantivyError::DataCorruption(_))
+                ));
+
+                let mut recovered = StateStore::open(&cfg)?;
+                assert_preserved_rebuild(&recovered, &cfg, &volume, generation)?;
+                assert_eq!(
+                    fs::read(archived_index(&recovered, damaged)?.join(filename))?,
+                    corrupt_bytes
+                );
+                let other_archive = archived_index(&recovered, other)?;
+                assert_eq!(
+                    fs::read(other_archive.join("meta.json"))?,
+                    original_other_metadata
+                );
+                let old_index = tantivy::Index::open_in_dir(other_archive)?;
+                assert_eq!(old_index.reader()?.searcher().num_docs(), 1);
+                drop(old_index);
+
+                // Reconciliation and replay use the same full FRN rather than
+                // creating a new identity or allowing archived body terms back.
+                let current = meta(old.key, "after-recovery.txt", 20);
+                for _ in 0..2 {
+                    commit_recovery_document(
+                        &mut recovered,
+                        &cfg,
+                        &volume,
+                        &current,
+                        "currentbody",
+                    )?;
+                }
+                let index = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+                let reader = content_index::open_reader(&index)?;
+                assert_eq!(reader.searcher().num_docs(), 1);
+                assert_eq!(
+                    content_index::read_file_meta(&index, &reader, old.key)?.map(|meta| meta.path),
+                    Some(current.path.clone())
+                );
+                for (term, count) in [("obsoletebody", 0), ("currentbody", 1)] {
+                    let query = tantivy::query::TermQuery::new(
+                        tantivy::Term::from_field_text(index.fields.content, term),
+                        tantivy::schema::IndexRecordOption::Basic,
+                    );
+                    assert_eq!(
+                        reader
+                            .searcher()
+                            .search(&query, &tantivy::collector::Count)?,
+                        count
+                    );
+                }
+                let metadata = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+                assert_eq!(metadata.index.reader()?.searcher().num_docs(), 1);
+                assert_eq!(
+                    meta_index::file_meta(&metadata, old.key)?.map(|meta| meta.path),
+                    Some(current.path)
+                );
+                assert!(recovered.volume(volume.id)?.needs_scan);
+                assert!(recovered.volume(volume.id)?.catching_up);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_committed_files_preserve_surviving_index_directories() -> Result<()> {
+        for content in [false, true] {
+            for missing_metadata in [false, true] {
+                let root = tempfile::tempdir()?.keep();
+                let (cfg, store, volume, _) = recovery_fixture(&root)?;
+                let generation = store.state.generation;
+                drop(store);
+                let damaged = Path::new(if content {
+                    &cfg.paths.content_index
+                } else {
+                    &cfg.paths.meta_index
+                });
+                let missing = if missing_metadata {
+                    PathBuf::from("meta.json")
+                } else {
+                    let index = tantivy::Index::open_in_dir(damaged)?;
+                    index
+                        .load_metas()?
+                        .segments
+                        .iter()
+                        .flat_map(|segment| segment.list_files())
+                        .find(|path| path.extension().is_some_and(|ext| ext == "store"))
+                        .context("committed store component")?
+                };
+                let original = fs::read(damaged.join(&missing))?;
+                let retained = missing.with_extension("retained-for-recovery");
+                fs::rename(damaged.join(&missing), damaged.join(&retained))?;
+                if !missing_metadata {
+                    // Receipt verification alone still succeeds, demonstrating
+                    // why actual segment-reader preflight is necessary.
+                    let index = tantivy::Index::open_in_dir(damaged)?;
+                    assert!(content_index::batch_receipt(&index)?.is_some());
+                    let error = index
+                        .reader_builder()
+                        .reload_policy(tantivy::ReloadPolicy::Manual)
+                        .try_into()
+                        .err()
+                        .context("missing segment must reject the reader")?;
+                    assert!(rebuildable_index_error(&error));
+                }
+
+                let recovered = StateStore::open(&cfg)?;
+                assert_preserved_rebuild(&recovered, &cfg, &volume, generation)?;
+                let archive = archived_index(&recovered, damaged)?;
+                assert_eq!(fs::read(archive.join(&retained))?, original);
+                assert!(!archive.join(&missing).try_exists()?);
+                assert!(archive.join(".managed.json").try_exists()?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inaccessible_index_preflight_cannot_retire_a_damaged_peer() -> Result<()> {
+        use tantivy::TantivyError;
+        use tantivy::directory::error::{LockError, OpenReadError};
+
+        for error in [
+            TantivyError::OpenReadError(OpenReadError::wrap_io_error(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                PathBuf::from("meta.json"),
+            )),
+            TantivyError::LockFailure(LockError::LockBusy, None),
+            TantivyError::IoError(Arc::new(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            TantivyError::SystemError("reader thread unavailable".into()),
+        ] {
+            assert!(!rebuildable_index_error(&error));
+            let root = tempfile::tempdir()?.keep();
+            let (cfg, store, volume, _) = recovery_fixture(&root)?;
+            let generation = store.state.generation;
+            let checkpoint = fs::read(&store.path)?;
+            let state_path = store.path.clone();
+            drop(store);
+            let metadata_path = Path::new(&cfg.paths.meta_index).join("meta.json");
+            let original_metadata = fs::read(&metadata_path)?;
+            let content_metadata = fs::read(Path::new(&cfg.paths.content_index).join("meta.json"))?;
+            atomic_write(&metadata_path, b"{damaged")?;
+            let mut visited = Vec::new();
+            let failure = StateStore::open_with_index_probe(&cfg, |path, content| {
+                visited.push(content);
+                if content {
+                    Err(error.clone().into())
+                } else {
+                    probe_index_receipt(path, content)
+                }
+            });
+            assert!(failure.is_err());
+            assert_eq!(visited, vec![false, true]);
+            assert_eq!(fs::read(&state_path)?, checkpoint);
+            assert_eq!(fs::read(&metadata_path)?, b"{damaged");
+            assert_eq!(
+                fs::read(Path::new(&cfg.paths.content_index).join("meta.json"))?,
+                content_metadata
+            );
+            assert!(fs::read_dir(&root)?.all(|entry| {
+                entry.is_ok_and(|entry| {
+                    !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("before-ingestion-v2")
+                })
+            }));
+            // Once the original metadata and access are available again, this
+            // exact checkpoint remains usable without an unnecessary rebuild.
+            atomic_write(&metadata_path, &original_metadata)?;
+            let reopened = StateStore::open(&cfg)?;
+            assert_eq!(reopened.state.generation, generation);
+            assert!(!reopened.volume(volume.id)?.needs_scan);
+            assert!(reopened.state.retired_indices.is_empty());
+        }
+        Ok(())
     }
 
     #[test]
