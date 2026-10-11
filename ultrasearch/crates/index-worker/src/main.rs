@@ -10,11 +10,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use content_extractor::{ExtractContext, ExtractorStack};
 use content_index::{ContentIndex, IndexWriter, WriterConfig};
-use core_types::DocKey;
+use core_types::{DocKey, RECONCILE_BATCH_WORK_BUDGET};
 use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use std::{env, fs};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -108,6 +109,7 @@ struct OutputRecord<'a> {
 }
 
 fn main() -> Result<()> {
+    let worker_started = Instant::now();
     dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -164,7 +166,9 @@ fn main() -> Result<()> {
 
     if let Some(job_file) = args.job_file.clone() {
         let batch = load_jobs(&job_file)?;
-        process_batch(&stack, &index, &mut writer, batch, &args)?;
+        process_batch_with_elapsed(&stack, &index, &mut writer, batch, &args, || {
+            worker_started.elapsed()
+        })?;
     } else {
         let path = args
             .path
@@ -198,12 +202,13 @@ fn main() -> Result<()> {
 /// successful attempt always publishes a fresh completed receipt. Callers must
 /// replay every retained intent, including previously completed attempts whose
 /// acknowledgement or cross-index checkpoint was interrupted.
-fn process_batch(
+fn process_batch_with_elapsed(
     stack: &ExtractorStack,
     index: &ContentIndex,
     writer: &mut IndexWriter,
     batch: JobFile,
     args: &Args,
+    mut elapsed: impl FnMut() -> Duration,
 ) -> Result<()> {
     validate_job_file(&batch)?;
     let batch_id = batch.id;
@@ -223,20 +228,29 @@ fn process_batch(
     for job in batch.jobs {
         let key = DocKey::from_parts(job.volume_id, job.file_id);
         let reconcile = job.operation == JobOperation::Reconcile;
-        match process_job(stack, index, writer, job, args) {
-            Ok(()) => {
-                // Later successful reconciliation or deletion supersedes a
-                // failed observation of the same identity in this batch.
-                deferred.remove(&key);
-            }
-            Err(error) if allow_deferral && reconcile && error.is::<DeferredFileFailure>() => {
-                deferred.insert(key);
-                warn!(%key, error = %format!("{error:#}"),
-                    "file extraction deferred; tombstone and retry obligation will commit together");
-            }
-            Err(error) => {
-                failed_jobs += 1;
-                warn!("job failed: {error:#}");
+        if allow_deferral && reconcile && elapsed() >= RECONCILE_BATCH_WORK_BUDGET {
+            // Do not start another filesystem operation once the cooperative
+            // budget expires. These validated jobs still invalidate old text
+            // and retain their identity in the final durable retry receipt.
+            content_index::delete_doc(writer, &index.fields, key);
+            deferred.insert(key);
+            warn!(%key, "batch work budget exhausted; file extraction deferred");
+        } else {
+            match process_job(stack, index, writer, job, args) {
+                Ok(()) => {
+                    // Later successful reconciliation or deletion supersedes a
+                    // failed observation of the same identity in this batch.
+                    deferred.remove(&key);
+                }
+                Err(error) if allow_deferral && reconcile && error.is::<DeferredFileFailure>() => {
+                    deferred.insert(key);
+                    warn!(%key, error = %format!("{error:#}"),
+                        "file extraction deferred; tombstone and retry obligation will commit together");
+                }
+                Err(error) => {
+                    failed_jobs += 1;
+                    warn!("job failed: {error:#}");
+                }
             }
         }
         pending += 1;
@@ -613,6 +627,20 @@ type CapturedContent = std::result::Result<Vec<u8>, u64>;
 const SNAPSHOT_READ_SIZE: usize = 64 * 1024;
 
 #[cfg(any(windows, test))]
+const SNAPSHOT_CAPTURE_BUDGET: Duration = Duration::from_secs(30);
+
+/// One slow read may wait at most five seconds, and successive short reads
+/// share one capture budget. Recheck after completion before accepting bytes.
+#[cfg(any(windows, test))]
+fn snapshot_wait_millis(elapsed: Duration) -> Result<u32> {
+    let remaining = SNAPSHOT_CAPTURE_BUDGET
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .context("snapshot capture exceeded its time budget; retry required")?;
+    Ok(remaining.as_millis().clamp(1, 5_000) as u32)
+}
+
+#[cfg(any(windows, test))]
 trait SnapshotSource {
     fn check_intact(&self) -> Result<()>;
     fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<usize>;
@@ -882,8 +910,6 @@ mod native_snapshot {
     use windows::Win32::System::WindowsProgramming::FILE_FLAG_OPEN_REQUIRING_OPLOCK;
     use windows::core::PCWSTR;
 
-    const READ_WAIT_MS: u32 = 5_000;
-
     pub(super) fn win32_io_error(error: windows::core::Error) -> std::io::Error {
         let code = error.code().0 as u32;
         if code & 0xffff_0000 == 0x8007_0000 {
@@ -939,6 +965,7 @@ mod native_snapshot {
     }
 
     pub(super) struct Reader {
+        started: Instant,
         file: Option<fs::File>,
         // Boxed storage never moves while the kernel owns these pointers.
         // UnsafeCell permits kernel writes while check_intact borrows Reader.
@@ -952,9 +979,11 @@ mod native_snapshot {
 
     impl Reader {
         pub(super) fn open(job: &JobSpec) -> Result<Self> {
+            let started = Instant::now();
             let oplock_event = event()?;
             let read_event = event()?;
             let mut reader = Self {
+                started,
                 file: None,
                 oplock: Box::new(UnsafeCell::new(OplockRequest {
                     input: REQUEST_OPLOCK_INPUT_BUFFER {
@@ -1033,6 +1062,7 @@ mod native_snapshot {
 
     impl SnapshotSource for Reader {
         fn check_intact(&self) -> Result<()> {
+            snapshot_wait_millis(self.started.elapsed())?;
             // SAFETY: the event is owned and is never closed while self exists.
             match unsafe { WaitForSingleObject(raw(&self.oplock_event), 0) } {
                 WAIT_TIMEOUT => Ok(()),
@@ -1081,6 +1111,9 @@ mod native_snapshot {
                     }
                     Some(code) if code == ERROR_IO_PENDING.0 as i32 => {
                         self.read_pending = true;
+                        // Record kernel ownership before a deadline error can
+                        // unwind into the existing cancellation/close/drain.
+                        let wait_millis = snapshot_wait_millis(self.started.elapsed())?;
                         // Put break first so simultaneous read/break readiness
                         // invalidates the snapshot. Writes need no RH ACK; a
                         // conflicting open proceeds as soon as Drop closes us.
@@ -1088,7 +1121,7 @@ mod native_snapshot {
                             WaitForMultipleObjects(
                                 &[raw(&self.oplock_event), raw(&self.read_event)],
                                 false,
-                                READ_WAIT_MS,
+                                wait_millis,
                             )
                         };
                         if ready == WAIT_OBJECT_0 {
@@ -1431,6 +1464,89 @@ mod tests {
         }
     }
 
+    fn process_batch(
+        stack: &ExtractorStack,
+        index: &ContentIndex,
+        writer: &mut IndexWriter,
+        batch: JobFile,
+        args: &Args,
+    ) -> Result<()> {
+        let started = Instant::now();
+        process_batch_with_elapsed(stack, index, writer, batch, args, || started.elapsed())
+    }
+
+    fn distinct_jobs(paths: &[PathBuf]) -> Result<Vec<JobSpec>> {
+        let jobs = paths
+            .iter()
+            .map(|path| job_for(path.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(not(windows))]
+        let jobs = jobs
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, job)| JobSpec {
+                file_id: job.file_id + ordinal as u64,
+                ..job
+            })
+            .collect();
+        Ok(jobs)
+    }
+
+    struct CountingFileExtractor {
+        processed: std::sync::Arc<std::sync::Mutex<Vec<DocKey>>>,
+    }
+
+    impl Extractor for CountingFileExtractor {
+        fn name(&self) -> &'static str {
+            "budget-admission-regression"
+        }
+
+        fn supports(&self, _: &ExtractContext) -> bool {
+            true
+        }
+
+        fn extract(
+            &self,
+            ctx: &ExtractContext,
+            key: DocKey,
+        ) -> std::result::Result<content_extractor::ExtractedContent, content_extractor::ExtractError>
+        {
+            self.processed
+                .lock()
+                .expect("extraction counter lock")
+                .push(key);
+            content_extractor::SimpleTextExtractor.extract(ctx, key)
+        }
+
+        fn extract_file(
+            &self,
+            ctx: &ExtractContext,
+            key: DocKey,
+            file: &fs::File,
+        ) -> std::result::Result<content_extractor::ExtractedContent, content_extractor::ExtractError>
+        {
+            self.processed
+                .lock()
+                .expect("extraction counter lock")
+                .push(key);
+            content_extractor::SimpleTextExtractor.extract_file(ctx, key, file)
+        }
+
+        fn extract_bytes(
+            &self,
+            ctx: &ExtractContext,
+            key: DocKey,
+            bytes: &[u8],
+        ) -> std::result::Result<content_extractor::ExtractedContent, content_extractor::ExtractError>
+        {
+            self.processed
+                .lock()
+                .expect("extraction counter lock")
+                .push(key);
+            content_extractor::SimpleTextExtractor.extract_bytes(ctx, key, bytes)
+        }
+    }
+
     struct SnapshotFixture {
         data: std::io::Cursor<Vec<u8>>,
         max_read: usize,
@@ -1523,6 +1639,80 @@ mod tests {
         assert_eq!(source.data.position(), 3);
     }
 
+    #[test]
+    fn snapshot_capture_deadline_clips_each_wait_to_the_remaining_total_budget() -> Result<()> {
+        assert_eq!(snapshot_wait_millis(Duration::ZERO)?, 5_000);
+        assert_eq!(snapshot_wait_millis(Duration::from_secs(25))?, 5_000);
+        assert_eq!(snapshot_wait_millis(Duration::from_millis(29_500))?, 500);
+        assert_eq!(
+            snapshot_wait_millis(SNAPSHOT_CAPTURE_BUDGET - Duration::from_nanos(1))?,
+            1
+        );
+        assert!(snapshot_wait_millis(SNAPSHOT_CAPTURE_BUDGET).is_err());
+        assert!(snapshot_wait_millis(SNAPSHOT_CAPTURE_BUDGET + Duration::from_secs(1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_capture_discards_bytes_when_short_reads_or_eof_exhaust_the_budget() -> Result<()> {
+        struct TimedSnapshot {
+            source: SnapshotFixture,
+            elapsed: Duration,
+        }
+
+        impl SnapshotSource for TimedSnapshot {
+            fn check_intact(&self) -> Result<()> {
+                snapshot_wait_millis(self.elapsed)?;
+                self.source.check_intact()
+            }
+
+            fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<usize> {
+                let result = self.source.read_at(offset, target);
+                self.elapsed += Duration::from_secs(5);
+                result
+            }
+        }
+
+        let mut within_budget = TimedSnapshot {
+            source: SnapshotFixture::new(b"abc", 1),
+            elapsed: Duration::ZERO,
+        };
+        assert_eq!(capture_bounded(&mut within_budget, 3)?, Ok(b"abc".to_vec()));
+        assert_eq!(within_budget.source.reads, 4);
+
+        // Every individual short read fits the old five-second wait, but the
+        // sixth completion exhausts one shared budget and rejects all bytes.
+        let mut slow = TimedSnapshot {
+            source: SnapshotFixture::new(b"0123456789", 1),
+            elapsed: Duration::ZERO,
+        };
+        let error = capture_bounded(&mut slow, 10).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("capture exceeded its time budget")
+        );
+        assert_eq!(slow.source.reads, 6);
+
+        // A deadline racing EOF or the size-policy probe is a retry, never a
+        // successful empty snapshot or an acknowledged too-large omission.
+        for bytes in [&b""[..], &b"x"[..]] {
+            let mut ending = TimedSnapshot {
+                source: SnapshotFixture::new(bytes, 1),
+                elapsed: Duration::from_secs(25),
+            };
+            assert!(capture_bounded(&mut ending, 0).is_err());
+            assert_eq!(ending.source.reads, 1);
+        }
+        let mut expired = TimedSnapshot {
+            source: SnapshotFixture::new(b"unread", 1),
+            elapsed: SNAPSHOT_CAPTURE_BUDGET,
+        };
+        assert!(capture_bounded(&mut expired, 10).is_err());
+        assert_eq!(expired.source.reads, 0);
+        Ok(())
+    }
+
     /// Inject a repeatable read failure for one actual file while letting the
     /// production verified-handle extractor read every other file normally.
     struct FailingFileExtractor {
@@ -1586,6 +1776,320 @@ mod tests {
             key,
             remaining: std::sync::Mutex::new(failures),
         })])
+    }
+
+    #[test]
+    fn batch_budget_defers_unstarted_files_durably_across_replay_and_recovery() -> Result<()> {
+        for commit_every in [0, 1] {
+            let dir = tempfile::tempdir()?;
+            let paths: Vec<_> = ["first.txt", "second.txt", "missing.txt", "last.txt"]
+                .into_iter()
+                .map(|name| dir.path().join(name))
+                .collect();
+            for path in &paths {
+                fs::write(path, "budgetobsolete")?;
+            }
+            let jobs = distinct_jobs(&paths)?;
+            let keys: Vec<_> = jobs
+                .iter()
+                .map(|job| DocKey::from_parts(job.volume_id, job.file_id))
+                .collect();
+            let expected_deferred: Vec<_> = keys[2..]
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let index_path = dir.path().join("content");
+            let index = content_index::open_or_create(&index_path)?;
+            let config = WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            };
+            let mut writer = content_index::create_writer(&index, &config)?;
+            let mut args = args();
+            args.commit_every = commit_every;
+            process_batch(
+                &ExtractorStack::with_defaults(),
+                &index,
+                &mut writer,
+                durable_batch(jobs.clone()),
+                &args,
+            )?;
+            assert_eq!(content_matches(&index, "budgetobsolete")?, 4);
+            drop(writer);
+            drop(index);
+
+            for path in &paths {
+                fs::write(path, "budgetcurrent")?;
+            }
+            let retained_path = dir.path().join("retained.txt");
+            fs::rename(&paths[2], &retained_path)?;
+            let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stack = ExtractorStack::new(vec![Box::new(CountingFileExtractor {
+                processed: processed.clone(),
+            })]);
+            let pending = deferrable_batch(jobs.clone());
+            let mut previous = None;
+            for _ in 0..2 {
+                let index = content_index::open_or_create(&index_path)?;
+                if let Some(previous) = &previous {
+                    assert_eq!(
+                        content_index::batch_outcome(&index.index)?.as_ref(),
+                        Some(previous)
+                    );
+                }
+                let mut writer = content_index::create_writer(&index, &config)?;
+                processed.lock().unwrap().clear();
+                let mut elapsed = [
+                    Duration::ZERO,
+                    RECONCILE_BATCH_WORK_BUDGET - Duration::from_millis(1),
+                    RECONCILE_BATCH_WORK_BUDGET,
+                    RECONCILE_BATCH_WORK_BUDGET,
+                ]
+                .into_iter();
+                process_batch_with_elapsed(
+                    &stack,
+                    &index,
+                    &mut writer,
+                    pending.clone(),
+                    &args,
+                    || {
+                        elapsed
+                            .next()
+                            .expect("one admission check per reconciliation")
+                    },
+                )?;
+                assert!(elapsed.next().is_none());
+                assert_eq!(processed.lock().unwrap().as_slice(), &keys[..2]);
+                let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+                assert!(outcome.receipt.complete);
+                assert_eq!(Some(outcome.receipt.batch_id), pending.id);
+                assert_eq!(outcome.deferred, expected_deferred);
+                if let Some(previous) = &previous {
+                    assert_ne!(outcome.receipt.commit_id, previous.receipt.commit_id);
+                }
+                // The missing path was not probed or acknowledged as obsolete:
+                // its full identity remains a retry obligation with its tombstone.
+                assert_eq!(content_matches(&index, "budgetobsolete")?, 0);
+                assert_eq!(content_matches(&index, "budgetcurrent")?, 2);
+                assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+                previous = Some(outcome);
+            }
+
+            let index = content_index::open_or_create(&index_path)?;
+            assert_eq!(content_index::batch_outcome(&index.index)?, previous);
+            let mut writer = content_index::create_writer(&index, &config)?;
+            let mut retry_jobs = jobs[2..].to_vec();
+            retry_jobs[0].path = retained_path.clone();
+            let retry = deferrable_batch(retry_jobs);
+            for _ in 0..2 {
+                processed.lock().unwrap().clear();
+                process_batch_with_elapsed(
+                    &stack,
+                    &index,
+                    &mut writer,
+                    retry.clone(),
+                    &args,
+                    || Duration::ZERO,
+                )?;
+                assert_eq!(processed.lock().unwrap().as_slice(), &keys[2..]);
+                let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+                assert!(outcome.receipt.complete);
+                assert!(outcome.deferred.is_empty());
+                assert_eq!(content_matches(&index, "budgetobsolete")?, 0);
+                assert_eq!(content_matches(&index, "budgetcurrent")?, 4);
+                let reader = content_index::open_reader(&index)?;
+                assert_eq!(reader.searcher().num_docs(), 4);
+                assert_eq!(
+                    content_index::read_file_meta(&index, &reader, keys[2])?
+                        .unwrap()
+                        .path
+                        .as_deref(),
+                    Some(retained_path.to_str().unwrap())
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expired_batch_budget_preserves_delete_and_strict_upsert_order() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths: Vec<_> = [
+            "deleted.txt",
+            "strict.txt",
+            "deferred.txt",
+            "otherdelete.txt",
+        ]
+        .into_iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+        for path in &paths {
+            fs::write(path, "orderedobsolete")?;
+        }
+        let jobs = distinct_jobs(&paths)?;
+        let keys: Vec<_> = jobs
+            .iter()
+            .map(|job| DocKey::from_parts(job.volume_id, job.file_id))
+            .collect();
+        let index = content_index::create_in_ram()?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        let args = args();
+        process_batch(
+            &ExtractorStack::with_defaults(),
+            &index,
+            &mut writer,
+            durable_batch(jobs.clone()),
+            &args,
+        )?;
+        fs::write(&paths[1], "strictreplacement")?;
+        let deletion = |job: &JobSpec| JobSpec {
+            operation: JobOperation::Delete,
+            path: PathBuf::new(),
+            ..job.clone()
+        };
+        let strict = JobSpec {
+            operation: JobOperation::Upsert,
+            ..jobs[1].clone()
+        };
+        let pending = deferrable_batch(vec![
+            jobs[0].clone(),
+            jobs[1].clone(),
+            jobs[2].clone(),
+            deletion(&jobs[0]),
+            strict,
+            deletion(&jobs[3]),
+        ]);
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stack = ExtractorStack::new(vec![Box::new(CountingFileExtractor {
+            processed: processed.clone(),
+        })]);
+        let mut admissions = 0;
+        process_batch_with_elapsed(&stack, &index, &mut writer, pending, &args, || {
+            admissions += 1;
+            RECONCILE_BATCH_WORK_BUDGET
+        })?;
+        assert_eq!(admissions, 3);
+        assert_eq!(processed.lock().unwrap().as_slice(), &[keys[1]]);
+        let outcome = content_index::batch_outcome(&index.index)?.unwrap();
+        assert!(outcome.receipt.complete);
+        assert_eq!(outcome.deferred, vec![keys[2]]);
+        assert_eq!(content_matches(&index, "orderedobsolete")?, 0);
+        assert_eq!(content_matches(&index, "strictreplacement")?, 1);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 1);
+
+        // Reversing the same-key operations changes the final obligation:
+        // a later unstarted reconciliation must survive an earlier deletion.
+        process_batch_with_elapsed(
+            &stack,
+            &index,
+            &mut writer,
+            deferrable_batch(vec![deletion(&jobs[2]), jobs[2].clone()]),
+            &args,
+            || RECONCILE_BATCH_WORK_BUDGET,
+        )?;
+        assert_eq!(
+            content_index::batch_outcome(&index.index)?
+                .unwrap()
+                .deferred,
+            vec![keys[2]]
+        );
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_budget_cannot_bypass_validation_or_complete_a_strict_failure() -> Result<()> {
+        for commit_every in [0, 1] {
+            let dir = tempfile::tempdir()?;
+            let paths = vec![dir.path().join("first.txt"), dir.path().join("strict.txt")];
+            for path in &paths {
+                fs::write(path, "strictoriginal")?;
+            }
+            let jobs = distinct_jobs(&paths)?;
+            let first_key = DocKey::from_parts(jobs[0].volume_id, jobs[0].file_id);
+            let index = content_index::create_in_ram()?;
+            let mut writer = content_index::create_writer(
+                &index,
+                &WriterConfig {
+                    heap_size_bytes: 20_000_000,
+                    num_threads: 1,
+                },
+            )?;
+            let mut args = args();
+            args.commit_every = commit_every;
+            let stack = ExtractorStack::with_defaults();
+            let pending = deferrable_batch(vec![
+                jobs[0].clone(),
+                JobSpec {
+                    operation: JobOperation::Upsert,
+                    ..jobs[1].clone()
+                },
+            ]);
+            process_batch(&stack, &index, &mut writer, pending.clone(), &args)?;
+            let completed = content_index::batch_outcome(&index.index)?.unwrap();
+            let invalid = JobFile {
+                reset_volumes: vec![jobs[0].volume_id],
+                ..deferrable_batch(vec![JobSpec {
+                    path: PathBuf::new(),
+                    ..jobs[0].clone()
+                }])
+            };
+            let error =
+                process_batch_with_elapsed(&stack, &index, &mut writer, invalid, &args, || {
+                    panic!("validate all jobs before budget checks or mutations")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("path must not be empty"));
+            assert!(!error.is::<DeferredFileFailure>());
+            assert_eq!(
+                content_index::batch_outcome(&index.index)?,
+                Some(completed.clone())
+            );
+            assert_eq!(content_matches(&index, "strictoriginal")?, 2);
+
+            fs::rename(&paths[1], dir.path().join("retained.txt"))?;
+            let error =
+                process_batch_with_elapsed(&stack, &index, &mut writer, pending, &args, || {
+                    RECONCILE_BATCH_WORK_BUDGET
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("1 failed job"));
+            let partial = content_index::batch_outcome(&index.index)?.unwrap();
+            assert!(!partial.receipt.complete);
+            assert!(partial.deferred.is_empty());
+            assert_eq!(partial.receipt.batch_id, completed.receipt.batch_id);
+            assert_ne!(partial.receipt.commit_id, completed.receipt.commit_id);
+            assert_eq!(content_index::committed_batch(&index.index)?, None);
+            assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 0);
+
+            // Older batch versions remain strict even after the same elapsed
+            // time: a real attempted extraction failure cannot be acknowledged.
+            let error = process_batch_with_elapsed(
+                &failing_file_stack(first_key, 1),
+                &index,
+                &mut writer,
+                durable_batch(vec![jobs[0].clone()]),
+                &args,
+                || panic!("strict legacy batches do not use omission budgets"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("1 failed job"));
+            assert!(
+                !content_index::batch_outcome(&index.index)?
+                    .unwrap()
+                    .receipt
+                    .complete
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -350,6 +350,30 @@ deferred-key set atomically with its final content outcome. Validation, index
 mutation, persistence, and process failures still fail the entire transaction.
 Standalone strict Upsert jobs retain their strict failure behavior.
 
+Version 4 workers also stop starting new Reconcile jobs after a 180-second
+monotonic work budget, measured from entry to the worker process. The complete
+batch is validated before any mutation. An unstarted job removes old content
+and enters the same durable deferred-key receipt without probing or extracting
+its path; it cannot become an acknowledged disappearance. Delete operations and
+strict Upsert jobs continue in their original order, so a later successful
+operation supersedes an earlier same-key deferral. Periodic commits remain
+partial; only the final successful commit publishes complete outcomes.
+
+Windows snapshot capture shares one 30-second cooperative budget across all
+reads, including short reads and the terminal EOF/size-policy probe. Each pending
+read waits at most five seconds or its remaining capture budget, with a one-ms
+minimum for the native wait API. Checks before and after reads reject bytes
+that finish after the deadline. The existing pending-request ownership,
+cancellation, close, and completion-drain ordering remains intact.
+
+The parent still kills and reaps a worker at 300 seconds before releasing the
+writer lane. The softer limits leave time for the current file and final
+commits; they are not a guaranteed whole-process deadline. A blocked native
+open/metadata operation, uncooperative extractor, index commit, or startup that
+consumes the available budget can still require the hard timeout and replay of
+unacknowledged intent. Such failures do not advance the journal checkpoint or
+establish healthy idle operation.
+
 The service validates that every deferred key belongs to the durable batch,
 verifies that its content was tombstoned, and removes the corresponding metadata.
 The checkpoint atomically retains the file snapshot, attempt count, and next retry
@@ -362,7 +386,14 @@ Retries start after five seconds and back off through 10, 20, 40, 80, and 160
 seconds to a five-minute cap. A backwards wall-clock change cannot postpone an
 obligation indefinitely. After fresh journal work, the service admits at most one
 bounded retry batch of 128 files while content extraction is allowed. Due files
-are ordered by deadline and document identity. A retry has no journal cursor and
+are ordered by deadline and document identity to choose the oldest admitted
+volume. Within that volume, equal-deadline cohorts rotate by their minimum
+persisted attempt count before count and byte admission. The whole cohort
+rotates even when its members have different attempt histories: after backoff
+reaches the five-minute cap, separate attempt-count groups could otherwise
+give the same slow prefix permanent priority. Rotation changes only newly
+admitted retries; restart replays an existing pending UUID and job order exactly.
+A retry has no journal cursor and
 cannot reset a volume; it uses the worker's current verified file snapshot for
 replacement in both indices. Fresh changes supersede older obligations, and
 deletion, exclusion, or a volume reset removes them. After pending work has
@@ -710,6 +741,36 @@ locked dependencies as the preceding follow-up. Two unnecessary mutable test
 bindings reported by the initial host run were removed before the final clean
 check/lint gates. No protocol, state format, index schema, dependency, or workflow
 file changed. GitHub Actions were not used; native qualification remains open.
+
+### Worker work-budget and durable retry fairness verification
+
+The next October 11 follow-up adds cooperative batch/capture budgets and rotates
+same-deadline retries so a repeatedly slow prefix cannot continually defer the
+same unstarted tail. Five new worker regressions use injected monotonic elapsed
+time, real file extraction, actual index commits, completed/partial receipts,
+reopen/replay, strict job failures, and same-key deletion/recovery. Two of those
+tests cover cumulative short-read and terminal-probe expiry without sleeping.
+Three service-state regressions use real commit receipts and checkpoints to
+model six slow captures followed by a healthy file across restarts, including
+different attempt histories sharing the capped backoff deadline. Existing
+near-32-MiB admission coverage now also checks rotation before byte truncation.
+
+| Gate | Result |
+| --- | --- |
+| Final host tests for `service`, `index-worker`, and `core-types` | All 122 passed: 81 service, 25 worker, and 16 core tests. These include the eight new worker/state regressions; no failed or ignored host tests. |
+| Final all-target host check and strict Clippy for those packages and `ipc` | Both passed with `--locked --offline`; Clippy used `-D warnings`. |
+| Final Windows GNU all-target check and strict Clippy for `service`, `index-worker`, `core-types`, `ipc`, and `content-extractor`, with `service/e2e-windows` | Both passed, including the native worker and service test targets. Compilation and lint only. |
+| Workspace formatting and Git whitespace checks | Passed. |
+| Whole-workspace Linux and native qualification | The earlier whole-workspace attempts remain blocked by missing `pkg-config`/GLib; no native Windows, installed MSI, or native performance execution was available. |
+
+The initial retry encountered inconsistent cached `.rlib`/`.rmeta` pairs. Their
+artifact and fingerprint directories were retained outside the target directory
+and regenerated without changing dependencies or source to work around the
+cache. A recovered-path assertion was corrected to compare its actual optional
+string type before the final passing run. The final tests and gates used stable
+source fingerprints, the same pinned toolchains, and locked dependencies. No
+state, receipt, protocol, or index-schema migration is required. Native
+qualification remains open, and no GitHub Actions were used.
 
 ## Native NTFS acceptance
 

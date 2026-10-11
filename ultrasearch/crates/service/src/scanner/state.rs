@@ -708,9 +708,19 @@ impl StateStore {
         due.sort_by_key(|retry| (retry.retry_at, retry.meta.key));
         let volume_id = due.first()?.meta.key.volume();
         let volume = volumes.iter().find(|volume| volume.id == volume_id)?;
+        due.retain(|retry| retry.meta.key.volume() == volume_id);
+        // The worker's soft deadline can defer an unstarted tail along with a
+        // repeatedly slow prefix. Rotate each equal-deadline cohort before
+        // either admission bound, using persisted attempts across restarts.
+        // Include different attempt histories: their capped retry delays can
+        // otherwise give one slow cohort permanent priority over another.
+        for cohort in due.chunk_by_mut(|left, right| left.retry_at == right.retry_at) {
+            let attempts = cohort.iter().map(|retry| retry.attempts).min()?;
+            let rotation = attempts.saturating_sub(1) as usize % cohort.len();
+            cohort.rotate_left(rotation);
+        }
         let changes = due
             .into_iter()
-            .filter(|retry| retry.meta.key.volume() == volume_id)
             .take(limit.min(BATCH_LIMIT))
             .map(|retry| MetadataChange::Upsert(retry.meta.clone()))
             .collect::<Vec<_>>();
@@ -1337,7 +1347,8 @@ mod tests {
         let mut first = meta(first_key, "long-first.txt", 1);
         first.path = Some(format!("X:\\{}", "深".repeat(20_000)));
         let mut second = first.clone();
-        second.key = DocKey::from_parts(volume.id, 43);
+        let second_key = DocKey::from_parts(volume.id, 43);
+        second.key = second_key;
         second.name = "long-second.txt".into();
 
         let fresh = pending_for_volume(
@@ -1396,9 +1407,23 @@ mod tests {
         assert_eq!(retry.metadata.len(), 1);
         assert_eq!(retry.metadata[0].key(), first_key);
         assert_eq!(retry.worker.jobs.len(), 1);
-        reserve_retry_capacity(&store.state, &retry)?;
-        store.begin(retry)?;
+        // Equal deadlines with different attempt histories must rotate before
+        // byte admission too. Counter widths and reserved capacity are intact,
+        // but the other long file must now receive the single available slot.
+        store.state.deferred[0].attempts -= 1;
+        let rotated = store
+            .due_retry(&volumes, &cfg, i64::MAX, 2)
+            .context("rotated reserved single retry")?;
+        assert_eq!(rotated.metadata.len(), 1);
+        assert_eq!(rotated.metadata[0].key(), second_key);
+        assert_eq!(rotated.worker.jobs.len(), 1);
+        reserve_retry_capacity(&store.state, &rotated)?;
+        store.begin(rotated)?;
         assert_eq!(store.state.pending.as_ref().unwrap().metadata.len(), 1);
+        assert_eq!(
+            store.state.pending.as_ref().unwrap().metadata[0].key(),
+            second_key
+        );
         assert!(fs::metadata(&store.path)?.len() <= MAX_STATE_BYTES);
         Ok(())
     }
@@ -1682,6 +1707,207 @@ mod tests {
             assert!(replay.state.deferred.is_empty());
             assert_eq!(replay.volume(vol.id)?.cursor, Some(later));
         }
+        Ok(())
+    }
+
+    fn exercise_budgeted_retry_tail(slow_attempts: u32, tail_attempts: u32) -> Result<()> {
+        const SLOW_FILES: usize = 6;
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut vol = volume("budgeted-retry-volume");
+        store.bind_volume(&mut vol)?;
+        let start = JournalCursor {
+            journal_id: 31,
+            last_usn: 100,
+        };
+        let next = JournalCursor {
+            last_usn: 500,
+            ..start
+        };
+        let checkpoint = store.volume_mut(vol.id)?;
+        checkpoint.cursor = Some(start);
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        store.save()?;
+        let generation = store.state.generation;
+        let keys: Vec<_> = (1..=SLOW_FILES as u64 + 1)
+            .map(|file| DocKey::from_parts(vol.id, file))
+            .collect();
+        let healthy = keys[SLOW_FILES];
+        let changes = keys
+            .iter()
+            .map(|key| {
+                MetadataChange::Upsert(meta(*key, &format!("retry{}.txt", key.file_id()), 1))
+            })
+            .collect();
+        store.begin(pending_for_volume(&vol, changes, Some(next), false, &cfg))?;
+        complete_at(&mut store, &cfg, &keys, 1000)?;
+        // Model both a fresh cohort and older retries whose different histories
+        // now share the capped backoff deadline. Every counter stays durable.
+        for retry in &mut store.state.deferred {
+            retry.attempts = if retry.meta.key == healthy {
+                tail_attempts
+            } else {
+                slow_attempts
+            };
+            retry.retry_at = 1000 + retry_delay(slow_attempts.max(tail_attempts));
+        }
+        store.save()?;
+
+        for attempt in 0..2 {
+            drop(store);
+            store = StateStore::open(&cfg)?;
+            assert_eq!(store.state.generation, generation);
+            let now = store.state.deferred[0].retry_at;
+            let retry = store
+                .due_retry(std::slice::from_ref(&vol), &cfg, now, keys.len())
+                .context("budgeted retry must remain admissible")?;
+            assert!(retry.retry);
+            assert!(retry.next_cursor.is_none());
+            assert!(retry.worker.reset_volumes.is_empty());
+            let order: Vec<_> = retry.metadata.iter().map(MetadataChange::key).collect();
+            assert_eq!(order.len(), keys.len());
+            assert_eq!(
+                order.iter().copied().collect::<BTreeSet<_>>().len(),
+                keys.len()
+            );
+            let batch_id = retry.worker.id;
+            store.begin(retry)?;
+            // A crash after admission must replay the exact admitted order;
+            // rotation changes only a later, newly admitted retry attempt.
+            drop(store);
+            store = StateStore::open(&cfg)?;
+            assert_eq!(store.state.generation, generation);
+            let durable = store.state.pending.as_ref().context("durable retry")?;
+            assert_eq!(durable.worker.id, batch_id);
+            assert!(
+                durable
+                    .worker
+                    .jobs
+                    .iter()
+                    .all(|job| job.operation == JobOperation::Reconcile)
+            );
+            assert_eq!(
+                durable
+                    .worker
+                    .jobs
+                    .iter()
+                    .map(|job| DocKey::from_parts(job.volume_id, job.file_id))
+                    .collect::<Vec<_>>(),
+                order
+            );
+            // Six 30-second failed captures exhaust the worker's soft budget.
+            // The healthy file succeeds quickly only if admitted before the
+            // sixth slow capture; otherwise its unstarted obligation defers.
+            let mut slow_captures = 0;
+            let mut healthy_started = false;
+            let mut deferred = Vec::new();
+            for job in &durable.worker.jobs {
+                let key = DocKey::from_parts(job.volume_id, job.file_id);
+                if key == healthy && slow_captures < SLOW_FILES {
+                    healthy_started = true;
+                } else {
+                    if key != healthy {
+                        slow_captures += 1;
+                    }
+                    deferred.push(key);
+                }
+            }
+            assert_eq!(slow_captures, SLOW_FILES);
+            assert_eq!(healthy_started, attempt == 1);
+            deferred.sort_unstable();
+            complete_at(&mut store, &cfg, &deferred, now + 180)?;
+            assert_eq!(store.volume(vol.id)?.cursor, Some(next));
+            assert_eq!(store.state.completed_batch, Some(batch_id));
+            assert_eq!(store.state.deferred.len(), keys.len() - attempt);
+        }
+        drop(store);
+        let store = StateStore::open(&cfg)?;
+        assert_eq!(store.state.generation, generation);
+        assert_eq!(store.volume(vol.id)?.cursor, Some(next));
+        assert_eq!(store.state.deferred.len(), SLOW_FILES);
+        assert!(
+            store
+                .state
+                .deferred
+                .iter()
+                .all(|retry| retry.meta.key != healthy && retry.attempts == slow_attempts + 2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_budget_rotation_reaches_a_tail_file_after_restart() -> Result<()> {
+        exercise_budgeted_retry_tail(1, 1)
+    }
+
+    #[test]
+    fn retry_budget_rotation_reaches_mixed_attempt_tail_after_backoff_caps() -> Result<()> {
+        // Both histories have a 300-second delay, and both become one larger
+        // every time the worker defers them. Rotating separate attempt-count
+        // groups would keep all six slower keys ahead of the healthy tail.
+        exercise_budgeted_retry_tail(8, 9)
+    }
+
+    #[test]
+    fn retry_rotation_preserves_oldest_volume_and_deadline_before_count_admission() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path());
+        let mut store = StateStore::open(&cfg)?;
+        let mut first = volume("first-retry-volume");
+        let mut second = volume("second-retry-volume");
+        store.bind_volume(&mut first)?;
+        store.bind_volume(&mut second)?;
+        let older = DocKey::from_parts(first.id, 99);
+        let oldest = DocKey::from_parts(second.id, 1);
+        store.state.deferred = (1..=4)
+            .map(|file| DeferredFile {
+                meta: meta(DocKey::from_parts(first.id, file), "retry.txt", 1),
+                attempts: 2,
+                retry_at: 1000,
+            })
+            .chain([
+                DeferredFile {
+                    meta: meta(older, "older.txt", 1),
+                    attempts: u32::MAX,
+                    retry_at: 900,
+                },
+                DeferredFile {
+                    meta: meta(oldest, "oldest.txt", 1),
+                    attempts: 3,
+                    retry_at: 899,
+                },
+            ])
+            .collect();
+        store.save()?;
+        let retry = store
+            .due_retry(&[first.clone(), second.clone()], &cfg, 1000, 3)
+            .context("oldest volume retry")?;
+        assert_eq!(retry.volume, second.id);
+        assert_eq!(retry.metadata.len(), 1);
+        assert_eq!(retry.metadata[0].key(), oldest);
+
+        let retry = store
+            .due_retry(std::slice::from_ref(&first), &cfg, 1000, 3)
+            .context("rotated count-limited retry")?;
+        assert_eq!(retry.volume, first.id);
+        assert_eq!(
+            retry
+                .metadata
+                .iter()
+                .map(MetadataChange::key)
+                .collect::<Vec<_>>(),
+            vec![
+                older,
+                DocKey::from_parts(first.id, 2),
+                DocKey::from_parts(first.id, 3),
+            ]
+        );
+        assert_eq!(retry.worker.jobs.len(), 3);
+        assert!(retry.next_cursor.is_none());
+        store.begin(retry)?;
+        assert!(store.due_retry(&[first, second], &cfg, 1000, 3).is_none());
         Ok(())
     }
 

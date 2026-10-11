@@ -10,6 +10,16 @@ pub type VolumeId = u16;
 pub type FileId = u64;
 pub type Timestamp = i64; // Unix timestamp (seconds); i64 for easy serde and fast fields.
 
+/// Parent-enforced worker lifetime. A timed-out child is killed and reaped
+/// before another writer can enter the ingestion lane.
+pub const INDEX_WORKER_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Stop admitting new reconciliations before the process deadline so remaining
+/// files can be tombstoned and deferred in a complete, durable batch receipt.
+/// This cooperative budget leaves time for the current file and final commits;
+/// blocked native operations or extraction still require the parent timeout.
+pub const RECONCILE_BATCH_WORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Canonical comparison form for indexed Windows paths. Keep the original
 /// display path separately; this form changes only separators, case and the
 /// trailing directory separator, without resolving filesystem identities.

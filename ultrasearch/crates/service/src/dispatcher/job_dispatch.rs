@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use core_types::INDEX_WORKER_PROCESS_TIMEOUT;
 use core_types::config::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -8,8 +9,6 @@ use std::time::{Duration, Instant};
 use tokio::task;
 use tracing::{error, info};
 
-// A failed or hung extractor must eventually release the single writer lane.
-const MAX_WORKER_DURATION: Duration = Duration::from_secs(5 * 60);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // Runtime replacement must not create a second writer lane while a cancelled
@@ -198,7 +197,7 @@ impl JobDispatcher {
                 resume_worker_thread(child.child.id())?;
             }
 
-            let status = child.wait_for_exit(MAX_WORKER_DURATION)?;
+            let status = child.wait_for_exit(INDEX_WORKER_PROCESS_TIMEOUT)?;
             if status.success() {
                 // An empty batch also needs a real receipt. Neither successful
                 // exit alone nor a receipt left by a failed attempt is an ACK.
