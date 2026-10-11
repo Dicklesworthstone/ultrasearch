@@ -1,10 +1,11 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, bail, ensure};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use console::style;
 use core_types::config::{default_config_path, load_or_create_config};
 use ipc::{
-    QueryExpr, ReloadConfigRequest, RescanRequest, SearchMode, SearchRequest, SearchResponse,
-    StatusRequest, StatusResponse, TermExpr, TermModifier,
+    FieldKind, QueryExpr, RangeExpr, RangeOp, RangeValue, ReloadConfigRequest, RescanRequest,
+    SearchMode, SearchRequest, SearchResponse, StatusRequest, StatusResponse, TermExpr,
+    TermModifier,
 };
 use uuid::Uuid;
 
@@ -31,8 +32,8 @@ struct Cli {
 enum Commands {
     /// Run a search query over IPC.
     Search {
-        /// Query string (full-text or filename).
-        query: String,
+        #[command(flatten)]
+        query: SearchQueryArgs,
         /// Limit results.
         #[arg(short, long, default_value_t = 20)]
         limit: u32,
@@ -78,6 +79,135 @@ enum Commands {
     },
 }
 
+#[derive(Args, Debug, Default)]
+struct SearchQueryArgs {
+    /// Raw query syntax, or literal text with --prefix, --phrase, or --fuzzy.
+    #[arg(
+        value_name = "QUERY",
+        required_unless_present_any = [
+            "min_size", "max_size", "modified_since", "modified_through"
+        ]
+    )]
+    query: Option<String>,
+    /// Default field for raw syntax; target field for literal matching.
+    #[arg(long, value_enum)]
+    field: Option<SearchFieldArg>,
+    /// Match every analyzed query word as a literal prefix.
+    #[arg(long, conflicts_with_all = ["phrase", "fuzzy"])]
+    prefix: bool,
+    /// Match literal query words in order at their analyzed positions.
+    #[arg(long, conflicts_with_all = ["prefix", "fuzzy"])]
+    phrase: bool,
+    /// Match each query word within 0–2 edits; a transposition costs one.
+    #[arg(
+        long,
+        value_name = "EDITS",
+        value_parser = clap::value_parser!(u8).range(0..=2),
+        conflicts_with_all = ["prefix", "phrase"]
+    )]
+    fuzzy: Option<u8>,
+    /// Inclusive minimum file size in bytes.
+    #[arg(long, value_name = "BYTES")]
+    min_size: Option<u64>,
+    /// Inclusive maximum file size in bytes.
+    #[arg(long, value_name = "BYTES")]
+    max_size: Option<u64>,
+    /// Inclusive earliest modification time, as Unix seconds.
+    #[arg(long, value_name = "UNIX_SECONDS", allow_negative_numbers = true)]
+    modified_since: Option<i64>,
+    /// Inclusive latest modification time, as Unix seconds.
+    #[arg(long, value_name = "UNIX_SECONDS", allow_negative_numbers = true)]
+    modified_through: Option<i64>,
+}
+
+impl SearchQueryArgs {
+    fn query_expr(&self) -> Result<QueryExpr> {
+        let text = self.query.as_deref().filter(|text| !text.trim().is_empty());
+        ensure!(
+            text.is_some()
+                || (self.field.is_none() && !self.prefix && !self.phrase && self.fuzzy.is_none()),
+            "--field and literal matching options require nonempty query text"
+        );
+        let mut clauses = Vec::with_capacity(3);
+        if let Some(text) = text {
+            let modifier = if self.prefix {
+                TermModifier::Prefix
+            } else if self.phrase {
+                TermModifier::Phrase
+            } else if let Some(distance) = self.fuzzy {
+                TermModifier::Fuzzy(distance)
+            } else {
+                TermModifier::Term
+            };
+            clauses.push(QueryExpr::Term(TermExpr {
+                field: self.field.map(|field| match field {
+                    SearchFieldArg::Name => FieldKind::Name,
+                    SearchFieldArg::Path => FieldKind::Path,
+                    SearchFieldArg::Ext => FieldKind::Ext,
+                    SearchFieldArg::Content => FieldKind::Content,
+                }),
+                // Preserve the exact raw expression, including whitespace and
+                // embedded field qualifiers. Literal interpretation is selected
+                // only by the explicit modifier flags above.
+                value: text.to_string(),
+                modifier,
+            }));
+        }
+        if let Some(size) =
+            inclusive_filter(FieldKind::Size, self.min_size, self.max_size, |lo, hi| {
+                RangeValue::U64 { lo, hi }
+            })?
+        {
+            clauses.push(size);
+        }
+        if let Some(modified) = inclusive_filter(
+            FieldKind::Modified,
+            self.modified_since,
+            self.modified_through,
+            |lo, hi| RangeValue::I64 { lo, hi },
+        )? {
+            clauses.push(modified);
+        }
+        match clauses.len() {
+            0 => bail!(
+                "provide nonempty query text or at least one size or modification-time filter"
+            ),
+            1 => clauses.pop().context("search criterion is missing"),
+            _ => Ok(QueryExpr::And(clauses)),
+        }
+    }
+}
+
+fn inclusive_filter<T: Ord>(
+    field: FieldKind,
+    minimum: Option<T>,
+    maximum: Option<T>,
+    value: impl FnOnce(T, Option<T>) -> RangeValue,
+) -> Result<Option<QueryExpr>> {
+    let (op, lo, hi) = match (minimum, maximum) {
+        (None, None) => return Ok(None),
+        (Some(lo), None) => (RangeOp::Ge, lo, None),
+        (None, Some(hi)) => (RangeOp::Le, hi, None),
+        (Some(lo), Some(hi)) => {
+            ensure!(lo <= hi, "{field:?} minimum exceeds its maximum");
+            (RangeOp::Between, lo, Some(hi))
+        }
+    };
+    Ok(Some(QueryExpr::Range(RangeExpr {
+        field,
+        op,
+        value: value(lo, hi),
+    })))
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SearchFieldArg {
+    Name,
+    Path,
+    Ext,
+    Content,
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
     /// Print the effective config path and contents.
@@ -121,7 +251,7 @@ async fn main() -> Result<()> {
             timeout_ms,
             json,
         } => {
-            let req = build_search_request(query, limit, offset, timeout_ms, mode);
+            let req = build_search_request(query, limit, offset, timeout_ms, mode)?;
             let resp = pipe(&cli).search(req).await?;
             output(resp, json, print_search_response)?;
         }
@@ -240,21 +370,16 @@ fn pipe(_cli: &Cli) -> UnsupportedClient {
 }
 
 fn build_search_request(
-    query: &str,
+    query: &SearchQueryArgs,
     limit: u32,
     offset: u32,
     timeout_ms: Option<u64>,
     mode: ModeArg,
-) -> SearchRequest {
-    let term = QueryExpr::Term(TermExpr {
-        field: None,
-        value: query.to_string(),
-        modifier: TermModifier::Term,
-    });
-
-    SearchRequest {
+) -> Result<SearchRequest> {
+    let query = query.query_expr()?;
+    Ok(SearchRequest {
         id: Uuid::new_v4(),
-        query: term,
+        query,
         limit,
         offset,
         mode: match mode {
@@ -264,7 +389,7 @@ fn build_search_request(
             ModeArg::Hybrid => SearchMode::Hybrid,
         },
         timeout: timeout_ms.map(std::time::Duration::from_millis),
-    }
+    })
 }
 
 fn print_status_response(resp: &StatusResponse) -> Result<()> {
@@ -368,10 +493,338 @@ fn unsupported_service<T>() -> Result<T> {
     )
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    fn parse_search(args: &[&str]) -> Result<SearchRequest> {
+        let cli = Cli::try_parse_from(
+            ["ultrasearch", "search"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )?;
+        let Commands::Search {
+            query,
+            limit,
+            offset,
+            mode,
+            timeout_ms,
+            ..
+        } = cli.command
+        else {
+            bail!("expected search command");
+        };
+        build_search_request(&query, limit, offset, timeout_ms, mode)
+    }
+
+    #[test]
+    fn raw_search_preserves_syntax_and_request_controls() -> Result<()> {
+        let raw = "  name:alpha OR content:\"two words\"  ";
+        let request = parse_search(&[
+            raw,
+            "--limit",
+            "7",
+            "--offset",
+            "3",
+            "--mode",
+            "content",
+            "--timeout-ms",
+            "4500",
+            "--json",
+        ])?;
+        assert_eq!(
+            request.query,
+            QueryExpr::Term(TermExpr {
+                field: None,
+                value: raw.to_string(),
+                modifier: TermModifier::Term,
+            })
+        );
+        assert!(!request.id.is_nil());
+        assert_eq!(request.limit, 7);
+        assert_eq!(request.offset, 3);
+        assert_eq!(request.mode, SearchMode::Content);
+        assert_eq!(
+            request.timeout,
+            Some(std::time::Duration::from_millis(4500))
+        );
+
+        // A field remains the raw parser's default, without escaping or
+        // rewriting explicit field qualifiers embedded in the expression.
+        let request = parse_search(&[raw, "--field", "path"])?;
+        assert_eq!(
+            request.query,
+            QueryExpr::Term(TermExpr {
+                field: Some(FieldKind::Path),
+                value: raw.to_string(),
+                modifier: TermModifier::Term,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_flags_and_fields_build_exact_term_modifiers() -> Result<()> {
+        let modes: &[(&[&str], TermModifier)] = &[
+            (&["--prefix"], TermModifier::Prefix),
+            (&["--phrase"], TermModifier::Phrase),
+            (&["--fuzzy", "0"], TermModifier::Fuzzy(0)),
+            (&["--fuzzy", "1"], TermModifier::Fuzzy(1)),
+            (&["--fuzzy", "2"], TermModifier::Fuzzy(2)),
+        ];
+        for (field, expected_field) in [
+            ("name", FieldKind::Name),
+            ("path", FieldKind::Path),
+            ("ext", FieldKind::Ext),
+            ("content", FieldKind::Content),
+        ] {
+            for &(flags, modifier) in modes {
+                let mut args = vec!["  NAME:alpha OR beta  ", "--field", field];
+                args.extend_from_slice(flags);
+                let request = parse_search(&args)?;
+                assert_eq!(
+                    request.query,
+                    QueryExpr::Term(TermExpr {
+                        field: Some(expected_field),
+                        value: "  NAME:alpha OR beta  ".to_string(),
+                        modifier,
+                    })
+                );
+            }
+        }
+        let request = parse_search(&["report", "--prefix"])?;
+        assert_eq!(
+            request.query,
+            QueryExpr::Term(TermExpr {
+                field: None,
+                value: "report".to_string(),
+                modifier: TermModifier::Prefix,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_filters_allow_filter_only_searches_without_empty_boolean_clauses() -> Result<()> {
+        let cases: &[(&[&str], RangeExpr)] = &[
+            (
+                &["--min-size", "1024"],
+                RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Ge,
+                    value: RangeValue::U64 { lo: 1024, hi: None },
+                },
+            ),
+            (
+                &["--max-size", "18446744073709551615"],
+                RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Le,
+                    value: RangeValue::U64 {
+                        lo: u64::MAX,
+                        hi: None,
+                    },
+                },
+            ),
+            (
+                &["--min-size", "0", "--max-size", "18446744073709551615"],
+                RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Between,
+                    value: RangeValue::U64 {
+                        lo: 0,
+                        hi: Some(u64::MAX),
+                    },
+                },
+            ),
+            (
+                &["--min-size", "0", "--max-size", "0"],
+                RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Between,
+                    value: RangeValue::U64 { lo: 0, hi: Some(0) },
+                },
+            ),
+            (
+                &["--modified-since", "-1"],
+                RangeExpr {
+                    field: FieldKind::Modified,
+                    op: RangeOp::Ge,
+                    value: RangeValue::I64 { lo: -1, hi: None },
+                },
+            ),
+            (
+                &["--modified-through", "0"],
+                RangeExpr {
+                    field: FieldKind::Modified,
+                    op: RangeOp::Le,
+                    value: RangeValue::I64 { lo: 0, hi: None },
+                },
+            ),
+            (
+                &[
+                    "--modified-since",
+                    "-9223372036854775808",
+                    "--modified-through",
+                    "9223372036854775807",
+                ],
+                RangeExpr {
+                    field: FieldKind::Modified,
+                    op: RangeOp::Between,
+                    value: RangeValue::I64 {
+                        lo: i64::MIN,
+                        hi: Some(i64::MAX),
+                    },
+                },
+            ),
+            (
+                &["  ", "--min-size", "0"],
+                RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Ge,
+                    value: RangeValue::U64 { lo: 0, hi: None },
+                },
+            ),
+        ];
+        for (args, expected) in cases {
+            let request = parse_search(args)?;
+            assert_eq!(
+                request.query,
+                QueryExpr::Range(expected.clone()),
+                "{args:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_and_range_filters_survive_the_versioned_ipc_wire() -> Result<()> {
+        let request = parse_search(&[
+            "mystery OR \"case\"",
+            "--field",
+            "content",
+            "--phrase",
+            "--min-size",
+            "1024",
+            "--max-size",
+            "18446744073709551615",
+            "--modified-since",
+            "-1",
+            "--modified-through",
+            "1700000000",
+            "--mode",
+            "hybrid",
+            "--limit",
+            "13",
+            "--offset",
+            "7",
+            "--timeout-ms",
+            "999",
+        ])?;
+        let payload = bincode::serialize(&request)?;
+        let message = ipc::framing::encode_message(ipc::framing::MessageKind::Search, &payload)?;
+        let frame = ipc::framing::encode_frame(&message)?;
+        let (message, remainder) = ipc::framing::decode_frame(&frame)?;
+        assert!(remainder.is_empty());
+        let (kind, payload) = ipc::framing::decode_message(&message)?;
+        assert_eq!(kind, ipc::framing::MessageKind::Search);
+        let decoded: SearchRequest = bincode::deserialize(payload)?;
+        assert_eq!(
+            decoded.query,
+            QueryExpr::And(vec![
+                QueryExpr::Term(TermExpr {
+                    field: Some(FieldKind::Content),
+                    value: "mystery OR \"case\"".to_string(),
+                    modifier: TermModifier::Phrase,
+                }),
+                QueryExpr::Range(RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Between,
+                    value: RangeValue::U64 {
+                        lo: 1024,
+                        hi: Some(u64::MAX)
+                    },
+                }),
+                QueryExpr::Range(RangeExpr {
+                    field: FieldKind::Modified,
+                    op: RangeOp::Between,
+                    value: RangeValue::I64 {
+                        lo: -1,
+                        hi: Some(1_700_000_000)
+                    },
+                }),
+            ])
+        );
+        assert_eq!(decoded.id, request.id);
+        assert_eq!(decoded.mode, SearchMode::Hybrid);
+        assert_eq!(decoded.limit, 13);
+        assert_eq!(decoded.offset, 7);
+        assert_eq!(decoded.timeout, Some(std::time::Duration::from_millis(999)));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parser_rejects_conflicting_modifiers_and_invalid_typed_values() {
+        let invalid: &[&[&str]] = &[
+            &["report", "--prefix", "--phrase"],
+            &["report", "--prefix", "--fuzzy", "1"],
+            &["report", "--phrase", "--fuzzy", "2"],
+            &["report", "--fuzzy", "3"],
+            &["report", "--fuzzy", "255"],
+            &["report", "--fuzzy", "-1"],
+            &["report", "--field", "size"],
+            &["--min-size", "-1"],
+            &["--max-size", "18446744073709551616"],
+            &["--modified-since", "-9223372036854775809"],
+            &["--modified-through", "9223372036854775808"],
+            &["--field", "name"],
+            &["--prefix"],
+            &[],
+        ];
+        for args in invalid {
+            let parsed = Cli::try_parse_from(
+                ["ultrasearch", "search"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            );
+            assert!(parsed.is_err(), "unexpectedly accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn query_builder_rejects_empty_criteria_and_reversed_ranges_before_ipc() {
+        let invalid: &[(&[&str], &str)] = &[
+            (&["  "], "provide nonempty query text"),
+            (&["", "--prefix"], "require nonempty query text"),
+            (
+                &["", "--phrase", "--min-size", "0"],
+                "require nonempty query text",
+            ),
+            (
+                &["--fuzzy", "0", "--max-size", "10"],
+                "require nonempty query text",
+            ),
+            (
+                &["--field", "name", "--min-size", "0"],
+                "require nonempty query text",
+            ),
+            (
+                &["report", "--min-size", "2", "--max-size", "1"],
+                "Size minimum exceeds",
+            ),
+            (
+                &["--modified-since", "1", "--modified-through", "-1"],
+                "Modified minimum exceeds",
+            ),
+        ];
+        for (args, expected_error) in invalid {
+            let failure = parse_search(args).unwrap_err().to_string();
+            assert!(failure.contains(expected_error), "{args:?}: {failure}");
+        }
+        assert!(SearchQueryArgs::default().query_expr().is_err());
+    }
+
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn unsupported_service_operations_cannot_report_success() {
         let client = UnsupportedClient;

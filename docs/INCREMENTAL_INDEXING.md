@@ -243,8 +243,40 @@ stable identity ordering, and replay rules as ordinary searches. Unsupported
 fuzzy distances and malformed ranges cannot turn a disjunction into a successful
 partial result. This implements the existing typed protocol operations; it does
 not change raw-Term parser fallback or cross-index negation semantics. The
-desktop search box and existing CLI positional query currently still send raw
-Term input unless a caller constructs the structured AST explicitly.
+desktop search box still sends raw Term input. The CLI can construct these typed
+operations explicitly with the options below.
+
+### CLI range and literal search options
+
+Run these commands on Windows with the UltraSearch service installed:
+
+```powershell
+cargo run -p cli -- search report --prefix --field name --min-size 1024
+cargo run -p cli -- search "blue moon" --phrase --field content
+cargo run -p cli -- search reprot --fuzzy 1 --field name
+cargo run -p cli -- search --min-size 1048576 --max-size 10485760 --modified-since 1700000000 --json
+```
+
+`--prefix`, `--phrase`, and `--fuzzy 0|1|2` are mutually exclusive literal modes.
+`--field name|path|ext|content` selects their target field. In raw query mode it
+sets the default for parsed text fields; explicit field qualifiers can still
+override that default. The existing metadata path treats raw extension input as
+an exact term, while its content-index counterpart parses that input. These raw
+extension semantics are unchanged. Without a literal mode the positional query
+is preserved as raw Term input.
+
+`--min-size` and `--max-size` use inclusive unsigned byte counts.
+`--modified-since` and `--modified-through` accept inclusive signed Unix seconds.
+Combined lower/upper bounds form `Between`; one
+bound forms `Ge` or `Le`. Supplied text and filters are combined with `And`.
+A filter-only search needs at least one range, and a field or literal modifier
+needs nonblank text. Empty searches, reversed ranges, conflicting literal modes,
+out-of-domain numbers, and unsupported fuzzy distances fail before IPC.
+
+Negative bounds are preserved in the request. This does not establish historical
+filesystem timestamp fidelity: the existing content worker still converts
+pre-epoch `SystemTime` metadata to zero. Raw-query errors and cross-index negation
+remain tracked separately in `ultrasearch-rmx`.
 
 ## Reconciliation and exclusions
 
@@ -910,6 +942,39 @@ emitted its existing gold deprecation notice, and scoped source checks/lints had
 no warnings. No protocol, schema, state, receipt, or workflow format changed.
 UBS and RCH were unavailable. Native acceptance remains open, and no GitHub
 Actions were used.
+
+### CLI typed-query exposure verification
+
+The final October 11 CLI addition connects those typed predicates to actual
+command-line requests. Six new portable tests cover raw-input and request-control
+preservation, literal mode/field selection, inclusive numeric filters and integer
+extrema, an explicit expected AST through versioned IPC framing, parser conflicts,
+and semantic rejection before IPC. Independent review checked both construction
+and the documented raw-extension and historical-timestamp limitations.
+
+| Gate | Result |
+| --- | --- |
+| Final CLI host all-target tests | All 7 passed, including all 6 new regressions. |
+| Actual CLI binary build and direct process checks | Build passed; all 15 additional checks passed. Valid raw, prefix, phrase, fuzzy, and filter-only inputs reached the expected unsupported-platform error on Linux with empty stdout. Conflicts, invalid fuzzy distances, empty criteria, reversed ranges, and integer overflow failed before IPC; help exposed all eight new options. |
+| CLI host and Windows GNU all-target check and strict Clippy | All four gates passed with locked dependencies and `-D warnings` for Clippy. |
+| Whole-workspace formatting and Git whitespace checks | Passed. |
+
+The previously verified service and IPC sources remained unchanged. This pass
+therefore totals **120 distinct passing host tests** (91 service, 22 IPC, and 7
+CLI), including **19 new host regressions**, and **20 successful process checks**
+including the five prior client checks. The two new native Windows named-pipe
+tests and existing NTFS integration targets remain cross-compiled only.
+
+Final gates retained aggregate tracked-source SHA-256
+`669fe099e0510f0b1fbb316c34dc7a82bc2d778279cb3f9306face415afd0fdd`
+and CLI source SHA-256
+`13d5590f2d37ef7c78984e14d9c1428db1ab81c03f8ca247a47177167cd638a0`.
+The broader Windows gates and the attempted whole-workspace Linux gates retain
+their results above: the latter remain blocked by missing `pkg-config`/GLib.
+No native Windows, NTFS, MSI, or performance execution was available. No dependency,
+protocol, schema, state, or workflow changes or GitHub Actions were introduced.
+`ultrasearch-84j` remains in progress pending native acceptance; raw-query error
+handling and cross-index negation are tracked in `ultrasearch-rmx`.
 
 ## Native NTFS acceptance
 
