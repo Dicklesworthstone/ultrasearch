@@ -288,7 +288,18 @@ fn dispatch(kind: framing::MessageKind, payload: &[u8]) -> Vec<u8> {
         if resp.served_by.is_none() {
             resp.served_by = Some(host_label());
         }
-        let encoded = bincode::serialize(&resp).unwrap_or_default();
+        let encoded = match framing::serialize_search_response(&mut resp) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::warn!(%error, "search page cannot be encoded; reporting unavailable");
+                resp.hits.clear();
+                resp.truncated = true;
+                resp.served_by = Some("service-unavailable".into());
+                // The fallback contains only fixed fields and a bounded label;
+                // it cannot retain an invalid identity or oversized stored row.
+                framing::serialize_search_response(&mut resp).unwrap_or_default()
+            }
+        };
         record_ipc_request(elapsed);
         return encoded;
     }

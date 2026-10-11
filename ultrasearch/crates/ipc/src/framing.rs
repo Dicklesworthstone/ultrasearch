@@ -54,6 +54,37 @@ pub fn encode_message(kind: MessageKind, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(message)
 }
 
+/// Serialize a search page after all response labels have been filled in.
+/// Keep the longest ranked prefix that fits the actual versioned wire frame;
+/// the complete match count and existing truncation state remain authoritative.
+pub fn serialize_search_response(response: &mut crate::SearchResponse) -> Result<Vec<u8>> {
+    let mut size = bincode::serialized_size(response)?;
+    let limit = (MAX_FRAME - MESSAGE_HEADER_LEN) as u64;
+    let had_hits = !response.hits.is_empty();
+    while size > limit {
+        let Some(hit) = response.hits.last() else {
+            bail!("search response labels exceed the IPC frame limit");
+        };
+        let hit_size = bincode::serialized_size(hit)?;
+        ensure!(size >= hit_size, "invalid serialized search page size");
+        // bincode's top-level functions use fixed-width integer encoding, so
+        // the vector length prefix has the same size after removing one hit.
+        size -= hit_size;
+        response.hits.pop();
+        response.truncated = true;
+    }
+    ensure!(
+        !had_hits || !response.hits.is_empty(),
+        "the first ranked search hit cannot fit in an IPC frame"
+    );
+    let payload = bincode::serialize(response)?;
+    ensure!(
+        payload.len() <= MAX_FRAME - MESSAGE_HEADER_LEN,
+        "serialized search response exceeds the IPC frame limit"
+    );
+    Ok(payload)
+}
+
 /// Validate compatibility before handing any bytes to a bincode deserializer.
 pub fn decode_message(message: &[u8]) -> Result<(MessageKind, &[u8])> {
     ensure!(
@@ -248,5 +279,145 @@ mod tests {
         assert_eq!(decoded.id, response.id);
         assert_eq!(decoded.hits[0].key, key);
         assert_eq!(decoded.hits[0].size, Some(10));
+    }
+
+    fn search_page(hits: Vec<crate::SearchHit>, total: u64) -> crate::SearchResponse {
+        crate::SearchResponse {
+            id: uuid::Uuid::new_v4(),
+            hits,
+            total,
+            truncated: false,
+            took_ms: 42,
+            served_by: Some("final-named-pipe-host-label".into()),
+        }
+    }
+
+    fn search_hit(identity: u64, path: String) -> crate::SearchHit {
+        crate::SearchHit {
+            key: core_types::DocKey::from_parts(42, 0xfedc_0000_0000_0000 | identity),
+            score: 1.0,
+            name: Some(format!("report-{identity:02}.txt")),
+            path: Some(path),
+            ext: Some("txt".into()),
+            size: Some(100),
+            modified: Some(200),
+            snippet: None,
+        }
+    }
+
+    fn wire_roundtrip(response: &mut crate::SearchResponse) -> Result<crate::SearchResponse> {
+        let payload = serialize_search_response(response)?;
+        let frame = encode_frame(&encode_message(MessageKind::Search, &payload)?)?;
+        assert!(frame.len() <= MAX_FRAME + 4);
+        let (message, remainder) = decode_frame(&frame)?;
+        assert!(remainder.is_empty());
+        let (kind, payload) = decode_message(&message)?;
+        assert_eq!(kind, MessageKind::Search);
+        Ok(bincode::deserialize(payload)?)
+    }
+
+    #[test]
+    fn long_path_search_pages_fit_the_wire_without_losing_order_or_total() -> Result<()> {
+        // Each path fits the native UTF-16 path bound, with ordinary-sized
+        // components, but one default-sized page exceeds the pipe frame.
+        let prefix = format!(r"C:\{}", format!("{}\\", "目".repeat(80)).repeat(120));
+        let original: Vec<_> = (0..24)
+            .map(|id| search_hit(id, format!("{prefix}report-{id:02}.txt")))
+            .collect();
+        assert!(
+            original
+                .iter()
+                .all(|hit| hit.path.as_ref().unwrap().encode_utf16().count() < 32_767)
+        );
+        let full = search_page(original.clone(), original.len() as u64);
+        assert!(encode_message(MessageKind::Search, &bincode::serialize(&full)?).is_err());
+
+        let mut received = Vec::new();
+        while received.len() < original.len() {
+            let offset = received.len();
+            let mut page = search_page(original[offset..].to_vec(), original.len() as u64);
+            let decoded = wire_roundtrip(&mut page)?;
+            assert_eq!(decoded.id, page.id);
+            assert_eq!(decoded.total, original.len() as u64);
+            assert_eq!(decoded.took_ms, 42);
+            assert_eq!(decoded.served_by, page.served_by);
+            assert!(!decoded.hits.is_empty());
+            assert_eq!(
+                decoded.truncated,
+                decoded.hits.len() < original.len() - offset
+            );
+            for (got, expected) in decoded.hits.iter().zip(&original[offset..]) {
+                assert_eq!(got.key, expected.key);
+                assert_eq!(got.path, expected.path);
+                assert_eq!(got.name, expected.name);
+                received.push(got.key);
+            }
+        }
+        assert_eq!(
+            received,
+            original.iter().map(|hit| hit.key).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_page_size_includes_final_labels_and_the_versioned_envelope() -> Result<()> {
+        let mut exact = search_page(vec![search_hit(1, r"C:\boundary.txt".into())], 1);
+        let available = MAX_FRAME - MESSAGE_HEADER_LEN - bincode::serialized_size(&exact)? as usize;
+        exact.hits[0]
+            .path
+            .as_mut()
+            .unwrap()
+            .push_str(&"x".repeat(available));
+        let payload = serialize_search_response(&mut exact)?;
+        assert_eq!(payload.len() + MESSAGE_HEADER_LEN, MAX_FRAME);
+        assert!(!wire_roundtrip(&mut exact)?.truncated);
+
+        let mut one_byte_over = exact.clone();
+        one_byte_over.hits[0].path.as_mut().unwrap().push('x');
+        assert!(serialize_search_response(&mut one_byte_over).is_err());
+
+        let mut prefix = search_page(
+            vec![search_hit(0, r"C:\small.txt".into()), exact.hits[0].clone()],
+            2,
+        );
+        let decoded = wire_roundtrip(&mut prefix)?;
+        assert_eq!(decoded.hits.len(), 1);
+        assert_eq!(
+            decoded.hits[0].key,
+            core_types::DocKey::from_parts(42, 0xfedc_0000_0000_0000)
+        );
+        assert_eq!(decoded.total, 2);
+        assert!(decoded.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn unencodable_search_rows_fail_and_existing_empty_truncation_is_preserved() -> Result<()> {
+        let mut bad_key = search_page(vec![search_hit(1, r"C:\identity.txt".into())], 1);
+        bad_key.hits[0].key = core_types::DocKey(u128::MAX);
+        assert!(serialize_search_response(&mut bad_key).is_err());
+
+        let mut oversized_label = search_page(Vec::new(), 99);
+        oversized_label.served_by = Some("h".repeat(MAX_FRAME));
+        assert!(serialize_search_response(&mut oversized_label).is_err());
+        // The server's unavailable fallback drops unencodable rows/labels and
+        // remains a valid, explicitly unavailable protocol response.
+        oversized_label.hits.clear();
+        oversized_label.served_by = Some("service-unavailable".into());
+        oversized_label.truncated = true;
+        let decoded = wire_roundtrip(&mut oversized_label)?;
+        assert!(decoded.hits.is_empty());
+        assert!(decoded.truncated);
+        assert_eq!(decoded.total, 99);
+        assert_eq!(decoded.served_by.as_deref(), Some("service-unavailable"));
+
+        let mut past_window = search_page(Vec::new(), 123);
+        past_window.truncated = true;
+        let decoded = wire_roundtrip(&mut past_window)?;
+        assert!(decoded.hits.is_empty());
+        assert!(decoded.truncated);
+        assert_eq!(decoded.total, 123);
+        Ok(())
     }
 }

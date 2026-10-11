@@ -173,6 +173,18 @@ the complete response with `served_by="service-unavailable"` and
 `truncated=true`. They cannot become a successful partial union or a healthy
 empty result. Existing query-parser fallback behavior is unchanged.
 
+The named-pipe server also bounds the actual serialized response after assigning
+its final host label. A page of individually valid long Windows paths can exceed
+the 256-KiB frame even when its hit count is small. Serialization now keeps the
+longest ranked prefix that fits the existing versioned envelope, preserves the
+exact total and response identity, and marks any shortened page as truncated.
+An API caller can continue from its previous offset plus the number of returned
+hits. The encoder does not skip an oversized row to return later-ranked rows.
+An individually unencodable first hit, invalid serialized identity, or oversized
+response label produces a bounded `service-unavailable` response instead of
+breaking the pipe with an oversized frame or reporting healthy empty results.
+The frame limit and protocol version are unchanged.
+
 ## Reconciliation and exclusions
 
 A new index, incompatible index generation/schema, journal gap, or requested
@@ -771,6 +783,34 @@ string type before the final passing run. The final tests and gates used stable
 source fingerprints, the same pinned toolchains, and locked dependencies. No
 state, receipt, protocol, or index-schema migration is required. Native
 qualification remains open, and no GitHub Actions were used.
+
+### Search response transport verification
+
+Three new portable IPC regressions exercise actual bincode serialization,
+versioned message encoding, frame encoding/decoding, and response decoding.
+They page through ordered Unicode paths that individually fit the native UTF-16
+bound but exceed the wire limit together, preserving full identities and exact
+totals. Boundary tests include the final host label and envelope, accept an
+exactly full frame, reject an individually oversized first hit, retain a valid
+ranked prefix, and preserve explicit unavailability and count-only truncation.
+These fixtures validate the wire format; they do not execute NTFS or a native
+named pipe.
+
+| Gate | Result |
+| --- | --- |
+| Final host tests for `service`, `index-worker`, `core-types`, and `ipc` | All 142 passed: 81 service, 25 worker, 16 core, and 20 IPC tests. No failed or ignored tests. |
+| Final host all-target check and strict Clippy for those four packages | Both passed with `--locked --offline` and `-D warnings` for Clippy. |
+| Final Windows GNU all-target check and strict Clippy for those packages plus `content-extractor`, with `service/e2e-windows` | Both passed, including compilation/lint of the actual named-pipe serialization callsite and native integration targets. |
+| Workspace formatting and Git whitespace checks | Passed. |
+| Complete October 11 round coverage | 230 distinct host tests passed across eight packages: service 81, watcher 39, core 16, metadata 17, content 15, worker 25, extractor 17, and IPC 20. This combines the final 142-test run with the 88 unchanged-package tests from the earlier passing run; 21 host regressions were added in this round. |
+
+Every final gate retained the same aggregate SHA-256 over tracked Rust/TOML/lock
+sources: `2d0aad0abfb5a4c9c24e28fedb62034e0a9d1b0cea74e626257c933c29fab97f`.
+No dependencies, protocol versions, schemas, state formats, or workflow files
+changed. The earlier mandatory whole-workspace Linux check/lint attempts still
+have the documented `pkg-config`/GLib blocker. Native Windows execution, installed
+MSI acceptance, and native performance qualification remain outstanding. No
+GitHub Actions were used.
 
 ## Native NTFS acceptance
 
