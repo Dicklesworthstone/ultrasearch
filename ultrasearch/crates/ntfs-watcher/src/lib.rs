@@ -563,6 +563,38 @@ mod journal {
         })
     }
 
+    /// Resolve the name of an already-open file with bounded buffer growth.
+    /// A failed name query cannot prove that the file identity disappeared:
+    /// volume-name resolution can fail while the full-FRN handle remains valid.
+    /// Only the earlier identity-open operation can establish absence.
+    pub(super) fn resolve_current_path(
+        mut probe: impl FnMut(&mut [u16]) -> Result<u32, NtfsError>,
+    ) -> Result<String, NtfsError> {
+        let mut buffer = vec![0u16; 1024];
+        for _ in 0..2 {
+            let length = probe(&mut buffer)? as usize;
+            if length == 0 {
+                return Err(NtfsError::Journal(
+                    "live file path query returned an empty name".into(),
+                ));
+            }
+            if length >= buffer.len() {
+                if length >= 32768 {
+                    return Err(NtfsError::Journal(
+                        "resolved path exceeds Windows limit".into(),
+                    ));
+                }
+                buffer.resize(length + 1, 0);
+                continue;
+            }
+            return String::from_utf16(&buffer[..length])
+                .map_err(|_| NtfsError::Journal("resolved path is not valid Unicode".into()));
+        }
+        Err(NtfsError::Journal(
+            "file path changed repeatedly during resolution".into(),
+        ))
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) struct JournalState {
         pub journal_id: u64,
@@ -1155,9 +1187,7 @@ mod native {
         .map_err(|error| journal_error("canonical path CreateFileW", error))?;
         // SAFETY: this new valid handle is transferred to a single owner.
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.0 as RawHandle) };
-        path_from_handle(&handle)?.ok_or_else(|| {
-            NtfsError::Journal(format!("cannot resolve canonical path {}", path.display()))
-        })
+        path_from_handle(&handle)
     }
 
     fn journal_error(operation: &str, error: WindowsError) -> NtfsError {
@@ -1453,21 +1483,15 @@ mod native {
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.0 as RawHandle) };
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: the handle remains valid and info is a live output struct.
-        if let Err(error) = unsafe { GetFileInformationByHandle(raw(&handle), &mut info) } {
-            if missing_file(&error) {
-                return Ok(None);
-            }
-            return Err(journal_error("GetFileInformationByHandle", error));
-        }
+        unsafe { GetFileInformationByHandle(raw(&handle), &mut info) }
+            .map_err(|error| journal_error("GetFileInformationByHandle", error))?;
         let actual_frn = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
         if actual_frn != record.frn {
             return Err(NtfsError::Journal(
                 "file reference changed during resolution".into(),
             ));
         }
-        let Some(path) = path_from_handle(&handle)? else {
-            return Ok(None);
-        };
+        let path = path_from_handle(&handle)?;
         let name = path
             .rsplit('\\')
             .next()
@@ -1487,38 +1511,31 @@ mod native {
         )))
     }
 
-    fn path_from_handle(handle: &OwnedHandle) -> Result<Option<String>, NtfsError> {
-        let mut buffer = vec![0u16; 1024];
-        for _ in 0..2 {
+    fn path_from_handle(handle: &OwnedHandle) -> Result<String, NtfsError> {
+        path_from_query(|buffer| {
             // SAFETY: buffer is writable for its full length, and the handle
             // stays open while Windows resolves its current full path.
             let length =
-                unsafe { GetFinalPathNameByHandleW(raw(handle), &mut buffer, VOLUME_NAME_GUID) };
+                unsafe { GetFinalPathNameByHandleW(raw(handle), buffer, VOLUME_NAME_GUID) };
             if length == 0 {
-                let error = WindowsError::from_win32();
-                if missing_file(&error) {
-                    return Ok(None);
-                }
-                return Err(journal_error("GetFinalPathNameByHandleW", error));
+                Err(WindowsError::from_win32())
+            } else {
+                Ok(length)
             }
-            if length as usize >= buffer.len() {
-                if length >= 32768 {
-                    return Err(NtfsError::Journal(
-                        "resolved path exceeds Windows limit".into(),
-                    ));
-                }
-                buffer.resize(length as usize + 1, 0);
-                continue;
-            }
-            let path = String::from_utf16(&buffer[..length as usize])
-                .map_err(|_| NtfsError::Journal("resolved path is not valid Unicode".into()))?;
-            // Worker opens must remain bound to this volume even if Windows
-            // reassigns drive letters between journal read and extraction.
-            return Ok(Some(path));
-        }
-        Err(NtfsError::Journal(
-            "file path changed repeatedly during resolution".into(),
-        ))
+        })
+    }
+
+    pub(super) fn path_from_query(
+        mut probe: impl FnMut(&mut [u16]) -> windows::core::Result<u32>,
+    ) -> Result<String, NtfsError> {
+        // GetFinalPathNameByHandleW can report PATH_NOT_FOUND when a volume
+        // name is unavailable. It does not establish absence of the open FRN.
+        // Keep the entire page unacknowledged, including during baseline and
+        // exclusion resolution; a later successful query can replay it.
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
+        journal::resolve_current_path(|buffer| {
+            probe(buffer).map_err(|error| journal_error("GetFinalPathNameByHandleW", error))
+        })
     }
 
     fn timestamp(time: FILETIME) -> i64 {
@@ -1647,6 +1664,53 @@ mod tests {
             assert!(!journal::excluded_path(path, &excluded), "{path}");
         }
         assert!(!journal::excluded_path(r"\\?\Volume{abc}\notes.txt", &[]));
+    }
+
+    #[test]
+    fn live_handle_path_queries_preserve_unicode_and_bound_growth() {
+        let path = format!(
+            r"\\?\Volume{{fixture}}\{}\file.txt",
+            "\u{1F4C4}".repeat(600)
+        );
+        let encoded: Vec<_> = path.encode_utf16().collect();
+        let mut calls = 0;
+        let resolved = journal::resolve_current_path(|buffer| {
+            calls += 1;
+            if encoded.len() >= buffer.len() {
+                // Windows includes the terminator in its required size, but
+                // excludes it from the successful result's character count.
+                Ok(encoded.len() as u32 + 1)
+            } else {
+                buffer[..encoded.len()].copy_from_slice(&encoded);
+                Ok(encoded.len() as u32)
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(resolved, path);
+
+        let mut repeated_growth = 0;
+        assert!(
+            journal::resolve_current_path(|buffer| {
+                repeated_growth += 1;
+                Ok(buffer.len() as u32 + 100)
+            })
+            .is_err()
+        );
+        assert_eq!(
+            repeated_growth, 2,
+            "path changes cannot cause an unbounded query loop"
+        );
+        let mut oversized = 0;
+        assert!(
+            journal::resolve_current_path(|_| {
+                oversized += 1;
+                Ok(32768)
+            })
+            .is_err()
+        );
+        assert_eq!(oversized, 1, "the path allocation bound cannot be enlarged");
+        assert!(journal::resolve_current_path(|_| Ok(0)).is_err());
     }
 
     #[test]
@@ -2067,6 +2131,119 @@ mod tests {
     }
 
     #[test]
+    fn live_handle_path_failure_cannot_omit_an_mft_identity_or_acknowledge_eof() {
+        let config = ReaderConfig {
+            chunk_size: 4096,
+            max_records_per_tick: 1,
+            ..ReaderConfig::default()
+        };
+        let records = [
+            record(900, 0x1234_0000_0000_0020, 0, "committed-prefix.txt"),
+            record(
+                100,
+                0x5678_0000_0000_0021,
+                0,
+                "live-without-volume-name.txt",
+            ),
+            record(800, 0x9ABC_0000_0000_0022, 0, "unread-suffix.txt"),
+        ];
+        for code in [2, 3] {
+            let mut scan = mft::State::default();
+            let first = scan
+                .next_batch(
+                    42,
+                    &config,
+                    |_| Ok(Some(encoded_batch(35, &records))),
+                    |record| Ok(Some(resolved_meta(record))),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(first, [resolved_meta(&records[0])]);
+
+            let mut calls = 0;
+            let failed = scan.next_batch(
+                42,
+                &config,
+                |_| panic!("the unread MFT page is already buffered"),
+                |record| {
+                    assert_eq!(record.frn, records[1].frn);
+                    let mut meta = resolved_meta(record);
+                    // OpenFileById and the full FRN have already succeeded.
+                    // A naming error after buffer growth still cannot turn
+                    // this existing file into an omitted baseline identity.
+                    meta.path = Some(journal::resolve_current_path(|buffer| {
+                        calls += 1;
+                        if calls == 1 {
+                            assert_eq!(buffer.len(), 1024);
+                            Ok(2048)
+                        } else {
+                            assert_eq!(calls, 2);
+                            assert_eq!(buffer.len(), 2049);
+                            Err(NtfsError::Journal(format!(
+                                "GetFinalPathNameByHandleW: Win32 error {code}"
+                            )))
+                        }
+                    })?);
+                    Ok(Some(meta))
+                },
+            );
+            assert!(matches!(
+                failed,
+                Err(NtfsError::Journal(ref message))
+                    if message.contains(&format!("Win32 error {code}"))
+            ));
+            assert_eq!(calls, 2);
+            assert!(
+                scan.next_batch(
+                    42,
+                    &config,
+                    |_| panic!("a failed name query cannot certify native EOF"),
+                    |_| panic!("a failed baseline requires a fresh reader"),
+                )
+                .is_err()
+            );
+
+            let mut replay = mft::State::default();
+            let mut recovered = Vec::new();
+            for page in 0..records.len() {
+                recovered.extend(
+                    replay
+                        .next_batch(
+                            42,
+                            &config,
+                            |start| {
+                                assert_eq!(page, 0, "unread records must stay buffered");
+                                assert_eq!(start, 0);
+                                Ok(Some(encoded_batch(35, &records)))
+                            },
+                            |record| Ok(Some(resolved_meta(record))),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                recovered,
+                records.iter().map(resolved_meta).collect::<Vec<_>>()
+            );
+            assert!(
+                replay
+                    .next_batch(
+                        42,
+                        &config,
+                        |start| {
+                            assert_eq!(start, 35);
+                            Ok(None)
+                        },
+                        |_| panic!("successful EOF resolves no additional identity"),
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn mft_partial_output_validates_complete_records_without_usn_order_assumptions() {
         let records = [
             record(900, 0x4321_0000_0000_0020, 0, "first.txt"),
@@ -2243,6 +2420,92 @@ mod tests {
             )
             .unwrap();
             assert_eq!(last, vec![FileEvent::Modified(resolved_meta(&records[2]))]);
+            assert_eq!(end, cursor(340));
+        }
+    }
+
+    #[test]
+    fn live_handle_path_failure_replays_journal_changes_without_false_tombstones() {
+        let records = [
+            record(100, 0x1234_0000_0000_0020, 1, "first-modified.txt"),
+            record(
+                180,
+                0x5678_0000_0000_0021,
+                journal::REASON_RENAME_NEW,
+                "renamed-but-still-alive.txt",
+            ),
+            record(
+                260,
+                0x9ABC_0000_0000_0022,
+                journal::REASON_DELETE,
+                "gone.txt",
+            ),
+        ];
+        let input = encoded_batch(340, &records);
+        for code in [2, 3] {
+            let mut resolved = Vec::new();
+            let failed = journal::resolve_batch(
+                42,
+                &input,
+                cursor(100),
+                2,
+                |record| {
+                    resolved.push(record.frn);
+                    let mut meta = resolved_meta(record);
+                    if record.frn == records[1].frn {
+                        meta.path = Some(journal::resolve_current_path(|_| {
+                            Err(NtfsError::Journal(format!(
+                                "GetFinalPathNameByHandleW: Win32 error {code}"
+                            )))
+                        })?);
+                    }
+                    Ok(Some(meta))
+                },
+                |_, _| Ok(false),
+            );
+            assert!(matches!(
+                failed,
+                Err(NtfsError::Journal(ref message))
+                    if message.contains(&format!("Win32 error {code}"))
+            ));
+            assert_eq!(resolved, [records[0].frn, records[1].frn]);
+
+            // Restoring the volume name replays the entire failed prefix.
+            // The second record remains the same live identity at its new
+            // pathname; it cannot have been acknowledged as a deletion.
+            let (events, next) = journal::resolve_batch(
+                42,
+                &input,
+                cursor(100),
+                2,
+                |record| Ok(Some(resolved_meta(record))),
+                |_, _| Ok(false),
+            )
+            .unwrap();
+            assert_eq!(
+                events,
+                [
+                    FileEvent::Modified(resolved_meta(&records[0])),
+                    FileEvent::Renamed {
+                        from: DocKey::from_parts(42, records[1].frn),
+                        to: resolved_meta(&records[1]),
+                    },
+                ]
+            );
+            assert_eq!(next, cursor(260));
+            let (deleted, end) = journal::resolve_batch(
+                42,
+                &encoded_batch(340, &records[2..]),
+                next,
+                2,
+                |_| panic!("a genuine deletion record needs no live-handle name query"),
+                |_, _| Ok(false),
+            )
+            .unwrap();
+            assert_eq!(
+                deleted,
+                [FileEvent::Deleted(DocKey::from_parts(42, records[2].frn))]
+            );
             assert_eq!(end, cursor(340));
         }
     }
@@ -3130,6 +3393,44 @@ mod tests {
                 "Win32 error {} must not acknowledge deletion or omit a baseline file",
                 code.0
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_live_handle_name_errors_never_establish_identity_absence() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NOT_READY, ERROR_PATH_NOT_FOUND,
+        };
+        use windows::core::{Error as WindowsError, HRESULT};
+
+        for code in [
+            ERROR_FILE_NOT_FOUND,
+            ERROR_PATH_NOT_FOUND,
+            ERROR_ACCESS_DENIED,
+            ERROR_NOT_READY,
+        ] {
+            let mut calls = 0;
+            let failed = native::path_from_query(|_| {
+                calls += 1;
+                Err(WindowsError::from(HRESULT::from_win32(code.0)))
+            });
+            assert!(matches!(
+                failed,
+                Err(NtfsError::Journal(ref message))
+                    if message.starts_with("GetFinalPathNameByHandleW:")
+            ));
+            assert_eq!(
+                calls, 1,
+                "failed name queries must retain their original error"
+            );
+        }
+        // The same Win32 statuses have different evidence at OpenFileById:
+        // missing the requested identity there still permits a tombstone.
+        for code in [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND] {
+            assert!(native::missing_file(&WindowsError::from(
+                HRESULT::from_win32(code.0)
+            )));
         }
     }
 

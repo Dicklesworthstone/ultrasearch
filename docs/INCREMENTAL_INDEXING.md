@@ -33,12 +33,21 @@ unsupported record versions produce errors; the implemented reader requests
 USN version 2 records.
 
 Metadata access failures reject the whole bounded read, including any events
-resolved before the failure. Only file/path-not-found means that an identity
-disappeared; access denied, sharing violations, unavailable devices, and failed
-path/exclusion probes cannot acknowledge deletion or silently omit a baseline
-entry. Content refresh reasons include transacted changes and ordinary data
+resolved before the failure. File/path-not-found from the initial full-FRN
+`OpenFileById` operation establishes identity absence. Once that handle is open,
+every failed metadata or name query remains an error, including those same
+native status codes. Access denied, sharing violations, unavailable devices,
+and failed path/exclusion probes cannot acknowledge deletion or silently omit
+a baseline entry. Content refresh reasons include transacted changes and ordinary data
 writes, including data reasons accumulated into close records. CLOSE alone
 changes no indexed state.
+
+An existing file can have an unavailable volume/path name:
+[Microsoft documents naming failures on valid handles](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew).
+Such a failure retains the journal checkpoint and invalidates an interrupted
+MFT reader; recovery replays the failed range or restarts the incomplete baseline.
+The live-handle path resolver makes at most two name queries with bounded buffer
+growth. Canonical output exclusions use the same strict resolver.
 
 The volume GUID and journal ID have different purposes. GUIDs bind persisted
 volume IDs to mounted volumes; journal IDs identify journal incarnations on
@@ -620,6 +629,29 @@ linker deprecation notice; no source lint failures remained. No tracked dependen
 versions, feature gates, workflow files, worker batch formats, or receipt formats
 changed. State v4 and the exact-path index fields require the migration described
 above. UBS and RCH were unavailable. Native acceptance remains outstanding.
+
+### Live-handle journal and baseline safety verification
+
+The October 11 follow-up prevents a failed name or metadata query on an
+already-open, identity-verified file from becoming a deletion or an omitted MFT
+entry. Deterministic regressions cover bounded Unicode path-buffer growth,
+failure after an already-committed MFT prefix, poisoned-reader EOF rejection,
+baseline restart, and journal replay without a false tombstone. A Windows-only
+regression checks that the native file/path-not-found codes remain errors after
+the initial open, alongside access-denied and unavailable-device errors.
+
+| Gate | Result |
+| --- | --- |
+| Frozen `ntfs-watcher` host tests | All 39 passed, including three new deterministic regressions. |
+| Host all-target check and strict Clippy for `ntfs-watcher` | Both passed with locked dependencies and `-D warnings` for Clippy. |
+| Windows GNU all-target check and strict Clippy for `ntfs-watcher` and `ipc` | Both passed, including compilation and lint of the native error-classification regression. |
+| Direct pinned-toolchain Rust formatting and Git whitespace checks | Passed. |
+| Native Windows execution | Not run; this Linux environment has no Windows runtime. Cross-compilation is not native acceptance. |
+
+These final gates used the pinned `nightly-2026-08-31` toolchain and official
+LLVM-MinGW 20261006 MSVCRT cross toolchain described above. No dependency,
+protocol, index schema, or durable state format changed. The Bead remains open
+for native NTFS and installed-service acceptance; no GitHub Actions were used.
 
 ## Native NTFS acceptance
 
