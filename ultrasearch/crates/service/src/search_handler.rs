@@ -1,22 +1,26 @@
 use crate::scanner::{Visibility, read_visibility};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use content_index::{ContentIndex, open_or_create as open_content};
 use core_types::DocKey;
 use ipc::{
-    FieldKind, QueryExpr, SearchHit, SearchMode, SearchRequest, SearchResponse, TermExpr,
-    TermModifier,
+    FieldKind, QueryExpr, RangeExpr, RangeOp, RangeValue, SearchHit, SearchMode, SearchRequest,
+    SearchResponse, TermExpr, TermModifier,
 };
 use meta_index::{MetaFields, MetaIndex, open_or_create_index, open_reader};
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 use tantivy::collector::{Count, ScoreSegmentTweaker, ScoreTweaker, TopDocs};
 use tantivy::columnar::StrColumn;
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
-use tantivy::schema::{Document, IndexRecordOption, TantivyDocument, Value};
+use tantivy::query::{
+    BooleanQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery,
+    TermQuery,
+};
+use tantivy::schema::{Document, Field, IndexRecordOption, TantivyDocument, Value};
 use tantivy::{DocAddress, DocId, IndexReader, Score, Searcher, SegmentReader, Term};
 use tracing::warn;
 
@@ -224,7 +228,7 @@ impl UnifiedSearchHandler {
     ) -> Result<Box<dyn Query>> {
         Ok(match expr {
             QueryExpr::Term(t) => self.term_query(t, fields, index)?,
-            QueryExpr::Range(_) => Box::new(BooleanQuery::new(vec![])),
+            QueryExpr::Range(range) => range_query(range, index)?,
             QueryExpr::Not(inner) => Box::new(BooleanQuery::new(vec![(
                 Occur::MustNot,
                 self.build_query(inner, fields, index)?,
@@ -250,6 +254,7 @@ impl UnifiedSearchHandler {
         fields: &MetaFields,
         index: &tantivy::Index,
     ) -> Result<Box<dyn Query>> {
+        validate_term_modifier(term.modifier)?;
         let value = term.value.trim();
         if value.is_empty() {
             return Ok(Box::new(BooleanQuery::new(vec![])));
@@ -264,28 +269,29 @@ impl UnifiedSearchHandler {
         for field in target_fields {
             match field {
                 FieldKind::Ext => {
-                    let t = Term::from_field_text(fields.ext, value);
-                    clauses.push((
-                        Occur::Should,
-                        Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                    ));
+                    let query = if term.modifier == TermModifier::Term {
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.ext, value),
+                            IndexRecordOption::WithFreqs,
+                        )) as Box<dyn Query>
+                    } else {
+                        modified_text_query(index, fields.ext, value, term.modifier)?
+                    };
+                    clauses.push((Occur::Should, query));
                 }
                 FieldKind::Name | FieldKind::Path => match term.modifier {
-                    TermModifier::Prefix => {
+                    TermModifier::Prefix | TermModifier::Phrase | TermModifier::Fuzzy(_) => {
                         let pf = if matches!(field, FieldKind::Name) {
                             fields.name
                         } else {
                             fields.path
                         };
-                        // Fallback for PrefixQuery removal
-                        let t = Term::from_field_text(pf, value);
                         clauses.push((
                             Occur::Should,
-                            Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs))
-                                as Box<dyn Query>,
+                            modified_text_query(index, pf, value, term.modifier)?,
                         ));
                     }
-                    _ => {
+                    TermModifier::Term => {
                         let mut parser = QueryParser::for_index(
                             index,
                             vec![if matches!(field, FieldKind::Name) {
@@ -318,7 +324,7 @@ impl UnifiedSearchHandler {
 
             Ok(match expr {
                 QueryExpr::Term(t) => self.term_query_content(t, &idx.fields, &idx.index)?,
-                QueryExpr::Range(_) => Box::new(BooleanQuery::new(vec![])),
+                QueryExpr::Range(range) => range_query(range, &idx.index)?,
                 QueryExpr::Not(inner) => Box::new(BooleanQuery::new(vec![(
                     Occur::MustNot,
                     self.build_content_query(inner)?,
@@ -347,6 +353,7 @@ impl UnifiedSearchHandler {
         fields: &content_index::ContentFields,
         index: &tantivy::Index,
     ) -> Result<Box<dyn Query>> {
+        validate_term_modifier(term.modifier)?;
         let value = term.value.trim();
         if value.is_empty() {
             return Ok(Box::new(BooleanQuery::new(vec![])));
@@ -371,15 +378,13 @@ impl UnifiedSearchHandler {
 
             if let Some(tf) = t_field {
                 match term.modifier {
-                    TermModifier::Prefix => {
-                        let t = Term::from_field_text(tf, value);
+                    TermModifier::Prefix | TermModifier::Phrase | TermModifier::Fuzzy(_) => {
                         clauses.push((
                             Occur::Should,
-                            Box::new(TermQuery::new(t, IndexRecordOption::WithFreqs))
-                                as Box<dyn Query>,
+                            modified_text_query(index, tf, value, term.modifier)?,
                         ));
                     }
-                    _ => {
+                    TermModifier::Term => {
                         let mut parser = QueryParser::for_index(index, vec![tf]);
                         parser.set_conjunction_by_default();
                         if let Ok(q) = parser.parse_query(value) {
@@ -575,6 +580,118 @@ impl SearchHandler for UnifiedSearchHandler {
             }
         }
     }
+}
+
+fn range_query(range: &RangeExpr, index: &tantivy::Index) -> Result<Box<dyn Query>> {
+    let name = match range.field {
+        FieldKind::Size => "size",
+        FieldKind::Volume => "volume",
+        FieldKind::Flags => "flags",
+        FieldKind::Created => "created",
+        FieldKind::Modified => "modified",
+        _ => bail!("range queries require a numeric metadata field"),
+    };
+    let field = index.schema().get_field(name)?;
+    // Fast-field range execution requires the exact schema type. In particular,
+    // never cast unsigned sizes through i64 or pass a mismatched IPC value type
+    // to Tantivy, whose fast-field weight asserts that these types agree.
+    let query = match range.value {
+        RangeValue::U64 { lo, hi } => {
+            ensure!(
+                matches!(
+                    range.field,
+                    FieldKind::Size | FieldKind::Volume | FieldKind::Flags
+                ),
+                "{name} range values must use signed integers"
+            );
+            numeric_range(range.op, lo, hi, |value| Term::from_field_u64(field, value))?
+        }
+        RangeValue::I64 { lo, hi } => {
+            ensure!(
+                matches!(range.field, FieldKind::Created | FieldKind::Modified),
+                "{name} range values must use unsigned integers"
+            );
+            numeric_range(range.op, lo, hi, |value| Term::from_field_i64(field, value))?
+        }
+    };
+    Ok(Box::new(query))
+}
+
+fn numeric_range<T: Copy + Ord>(
+    op: RangeOp,
+    lo: T,
+    hi: Option<T>,
+    term: impl Fn(T) -> Term,
+) -> Result<RangeQuery> {
+    if op != RangeOp::Between {
+        ensure!(hi.is_none(), "only Between accepts a second range bound");
+    }
+    let (lower, upper) = match op {
+        RangeOp::Gt => (Bound::Excluded(term(lo)), Bound::Unbounded),
+        RangeOp::Ge => (Bound::Included(term(lo)), Bound::Unbounded),
+        RangeOp::Lt => (Bound::Unbounded, Bound::Excluded(term(lo))),
+        RangeOp::Le => (Bound::Unbounded, Bound::Included(term(lo))),
+        RangeOp::Between => {
+            let hi = hi.context("Between requires both inclusive range bounds")?;
+            ensure!(lo <= hi, "range lower bound exceeds its upper bound");
+            (Bound::Included(term(lo)), Bound::Included(term(hi)))
+        }
+    };
+    // Bound preserves strict comparisons at integer extrema without adding or
+    // subtracting one in service code. At least one bound is always present.
+    Ok(RangeQuery::new(lower, upper))
+}
+
+fn validate_term_modifier(modifier: TermModifier) -> Result<()> {
+    if let TermModifier::Fuzzy(distance) = modifier {
+        ensure!(distance <= 2, "fuzzy distance must be between zero and two");
+    }
+    Ok(())
+}
+
+fn modified_text_query(
+    index: &tantivy::Index,
+    field: Field,
+    value: &str,
+    modifier: TermModifier,
+) -> Result<Box<dyn Query>> {
+    validate_term_modifier(modifier)?;
+    let mut analyzer = index.tokenizer_for_field(field)?;
+    let mut stream = analyzer.token_stream(value);
+    let mut terms = Vec::new();
+    stream.process(&mut |token| {
+        terms.push((token.position, Term::from_field_text(field, &token.text)));
+    });
+    if terms.is_empty() {
+        return Ok(Box::new(EmptyQuery));
+    }
+    if modifier == TermModifier::Phrase {
+        return if terms.len() == 1 {
+            Ok(Box::new(TermQuery::new(
+                terms.pop().context("phrase has no analyzed term")?.1,
+                IndexRecordOption::WithFreqs,
+            )))
+        } else {
+            Ok(Box::new(PhraseQuery::new_with_offset(terms)))
+        };
+    }
+    // Literal modifiers use the field's indexing analyzer rather than parsing
+    // their value as query syntax. Multiple analyzed tokens are conjunctive;
+    // Phrase additionally requires their indexed positions. Prefix is a true
+    // zero-edit prefix automaton, without a lossy cap on expanded dictionary
+    // terms. Fuzzy uses the supported edit bound, counting transpositions once.
+    let mut clauses = Vec::with_capacity(terms.len());
+    for (_, term) in terms {
+        let query = match modifier {
+            TermModifier::Prefix => FuzzyTermQuery::new_prefix(term, 0, false),
+            TermModifier::Fuzzy(distance) => FuzzyTermQuery::new(term, distance, true),
+            TermModifier::Term | TermModifier::Phrase => {
+                bail!("literal text query requires Prefix, Phrase, or Fuzzy")
+            }
+        };
+        clauses.push((Occur::Must, Box::new(query) as Box<dyn Query>));
+    }
+    Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
 fn visible_query(
@@ -883,6 +1000,502 @@ mod tests {
 
     fn keys(response: &SearchResponse) -> Vec<DocKey> {
         response.hits.iter().map(|hit| hit.key).collect()
+    }
+
+    fn literal(field: FieldKind, value: &str, modifier: TermModifier) -> QueryExpr {
+        QueryExpr::Term(TermExpr {
+            field: Some(field),
+            value: value.to_string(),
+            modifier,
+        })
+    }
+
+    fn range(field: FieldKind, op: RangeOp, value: RangeValue) -> QueryExpr {
+        QueryExpr::Range(RangeExpr { field, op, value })
+    }
+
+    fn assert_query_members(
+        fixture: &SearchFixture,
+        query: &QueryExpr,
+        metadata: &[DocKey],
+        content: &[DocKey],
+        visibility: &Visibility,
+    ) -> Result<()> {
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Auto,
+            SearchMode::Hybrid,
+        ] {
+            let expected: BTreeSet<_> = match mode {
+                SearchMode::NameOnly => metadata.iter().copied().collect(),
+                SearchMode::Content => content.iter().copied().collect(),
+                SearchMode::Auto | SearchMode::Hybrid => {
+                    metadata.iter().chain(content).copied().collect()
+                }
+            };
+            let req = SearchRequest::with_query(query.clone())
+                .with_mode(mode)
+                .with_limit(200);
+            let response = fixture.search(&req, visibility)?;
+            let actual = keys(&response);
+            assert_eq!(response.total, expected.len() as u64, "{mode:?}: {query:?}");
+            assert_eq!(actual.len(), expected.len(), "{mode:?}: {query:?}");
+            assert_eq!(
+                actual.into_iter().collect::<BTreeSet<_>>(),
+                expected,
+                "{mode:?}: {query:?}"
+            );
+            assert!(!response.truncated);
+            assert!(response.served_by.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsigned_ranges_preserve_strict_bounds_and_full_size_domain() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut files = Vec::new();
+        for (identity, size) in [0, 9, 10, 11, u64::MAX].into_iter().enumerate() {
+            let mut meta = file(
+                if identity % 2 == 0 { 2 } else { 10 },
+                0xabcd_0000_0000_0000 | identity as u64,
+                "range candidate",
+                &format!(r"C:\ranges\{identity}.txt"),
+            );
+            meta.size = size;
+            meta.flags = match identity {
+                1 => FileFlags::HIDDEN,
+                2 => FileFlags::IS_DIR,
+                3 => FileFlags::SYSTEM,
+                4 => FileFlags::HIDDEN | FileFlags::SYSTEM,
+                _ => FileFlags::empty(),
+            };
+            fixture.put(&meta, (identity != 2).then_some("indexed body"))?;
+            files.push(meta);
+        }
+        fixture.commit()?;
+        let cases: &[(RangeOp, u64, Option<u64>, &[usize])] = &[
+            (RangeOp::Gt, 10, None, &[3, 4]),
+            (RangeOp::Ge, 10, None, &[2, 3, 4]),
+            (RangeOp::Lt, 10, None, &[0, 1]),
+            (RangeOp::Le, 10, None, &[0, 1, 2]),
+            (RangeOp::Between, 9, Some(11), &[1, 2, 3]),
+            (RangeOp::Between, 10, Some(10), &[2]),
+            (RangeOp::Gt, u64::MAX, None, &[]),
+            (RangeOp::Ge, u64::MAX, None, &[4]),
+            (RangeOp::Gt, i64::MAX as u64, None, &[4]),
+            (RangeOp::Lt, 0, None, &[]),
+            (RangeOp::Le, 0, None, &[0]),
+            (RangeOp::Between, 0, Some(u64::MAX), &[0, 1, 2, 3, 4]),
+        ];
+        for &(op, lo, hi, indices) in cases {
+            let metadata: Vec<_> = indices.iter().map(|&i| files[i].key).collect();
+            let content: Vec<_> = indices
+                .iter()
+                .filter(|&&i| i != 2)
+                .map(|&i| files[i].key)
+                .collect();
+            assert_query_members(
+                &fixture,
+                &range(FieldKind::Size, op, RangeValue::U64 { lo, hi }),
+                &metadata,
+                &content,
+                &Visibility::default(),
+            )?;
+        }
+        for (field, op, value) in [
+            (
+                FieldKind::Volume,
+                RangeOp::Ge,
+                RangeValue::U64 { lo: 10, hi: None },
+            ),
+            (
+                FieldKind::Flags,
+                RangeOp::Between,
+                RangeValue::U64 { lo: 2, hi: Some(4) },
+            ),
+        ] {
+            let expected = [files[1].key, files[3].key];
+            assert_query_members(
+                &fixture,
+                &range(field, op, value),
+                &expected,
+                &expected,
+                &Visibility::default(),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn signed_timestamp_ranges_preserve_negative_values_and_extrema() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut files = Vec::new();
+        for (identity, timestamp) in [i64::MIN, -1, 0, 1, i64::MAX].into_iter().enumerate() {
+            let mut meta = file(2, identity as u64, "timestamp", r"C:\time\entry.txt");
+            meta.created = timestamp;
+            meta.modified = timestamp;
+            fixture.put(&meta, Some("indexed body"))?;
+            files.push(meta);
+        }
+        fixture.commit()?;
+        let cases: &[(RangeOp, i64, Option<i64>, &[usize])] = &[
+            (RangeOp::Gt, 0, None, &[3, 4]),
+            (RangeOp::Ge, 0, None, &[2, 3, 4]),
+            (RangeOp::Lt, 0, None, &[0, 1]),
+            (RangeOp::Le, 0, None, &[0, 1, 2]),
+            (RangeOp::Between, -1, Some(1), &[1, 2, 3]),
+            (RangeOp::Between, -1, Some(-1), &[1]),
+            (RangeOp::Gt, i64::MAX, None, &[]),
+            (RangeOp::Ge, i64::MAX, None, &[4]),
+            (RangeOp::Lt, i64::MIN, None, &[]),
+            (RangeOp::Le, i64::MIN, None, &[0]),
+            (RangeOp::Between, i64::MIN, Some(i64::MAX), &[0, 1, 2, 3, 4]),
+        ];
+        for field in [FieldKind::Created, FieldKind::Modified] {
+            for &(op, lo, hi, indices) in cases {
+                let expected: Vec<_> = indices.iter().map(|&i| files[i].key).collect();
+                assert_query_members(
+                    &fixture,
+                    &range(field, op, RangeValue::I64 { lo, hi }),
+                    &expected,
+                    &expected,
+                    &Visibility::default(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_typed_ranges_and_fuzzy_distances_reject_the_whole_request() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        fixture.put(&file(2, 1, "needle", r"C:\needle.txt"), Some("needle"))?;
+        fixture.commit()?;
+        let invalid = [
+            range(
+                FieldKind::Size,
+                RangeOp::Ge,
+                RangeValue::I64 { lo: -1, hi: None },
+            ),
+            range(
+                FieldKind::Modified,
+                RangeOp::Ge,
+                RangeValue::U64 { lo: 0, hi: None },
+            ),
+            range(
+                FieldKind::Name,
+                RangeOp::Ge,
+                RangeValue::U64 { lo: 0, hi: None },
+            ),
+            range(
+                FieldKind::Kind,
+                RangeOp::Ge,
+                RangeValue::U64 { lo: 0, hi: None },
+            ),
+            range(
+                FieldKind::Size,
+                RangeOp::Between,
+                RangeValue::U64 { lo: 0, hi: None },
+            ),
+            range(
+                FieldKind::Size,
+                RangeOp::Between,
+                RangeValue::U64 {
+                    lo: 10,
+                    hi: Some(9),
+                },
+            ),
+            range(
+                FieldKind::Created,
+                RangeOp::Between,
+                RangeValue::I64 {
+                    lo: 1,
+                    hi: Some(-1),
+                },
+            ),
+            range(
+                FieldKind::Size,
+                RangeOp::Le,
+                RangeValue::U64 {
+                    lo: 10,
+                    hi: Some(20),
+                },
+            ),
+            literal(FieldKind::Name, "needle", TermModifier::Fuzzy(3)),
+            literal(FieldKind::Name, "", TermModifier::Fuzzy(u8::MAX)),
+        ];
+        for query in invalid {
+            // A valid disjunct must not turn the invalid predicate into a
+            // successful partial result in either the internal or IPC handler.
+            let query = QueryExpr::Or(vec![
+                literal(FieldKind::Name, "needle", TermModifier::Term),
+                query,
+            ]);
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Auto,
+                SearchMode::Hybrid,
+            ] {
+                let req = SearchRequest::with_query(query.clone()).with_mode(mode);
+                assert!(fixture.search(&req, &Visibility::default()).is_err());
+                let response = fixture.handler.search(req);
+                assert!(response.hits.is_empty());
+                assert_eq!(response.total, 0);
+                assert!(response.truncated);
+                assert_eq!(response.served_by.as_deref(), Some("service-unavailable"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_prefixes_use_field_analysis_and_complete_dictionary_membership() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut expected = Vec::new();
+        let mut content_expected = Vec::new();
+        // More distinct prefix expansions than Tantivy's default phrase-prefix
+        // expansion cap; the exact union must include the complete dictionary.
+        for identity in 0..65 {
+            let meta = file(
+                2,
+                identity,
+                &format!("Étude{identity}"),
+                &format!(r"C:\Projects\Étude{identity}.txt"),
+            );
+            fixture.put(
+                &meta,
+                Some(if identity % 2 == 0 {
+                    "tailored body"
+                } else {
+                    "ordinary body"
+                }),
+            )?;
+            expected.push(meta.key);
+            if identity % 2 == 0 {
+                content_expected.push(meta.key);
+            }
+        }
+        for (identity, name) in [(100, "Étendue"), (101, "Etude")] {
+            fixture.put(
+                &file(2, identity, name, r"C:\elsewhere\entry.txt"),
+                Some("other"),
+            )?;
+        }
+        fixture.commit()?;
+        for (field, value) in [(FieldKind::Name, "ÉTU"), (FieldKind::Path, "proj ÉTU")] {
+            assert_query_members(
+                &fixture,
+                &literal(field, value, TermModifier::Prefix),
+                &expected,
+                &expected,
+                &Visibility::default(),
+            )?;
+        }
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Content, "TAIL", TermModifier::Prefix),
+            &[],
+            &content_expected,
+            &Visibility::default(),
+        )?;
+        let all: Vec<_> = expected
+            .iter()
+            .copied()
+            .chain([DocKey::from_parts(2, 100), DocKey::from_parts(2, 101)])
+            .collect();
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Ext, "tx", TermModifier::Prefix),
+            &all,
+            &all,
+            &Visibility::default(),
+        )?;
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Name, "ÉTU OR Etude", TermModifier::Prefix),
+            &[],
+            &[],
+            &Visibility::default(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn literal_phrases_require_analyzed_positions_without_parsing_syntax() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let first = file(2, 1, "blue moon", r"C:\phrase\first.txt");
+        let spaced = file(2, 2, "blue distant moon", r"C:\phrase\spaced.txt");
+        let reversed = file(2, 3, "moon blue", r"C:\phrase\reversed.txt");
+        let syntax = file(2, 4, "name: blue OR content: moon", r"C:\phrase\syntax.txt");
+        let prefix = file(2, 5, "blue moonlight", r"C:\phrase\prefix.txt");
+        for (meta, body) in [
+            (&first, "blue moon shines"),
+            (&spaced, "blue distant moon"),
+            (&reversed, "moon blue"),
+            (&syntax, "name: blue OR content: moon"),
+            (&prefix, "blue moonlight"),
+        ] {
+            fixture.put(meta, Some(body))?;
+        }
+        fixture.commit()?;
+        for (value, expected) in [
+            ("BLUE MOON", vec![first.key]),
+            ("name: blue OR content: moon", vec![syntax.key]),
+            ("!!!", Vec::new()),
+        ] {
+            assert_query_members(
+                &fixture,
+                &literal(FieldKind::Name, value, TermModifier::Phrase),
+                &expected,
+                &expected,
+                &Visibility::default(),
+            )?;
+            assert_query_members(
+                &fixture,
+                &literal(FieldKind::Content, value, TermModifier::Phrase),
+                &[],
+                &expected,
+                &Visibility::default(),
+            )?;
+        }
+        let all = [first.key, spaced.key, reversed.key, syntax.key, prefix.key];
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Ext, "txt", TermModifier::Phrase),
+            &all,
+            &all,
+            &Visibility::default(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn literal_fuzzy_queries_enforce_edit_distance_and_all_analyzed_tokens() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut files = Vec::new();
+        for (identity, name) in [
+            "report final",
+            "reprot finals",
+            "reports finale",
+            "remote final",
+            "report",
+            "report finally",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let meta = file(2, identity as u64, name, r"C:\fuzzy\entry.txt");
+            fixture.put(&meta, Some(name))?;
+            files.push(meta);
+        }
+        fixture.commit()?;
+        for (distance, indices) in [(0, vec![0]), (1, vec![0, 1, 2]), (2, vec![0, 1, 2, 5])] {
+            let expected: Vec<_> = indices.iter().map(|&i| files[i].key).collect();
+            assert_query_members(
+                &fixture,
+                &literal(
+                    FieldKind::Name,
+                    "REPORT FINAL",
+                    TermModifier::Fuzzy(distance),
+                ),
+                &expected,
+                &expected,
+                &Visibility::default(),
+            )?;
+            assert_query_members(
+                &fixture,
+                &literal(
+                    FieldKind::Content,
+                    "REPORT FINAL",
+                    TermModifier::Fuzzy(distance),
+                ),
+                &[],
+                &expected,
+                &Visibility::default(),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_predicates_keep_exact_union_through_masked_replacement_and_replay() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut changed = file(5, 0xabcd_0000_0000_0010, "report old", r"C:\old\entry.txt");
+        let stable = file(5, 20, "report stable", r"C:\stable.txt");
+        let child = file(5, 30, "report child", r"C:\covered\child.txt");
+        let sibling = file(5, 40, "report sibling", r"C:\coveredness\sibling.txt");
+        let other = file(9, 50, "report other", r"D:\other.txt");
+        for meta in [&changed, &stable, &child, &sibling, &other] {
+            fixture.put(meta, Some("old body"))?;
+        }
+        fixture.commit()?;
+        let query = QueryExpr::And(vec![
+            literal(FieldKind::Name, "REP", TermModifier::Prefix),
+            range(
+                FieldKind::Size,
+                RangeOp::Between,
+                RangeValue::U64 {
+                    lo: 50,
+                    hi: Some(150),
+                },
+            ),
+        ]);
+        let all = [changed.key, stable.key, child.key, sibling.key, other.key];
+        assert_query_members(&fixture, &query, &all, &all, &Visibility::default())?;
+        let mut visibility = Visibility::default();
+        visibility.documents.insert(changed.key);
+        visibility.volumes.insert(9);
+        visibility
+            .directories
+            .insert(5, vec![r"C:\covered".to_string()]);
+        changed.name = "report replacement".to_string();
+        changed.path = Some(r"C:\new\entry.txt".to_string());
+        changed.size = 125;
+        fixture.put_content(&changed, Some("new body"))?;
+        fixture.content.commit()?;
+        fixture.reload()?;
+        let masked = [stable.key, sibling.key];
+        assert_query_members(&fixture, &query, &masked, &masked, &visibility)?;
+        fixture.put_metadata(&changed)?;
+        fixture.metadata.commit()?;
+        fixture.reload()?;
+        visibility.documents.remove(&changed.key);
+        let complete = [changed.key, stable.key, sibling.key];
+        assert_query_members(&fixture, &query, &complete, &complete, &visibility)?;
+        // Replaying the completed update preserves exactly one stable identity.
+        fixture.put(&changed, Some("new body"))?;
+        fixture.commit()?;
+        assert_query_members(&fixture, &query, &complete, &complete, &visibility)?;
+
+        visibility.documents.insert(changed.key);
+        changed.size = 200;
+        fixture.put_content(&changed, Some("larger body"))?;
+        fixture.content.commit()?;
+        fixture.reload()?;
+        assert_query_members(&fixture, &query, &masked, &masked, &visibility)?;
+        fixture.put_metadata(&changed)?;
+        fixture.metadata.commit()?;
+        fixture.reload()?;
+        visibility.documents.remove(&changed.key);
+        for _ in 0..2 {
+            fixture.delete(stable.key);
+            fixture.commit()?;
+        }
+        fixture.handler = UnifiedSearchHandler::try_new(
+            &fixture.root.join("meta"),
+            &fixture.root.join("content"),
+        )?;
+        assert_query_members(
+            &fixture,
+            &query,
+            &[sibling.key],
+            &[sibling.key],
+            &visibility,
+        )?;
+        Ok(())
     }
 
     #[test]
