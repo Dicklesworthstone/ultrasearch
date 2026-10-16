@@ -793,14 +793,17 @@ mod journal {
         {
             return Ok(Some(FileEvent::RescanRequired { doc }));
         }
-        // Reasons accumulate until close. Deletion wins over create/modify in
-        // a combined record; a historical create must never resurrect a file.
+        // Reasons accumulate until close. Deletion wins over create, modify,
+        // and rename in a combined record. NTFS can move an ordinary directory
+        // into $Extend\$Deleted before emitting DELETE | RENAME_NEW | CLOSE.
+        // That terminal record must not become another directory rename: its
+        // full identity needs a tombstone, not a current pathname lookup.
         // Ordinary directory removal deletes an empty directory. Recursive
         // removal produces each child's own deletion/move records, so the
         // directory's tombstone must not reset an otherwise valid volume scan.
         // Keep structural/reparse histories conservative in the branch above.
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw
-        if !directory_rename && record.reason & REASON_DELETE != 0 {
+        if record.reason & REASON_DELETE != 0 {
             return Ok(Some(FileEvent::Deleted(doc)));
         }
         let indexed_reasons =
@@ -811,11 +814,7 @@ mod journal {
             // CLOSE alone, without an accumulated reason, changes no state.
             return Ok(None);
         }
-        let current = if record.reason & REASON_DELETE != 0 {
-            None
-        } else {
-            metadata()?
-        };
+        let current = metadata()?;
         if let Some(meta) = &current {
             validate_metadata_identity(meta, doc)?;
         }
@@ -1709,6 +1708,259 @@ impl NtfsWatcher for InMemoryWatcher {
 mod tests {
     use super::*;
     use core_types::FileFlags;
+
+    #[test]
+    fn terminal_directory_delete_overrides_accumulated_rename_reasons() {
+        for volume in [1, 42, u16::MAX] {
+            // The reported $Deleted parent is one fixture, not a production
+            // magic MFT slot. FILE_DELETE supplies the evidence in every case.
+            for parent in [0x0001_0000_0000_001d, 0xfedc_0000_0000_1234] {
+                for rename in [
+                    0,
+                    journal::REASON_RENAME_OLD,
+                    journal::REASON_RENAME_NEW,
+                    journal::REASON_RENAME_OLD | journal::REASON_RENAME_NEW,
+                ] {
+                    for accumulated in [
+                        0,
+                        journal::REASON_CLOSE,
+                        journal::REASON_CREATE | 1 | 0x8000 | journal::REASON_CLOSE,
+                    ] {
+                        let mut change = record(
+                            128,
+                            0xffff_0000_0000_005f,
+                            journal::REASON_DELETE | rename | accumulated,
+                            "001100000000005F6827FE8B",
+                        );
+                        change.parent_frn = parent;
+                        change.attributes = journal::ATTRIBUTE_DIRECTORY | 0x20;
+                        let event = journal::event_from_record(volume, &change, || {
+                            panic!("a terminal directory deletion must not resolve metadata")
+                        })
+                        .unwrap();
+                        assert_eq!(
+                            event,
+                            Some(FileEvent::Deleted(DocKey::from_parts(volume, change.frn))),
+                            "reason={:#x} parent={parent:#x}",
+                            change.reason
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delete_staging_history_preserves_terminal_records_across_bounded_replay() {
+        use journal::{
+            ATTRIBUTE_DIRECTORY, REASON_CLOSE, REASON_CREATE, REASON_DELETE,
+            REASON_RENAME_NEW, REASON_RENAME_OLD,
+        };
+
+        let root = 0x0063_0000_0000_005d;
+        let nested = 0x001b_0000_0000_005e;
+        let deep = 0x0011_0000_0000_005f;
+        let gone = 0x0012_0000_0000_0060;
+        let leaf = 0x0013_0000_0000_0061;
+        let survivor = 0x0014_0000_0000_0062;
+        let replacement = 0x0064_0000_0000_005d;
+        let volume_root = 0x0001_0000_0000_0005;
+        let deleted_parent = 0x0001_0000_0000_001d;
+        let terminal = REASON_DELETE | REASON_RENAME_NEW | REASON_CLOSE;
+        // Reproduce the native directory staging sequence from issue #6, with
+        // ordinary file tombstones interleaved and a surviving moved-out file.
+        // Include reuse of the root's MFT slot under a different sequence.
+        let specs = [
+            (survivor, nested, REASON_RENAME_OLD, "survivor.txt", false),
+            (
+                survivor,
+                volume_root,
+                REASON_RENAME_NEW,
+                "survived.txt",
+                false,
+            ),
+            (gone, root, REASON_DELETE | REASON_CLOSE, "gone.txt", false),
+            (leaf, deep, REASON_DELETE | REASON_CLOSE, "leaf.txt", false),
+            (deep, nested, REASON_RENAME_OLD, "deep", true),
+            (
+                deep,
+                deleted_parent,
+                REASON_RENAME_NEW,
+                "001100000000005F6827FE8B",
+                true,
+            ),
+            (
+                deep,
+                deleted_parent,
+                terminal,
+                "001100000000005F6827FE8B",
+                true,
+            ),
+            (nested, root, REASON_RENAME_OLD, "nested", true),
+            (
+                nested,
+                deleted_parent,
+                REASON_RENAME_NEW,
+                "001B000000005E4517D385",
+                true,
+            ),
+            (
+                nested,
+                deleted_parent,
+                terminal,
+                "001B000000005E4517D385",
+                true,
+            ),
+            (root, volume_root, REASON_RENAME_OLD, "removed-tree", true),
+            (
+                root,
+                deleted_parent,
+                REASON_RENAME_NEW,
+                "006300000000005D0E7E6250",
+                true,
+            ),
+            (
+                root,
+                deleted_parent,
+                terminal,
+                "006300000000005D0E7E6250",
+                true,
+            ),
+            (
+                replacement,
+                volume_root,
+                REASON_CREATE,
+                "replacement-tree",
+                true,
+            ),
+        ];
+        let records: Vec<_> = specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (frn, parent, reason, name, is_dir))| {
+                let mut change = record((index as u64 + 1) * 128, frn, reason, name);
+                change.parent_frn = parent;
+                if is_dir {
+                    change.attributes = ATTRIBUTE_DIRECTORY;
+                }
+                change
+            })
+            .collect();
+        let moved_meta = resolved_meta(&records[1]);
+        let mut replacement_meta = resolved_meta(&records[13]);
+        replacement_meta.flags = FileFlags::IS_DIR;
+        let directory_history = |index: usize| FileEvent::DirectoryRenamed {
+            doc: DocKey::from_parts(42, records[index].frn),
+            parent: DocKey::from_parts(42, records[index].parent_frn),
+            name: records[index].name.clone(),
+            current: None,
+        };
+        let expected = vec![
+            FileEvent::Renamed {
+                from: moved_meta.key,
+                to: moved_meta.clone(),
+            },
+            FileEvent::Deleted(DocKey::from_parts(42, gone)),
+            FileEvent::Deleted(DocKey::from_parts(42, leaf)),
+            directory_history(4),
+            directory_history(5),
+            FileEvent::Deleted(DocKey::from_parts(42, deep)),
+            directory_history(7),
+            directory_history(8),
+            FileEvent::Deleted(DocKey::from_parts(42, nested)),
+            directory_history(10),
+            directory_history(11),
+            FileEvent::Deleted(DocKey::from_parts(42, root)),
+            FileEvent::Created(replacement_meta.clone()),
+        ];
+        let end = (records.len() as u64 + 1) * 128;
+        for budget in [1, 2, 3, 7, 64] {
+            for _ in 0..2 {
+                let mut consumed = 0;
+                let mut position = cursor(records[0].usn);
+                let mut observed = Vec::new();
+                while consumed < records.len() {
+                    let (events, next) = journal::resolve_batch(
+                        42,
+                        &encoded_batch(end, &records[consumed..]),
+                        position,
+                        budget,
+                        |change| {
+                            assert_eq!(change.reason & REASON_DELETE, 0);
+                            if change.frn == survivor {
+                                Ok(Some(moved_meta.clone()))
+                            } else if change.frn == replacement {
+                                Ok(Some(replacement_meta.clone()))
+                            } else {
+                                // The native identity probe has established
+                                // absence, not swallowed an access failure.
+                                Ok(None)
+                            }
+                        },
+                        |_, _| Ok(false),
+                    )
+                    .unwrap();
+                    assert!(events.len() <= budget);
+                    consumed += budget.min(records.len() - consumed);
+                    assert_eq!(next, cursor(records.get(consumed).map_or(end, |r| r.usn)));
+                    assert!(next.last_usn > position.last_usn);
+                    observed.extend(events);
+                    position = next;
+                }
+                assert_eq!(position, cursor(end));
+                assert_eq!(observed, expected, "budget={budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_delete_fix_preserves_structural_recovery_and_live_rename_history() {
+        let mut change = record(
+            128,
+            0x0011_0000_0000_005f,
+            journal::REASON_RENAME_NEW,
+            "001100000000005F6827FE8B",
+        );
+        change.parent_frn = 0x0001_0000_0000_001d;
+        change.attributes = journal::ATTRIBUTE_DIRECTORY;
+        let mut current = resolved_meta(&change);
+        current.flags = FileFlags::IS_DIR;
+        for metadata in [None, Some(current)] {
+            let event = journal::event_from_record(42, &change, || Ok(metadata.clone())).unwrap();
+            assert_eq!(
+                event,
+                Some(FileEvent::DirectoryRenamed {
+                    doc: DocKey::from_parts(42, change.frn),
+                    parent: DocKey::from_parts(42, change.parent_frn),
+                    name: change.name.clone(),
+                    current: metadata,
+                })
+            );
+        }
+        assert!(
+            journal::event_from_record(42, &change, || {
+                Err(NtfsError::Journal("metadata access denied".into()))
+            })
+            .is_err()
+        );
+        for (reason, attributes) in [
+            (journal::REASON_HARD_LINK, journal::ATTRIBUTE_DIRECTORY),
+            (journal::REASON_REPARSE, journal::ATTRIBUTE_DIRECTORY),
+            (0, journal::ATTRIBUTE_DIRECTORY | journal::ATTRIBUTE_REPARSE),
+        ] {
+            change.reason = journal::REASON_DELETE | journal::REASON_RENAME_NEW | reason;
+            change.attributes = attributes;
+            assert_eq!(
+                journal::event_from_record(42, &change, || {
+                    panic!("structural recovery must not probe a terminal identity")
+                })
+                .unwrap(),
+                Some(FileEvent::RescanRequired {
+                    doc: DocKey::from_parts(42, change.frn),
+                })
+            );
+        }
+    }
 
     #[test]
     fn doc_key_round_trip() {
@@ -2995,7 +3247,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_deleted_renamed_directories_retain_descendant_anchors() {
+    fn missing_renamed_directories_keep_anchors_but_terminal_deletes_tombstone() {
         for reason in [
             journal::REASON_RENAME_OLD,
             journal::REASON_RENAME_NEW,
@@ -3004,18 +3256,24 @@ mod tests {
         ] {
             let mut change = record(128, 0xFEDC_0000_0000_0040, reason, "gone-directory");
             change.attributes = journal::ATTRIBUTE_DIRECTORY;
+            let doc = DocKey::from_parts(42, change.frn);
+            let expected = if reason & journal::REASON_DELETE != 0 {
+                FileEvent::Deleted(doc)
+            } else {
+                FileEvent::DirectoryRenamed {
+                    doc,
+                    parent: DocKey::from_parts(42, change.parent_frn),
+                    name: "gone-directory".into(),
+                    current: None,
+                }
+            };
             assert_eq!(
                 journal::event_from_record(42, &change, || {
                     assert_eq!(reason & journal::REASON_DELETE, 0);
                     Ok(None)
                 })
                 .unwrap(),
-                Some(FileEvent::DirectoryRenamed {
-                    doc: DocKey::from_parts(42, change.frn),
-                    parent: DocKey::from_parts(42, change.parent_frn),
-                    name: "gone-directory".into(),
-                    current: None,
-                })
+                Some(expected)
             );
         }
     }
@@ -4068,6 +4326,65 @@ mod tests {
             std::fs::read(&survived).unwrap(),
             b"survives the ancestor deletion"
         );
+
+        // Exercise direct RemoveDirectoryW as well as Rust's remove_dir_all
+        // above. Their native journal reason combinations can differ (#6),
+        // but both must produce every full-identity tombstone on replay.
+        let direct_tree = dir.path().join("remove-directory-api-tree");
+        let direct_nested = direct_tree.join("nested");
+        let direct_deep = direct_nested.join("deep");
+        let direct_leaf = direct_deep.join("leaf.txt");
+        let direct_sibling = direct_tree.join("sibling.txt");
+        std::fs::create_dir_all(&direct_deep).unwrap();
+        std::fs::write(&direct_leaf, b"direct API leaf").unwrap();
+        std::fs::write(&direct_sibling, b"direct API sibling").unwrap();
+        let created = read_to_head(&volume, &mut position);
+        let direct_keys: std::collections::BTreeSet<_> = [
+            &direct_tree,
+            &direct_nested,
+            &direct_deep,
+            &direct_leaf,
+            &direct_sibling,
+        ]
+        .map(|path| created_key(&created, path))
+        .into_iter()
+        .collect();
+        assert_eq!(direct_keys.len(), 5);
+        let before_direct_deletion = position;
+        std::fs::remove_file(&direct_leaf).unwrap();
+        std::fs::remove_file(&direct_sibling).unwrap();
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::RemoveDirectoryW;
+            use windows::core::PCWSTR;
+
+            for path in [&direct_deep, &direct_nested, &direct_tree] {
+                let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                // SAFETY: this is an empty fixture directory; the NUL-terminated
+                // path buffer remains live for the synchronous native call.
+                unsafe { RemoveDirectoryW(PCWSTR(wide.as_ptr())) }
+                    .expect("direct native fixture directory deletion must succeed");
+            }
+        }
+        let deleted = read_to_head(&volume, &mut position);
+        assert!(position.last_usn > before_direct_deletion.last_usn);
+        let mut replay_position = before_direct_deletion;
+        let replayed = read_to_head(&volume, &mut replay_position);
+        assert!(replay_position.last_usn >= position.last_usn);
+        for events in [&deleted, &replayed] {
+            let observed: std::collections::BTreeSet<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    FileEvent::Deleted(key) if direct_keys.contains(key) => Some(*key),
+                    FileEvent::RescanRequired { doc } if direct_keys.contains(doc) => {
+                        panic!("ordinary native removal must not reset the volume")
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(observed, direct_keys);
+        }
+        assert!(!direct_tree.exists());
 
         let wrong_identity = JournalCursor {
             journal_id: position.journal_id ^ 1,
