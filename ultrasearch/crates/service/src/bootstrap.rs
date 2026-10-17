@@ -103,22 +103,6 @@ pub fn run_app_with_options(
                 )
             })?;
     }
-    rt.spawn(scheduler.run_loop());
-
-    // Start after the scheduler exists. Test seeds explicitly opt out of native
-    // discovery; production never substitutes a successful no-op watcher.
-    if use_journal {
-        let cfg_clone = cfg_owned.clone();
-        rt.spawn(async move {
-            if let Err(e) = watch_changes(cfg_clone, ingestion).await {
-                update_status_ingestion_state(format!("stopped: {e:#}"));
-                tracing::error!("change watcher stopped: {e:#}");
-            }
-        });
-    } else {
-        update_status_ingestion_state("native ingestion disabled by test bootstrap options");
-    }
-
     // Try to install unified search handler.
     // We pass both meta and content index paths.
     let meta_path = Path::new(&cfg_owned.paths.meta_index);
@@ -130,12 +114,24 @@ pub fn run_app_with_options(
     set_search_handler(Box::new(handler));
 
     #[cfg(target_os = "windows")]
-    {
-        // Start IPC server
-        // We use the runtime we just created.
-        if let Err(e) = rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref())) {
-            tracing::error!("failed to start IPC server: {}", e);
-        }
+    let _pipe_listener = rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref()))?;
+
+    // Readers and the endpoint are ready before writers can run. A failed pipe
+    // bind returns an error, drops this ingestion session, and never leaves a
+    // second invisible scanner/worker running behind another service's pipe.
+    rt.spawn(scheduler.run_loop());
+    // Test seeds explicitly opt out of native discovery; production never
+    // substitutes a successful no-op watcher.
+    if use_journal {
+        let cfg_clone = cfg_owned.clone();
+        rt.spawn(async move {
+            if let Err(e) = watch_changes(cfg_clone, ingestion).await {
+                update_status_ingestion_state(format!("stopped: {e:#}"));
+                tracing::error!("change watcher stopped: {e:#}");
+            }
+        });
+    } else {
+        update_status_ingestion_state("native ingestion disabled by test bootstrap options");
     }
 
     tracing::info!("UltraSearch service started. Waiting for shutdown signal...");

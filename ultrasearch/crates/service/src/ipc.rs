@@ -7,7 +7,7 @@ use crate::metrics::{global_metrics_snapshot, record_ipc_request};
 use crate::search_handler::search;
 use crate::status::make_status_response;
 use crate::status_provider::status_snapshot;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ipc::{
     MetricsSnapshot, ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse,
     SearchRequest, StatusRequest, framing,
@@ -23,35 +23,46 @@ use uuid::Uuid;
 const DEFAULT_PIPE_NAME: &str = r#"\\.\pipe\ultrasearch"#;
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 
-/// Start a Tokio named-pipe server that spawns a task per connection.
+/// Bind the first pipe instance before reporting successful startup. Keep a
+/// replacement listener alive before handing a connected instance to a task.
 pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>> {
     let name = pipe_name.unwrap_or(DEFAULT_PIPE_NAME).to_string();
+    anyhow::ensure!(
+        !name.contains('\0'),
+        "named pipe name must not contain an embedded NUL"
+    );
+    // Binding inside the spawned task used to return Ok even when another
+    // service owned this name or the security descriptor could not be applied.
+    // The caller must see that failure before starting ingestion workers.
+    let mut server = unsafe { create_secure_pipe(&name, true) }
+        .with_context(|| format!("cannot bind UltraSearch named pipe {name}"))?;
 
     let handle = tokio::spawn(async move {
-        let mut first = true;
         loop {
-            // Use raw Win32 API to create pipe with Security Descriptor
-            // SDDL: D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)
-            // SY=System, BA=Admins, AU=Authenticated Users (Read/Write)
-            let server = match unsafe { create_secure_pipe(&name, first) } {
-                Ok(s) => s,
-                Err(e) => {
-                    // Likely another instance owns the pipe. Back off and retry, but escalate to warning after a few tries.
-                    tracing::warn!("named pipe create failed ({}); retrying in 1s", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
+            let connected = server.connect().await;
+            // Retain the current instance until its successor exists. Otherwise
+            // a short-lived client can close the last handle before the next
+            // listener is created, losing both availability and name ownership.
+            // https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/struct.NamedPipeServer.html
+            let next = loop {
+                match unsafe { create_secure_pipe(&name, false) } {
+                    Ok(next) => break next,
+                    Err(error) => {
+                        tracing::warn!(%error, "named pipe replacement failed; retaining current instance and retrying in 1s");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             };
-
-            first = false;
-
-            if let Err(e) = server.connect().await {
+            let accepted = std::mem::replace(&mut server, next);
+            if let Err(e) = connected {
                 tracing::error!("named pipe connect failed: {}", e);
+                drop(accepted);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(server).await {
+                if let Err(e) = handle_connection(accepted).await {
                     tracing::warn!("pipe connection error: {e:?}");
                 }
             });
@@ -315,6 +326,66 @@ fn host_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_pipe_startup_rejects_duplicate_and_invalid_names() {
+        let name = format!(r"\\.\pipe\ultrasearch-bind-{}", Uuid::new_v4());
+        let listener = start_pipe_server(Some(&name)).await.unwrap();
+        let duplicate = start_pipe_server(Some(&name)).await;
+        assert!(
+            duplicate.is_err(),
+            "startup must not acknowledge a failed bind"
+        );
+        assert!(start_pipe_server(Some("not-a-pipe-name")).await.is_err());
+        assert!(
+            start_pipe_server(Some(&format!("{name}\0suffix")))
+                .await
+                .is_err()
+        );
+        listener.abort();
+        assert!(listener.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn native_pipe_keeps_name_ownership_across_short_lived_clients() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = format!(r"\\.\pipe\ultrasearch-churn-{}", Uuid::new_v4());
+        let listener = start_pipe_server(Some(&name)).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..32 {
+                let mut client = ClientOptions::new().open(&name).unwrap();
+                let id = Uuid::new_v4();
+                let mut payload = b"PING".to_vec();
+                payload.extend_from_slice(id.as_bytes());
+                let message =
+                    framing::encode_message(framing::MessageKind::Ping, &payload).unwrap();
+                client
+                    .write_all(&framing::encode_frame(&message).unwrap())
+                    .await
+                    .unwrap();
+                let mut prefix = [0; 4];
+                client.read_exact(&mut prefix).await.unwrap();
+                let length = u32::from_le_bytes(prefix) as usize;
+                assert!(length > 0 && length <= MAX_MESSAGE_BYTES);
+                let mut response = vec![0; length];
+                client.read_exact(&mut response).await.unwrap();
+                let (kind, payload) = framing::decode_message(&response).unwrap();
+                assert_eq!(kind, framing::MessageKind::Ping);
+                assert_eq!(payload, id.as_bytes());
+                drop(client);
+                tokio::task::yield_now().await;
+                assert!(
+                    unsafe { create_secure_pipe(&name, true) }.is_err(),
+                    "a replacement listener must retain exclusive name ownership"
+                );
+            }
+        })
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        result.expect("native named-pipe churn exceeded its deadline");
+    }
 
     #[tokio::test]
     async fn echoes_uuid_prefix() {
