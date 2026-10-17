@@ -92,9 +92,14 @@ pub struct ExtractorStack {
 }
 
 impl ExtractorStack {
-    /// Simple default stack. Unknown formats are explicit content omissions.
+    /// Source text plus installed Windows stream filters. Unknown formats are
+    /// explicit omissions; no native parser is required on other platforms.
     pub fn with_defaults() -> Self {
-        Self::simple_only()
+        Self::new(vec![
+            Box::new(SimpleTextExtractor),
+            #[cfg(windows)]
+            Box::new(ifilter::IFilterExtractor::new()),
+        ])
     }
 
     /// Simple-only stack (no external dependencies).
@@ -110,10 +115,12 @@ impl ExtractorStack {
                 return Self::new(vec![
                     Box::new(SimpleTextExtractor),
                     Box::new(ExtractousExtractor::new()),
+                    #[cfg(windows)]
+                    Box::new(ifilter::IFilterExtractor::new()),
                 ]);
             }
         }
-        Self::simple_only()
+        Self::with_defaults()
     }
 
     pub fn new(backends: Vec<Box<dyn Extractor + Send + Sync>>) -> Self {
@@ -865,10 +872,20 @@ mod tests {
     }
 
     #[test]
-    fn with_extractous_disabled_uses_simple_only() {
-        let stack = ExtractorStack::with_extractous_enabled(false);
-        assert_eq!(stack.backends.len(), 1);
-        assert_eq!(stack.backends[0].name(), "simple-text");
+    fn worker_defaults_use_platform_filters_without_changing_explicit_simple_only() {
+        for stack in [
+            ExtractorStack::with_defaults(),
+            ExtractorStack::with_extractous_enabled(false),
+        ] {
+            assert_eq!(stack.backends.len(), if cfg!(windows) { 2 } else { 1 });
+            assert_eq!(stack.backends[0].name(), "simple-text");
+            assert_eq!(
+                stack.backends.iter().any(|backend| backend.name() == "ifilter"),
+                cfg!(windows)
+            );
+            assert!(!stack.backends.iter().any(|backend| backend.name() == "noop"));
+        }
+        assert_eq!(ExtractorStack::simple_only().backends.len(), 1);
     }
 
     #[test]
