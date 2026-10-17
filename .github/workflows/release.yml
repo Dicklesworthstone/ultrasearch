@@ -74,9 +74,14 @@ jobs:
 
       - name: Copy binaries to dist
         run: |
+          Copy-Item target/release/ui.exe dist/ui.exe
+          Copy-Item target/release/service.exe dist/service.exe
+          Copy-Item target/release/index-worker.exe dist/index-worker.exe
+          Copy-Item target/release/cli.exe dist/cli.exe
+          Copy-Item target/release/launcher.exe dist/launcher.exe
           Copy-Item target/release/ui.exe dist/ultrasearch-ui.exe
           Copy-Item target/release/service.exe dist/ultrasearch-service.exe
-          Copy-Item target/release/cli.exe dist/ultrasearch-cli.exe -ErrorAction SilentlyContinue
+          Copy-Item target/release/cli.exe dist/ultrasearch-cli.exe
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
@@ -294,6 +299,11 @@ jobs:
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
           generate_release_notes: true
           files: |
+            dist/ui.exe
+            dist/service.exe
+            dist/index-worker.exe
+            dist/cli.exe
+            dist/launcher.exe
             dist/ultrasearch-ui.exe
             dist/ultrasearch-service.exe
             dist/ultrasearch-cli.exe
@@ -306,10 +316,12 @@ jobs:
 
             | File | Description |
             |------|-------------|
-            | `ultrasearch-ui.exe` | Desktop UI application |
-            | `ultrasearch-service.exe` | Background Windows service |
-            | `ultrasearch-cli.exe` | Command-line interface |
-            | `*.msi` | Windows installer package |
+            | `*.msi` | Windows MSI installer package (Service + Worker + UI + Launcher + CLI) |
+            | `launcher.exe` | One-click portable launcher |
+            | `ui.exe` / `ultrasearch-ui.exe` | Desktop UI application |
+            | `service.exe` / `ultrasearch-service.exe` | Background Windows service |
+            | `index-worker.exe` | Sandboxed content extraction worker |
+            | `cli.exe` / `ultrasearch-cli.exe` | Command-line interface |
 
             ### Verification
 
