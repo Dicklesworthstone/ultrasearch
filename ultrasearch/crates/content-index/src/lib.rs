@@ -47,8 +47,8 @@ pub fn build_schema() -> (Schema, ContentFields) {
     let flags = builder.add_u64_field("flags", FAST | STORED);
     let content_lang = builder.add_text_field("content_lang", STRING | STORED);
 
-    // Use default tokenizer for content, but allow overrides via per-field options later if needed.
-    let content = builder.add_text_field("content", TEXT);
+    // Use default tokenizer for content, and store text so search hits can generate snippets.
+    let content = builder.add_text_field("content", TEXT | STORED);
 
     let fields = ContentFields {
         doc_key,

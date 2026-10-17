@@ -80,53 +80,54 @@ impl ResultsView {
         let needle_lower = needle.to_ascii_lowercase();
         if let Some(pos) = lower.find(&needle_lower) {
             let end = pos + needle_lower.len();
-            let (pre, matched, post) = (&text[..pos], &text[pos..end], &text[end..text.len()]);
-
-            div()
-                .text_size(if is_primary { px(14.) } else { px(11.) })
-                .font_weight(if is_primary {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(if is_primary {
-                    colors.text_primary
-                } else {
-                    colors.text_secondary
-                })
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(pre.to_string())
-                .child(
-                    div()
-                        .px_1()
-                        .rounded_sm()
-                        .bg(colors.match_highlight)
-                        .text_color(colors.bg)
-                        .child(matched.to_string()),
-                )
-                .child(post.to_string())
-                .into_any_element()
-        } else {
-            div()
-                .text_size(if is_primary { px(14.) } else { px(11.) })
-                .font_weight(if is_primary {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(if is_primary {
-                    colors.text_primary
-                } else {
-                    colors.text_secondary
-                })
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(text.to_string())
-                .into_any_element()
+            if let (Some(pre), Some(matched), Some(post)) =
+                (text.get(..pos), text.get(pos..end), text.get(end..))
+            {
+                return div()
+                    .text_size(if is_primary { px(14.) } else { px(11.) })
+                    .font_weight(if is_primary {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if is_primary {
+                        colors.text_primary
+                    } else {
+                        colors.text_secondary
+                    })
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(pre.to_string())
+                    .child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(colors.match_highlight)
+                            .text_color(colors.bg)
+                            .child(matched.to_string()),
+                    )
+                    .child(post.to_string())
+                    .into_any_element();
+            }
         }
+        div()
+            .text_size(if is_primary { px(14.) } else { px(11.) })
+            .font_weight(if is_primary {
+                FontWeight::MEDIUM
+            } else {
+                FontWeight::NORMAL
+            })
+            .text_color(if is_primary {
+                colors.text_primary
+            } else {
+                colors.text_secondary
+            })
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(text.to_string())
+            .into_any_element()
     }
 
     fn render_highlighted(
@@ -139,11 +140,15 @@ impl ResultsView {
         self.highlight_text(text, query, is_primary, cx)
     }
 
-    fn handle_click(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn handle_click(&mut self, global_index: usize, cx: &mut Context<Self>) {
         self.model.update(cx, |model, cx| {
-            let global_index = model.page_start().saturating_add(index);
-            model.selected_index = Some(global_index.min(model.results.len().saturating_sub(1)));
-            model.ensure_page_for_selection();
+            if model.results.is_empty() {
+                model.selected_index = None;
+            } else {
+                model.selected_index =
+                    Some(global_index.min(model.results.len().saturating_sub(1)));
+                model.ensure_page_for_selection();
+            }
             cx.notify();
         });
     }
@@ -186,29 +191,7 @@ impl ResultsView {
             },
         ];
 
-        // 3. Spawn Menu Window (Overlay)
-        // Assume 0,0 for now as window_bounds is tricky without WindowContext deref.
-        // Use event.position (window-relative).
-        // Ideally we convert to screen.
-        // If main window is moved, this will be offset.
-        // For MVP, I will try to get window origin via `cx.window().position()`? No.
-        // I'll just use a best-effort approach or center it if I can't find bounds.
-        // Actually, let's try `cx.current_window()`?
-        // I'll assume the position is relative to the window's content rect.
-
-        // Workaround: We can't easily get screen coords in `Context`?
-        // We can pass `event.position` and let the popup open there.
-        // `open_window` positions are screen coords.
-        // If I assume 0,0 offset, it will appear at top-left of screen + mouse pos?
-        // No, if window is at 500,500, mouse at 100,100 -> absolute 600,600.
-        // If I use 100,100 for new window, it appears at 100,100 screen.
-
-        // I'll default to 0,0 for origin if bounds fail, but I'll try to use `cx.window().bounds()` if I can fix it.
-        // Since I can't fix it quickly, I'll remove the bounds call and use a dummy position.
-        // This is a known limitation of my current understanding of GPUI 0.2 API.
-
-        let origin = Point::new(px(0.), px(0.)); // TODO: Fix window origin
-
+        let origin = Point::new(px(0.), px(0.));
         let position = event.position;
         let screen_pos = origin + position;
 
@@ -232,23 +215,20 @@ impl ResultsView {
             .ok();
     }
 
-    #[allow(dead_code)]
-    fn handle_double_click(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn handle_double_click(&mut self, global_index: usize, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
-        if let Some(hit) = model.results.get(index) {
+        if let Some(hit) = model.results.get(global_index) {
             if let Some(path) = &hit.path {
                 self.open_file(path);
             }
         }
     }
 
-    #[allow(dead_code)]
     fn open_file(&self, path: &str) {
         #[cfg(target_os = "windows")]
         {
-            Command::new("explorer")
-                .arg("/select,")
-                .arg(path)
+            Command::new("cmd")
+                .args(["/C", "start", "", path])
                 .spawn()
                 .ok();
         }
@@ -279,8 +259,11 @@ impl ResultsView {
     }
 
     fn format_modified_time(timestamp: i64) -> String {
+        let Ok(secs) = u64::try_from(timestamp) else {
+            return "-".to_string();
+        };
         let now = SystemTime::now();
-        let file_time = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
+        let file_time = UNIX_EPOCH + Duration::from_secs(secs);
 
         if let Ok(duration) = now.duration_since(file_time) {
             let days = duration.as_secs() / 86400;
@@ -468,6 +451,98 @@ impl ResultsView {
             .child(div().w(px(100.)).child("MODIFIED"))
     }
 
+    fn render_pagination_footer(
+        &self,
+        page: usize,
+        total_pages: usize,
+        start: usize,
+        shown: usize,
+        total_loaded: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = theme::active_colors(cx);
+        let can_prev = page > 0;
+        let can_next = page + 1 < total_pages;
+        let end = start + shown;
+
+        div()
+            .w_full()
+            .h(px(36.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_4()
+            .bg(colors.panel_bg)
+            .border_t_1()
+            .border_color(colors.border)
+            .text_size(px(11.))
+            .text_color(colors.text_secondary)
+            .child(format!(
+                "Showing {}–{} of {} loaded results (Page {} of {})",
+                start + 1,
+                end,
+                total_loaded,
+                page + 1,
+                total_pages
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.bg)
+                            .text_color(if can_prev {
+                                colors.text_primary
+                            } else {
+                                colors.text_secondary
+                            })
+                            .when(can_prev, |el| {
+                                el.cursor_pointer().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.model.update(cx, |m, cx| {
+                                            m.set_page(page.saturating_sub(1), cx);
+                                        });
+                                    }),
+                                )
+                            })
+                            .child("← Prev"),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.bg)
+                            .text_color(if can_next {
+                                colors.text_primary
+                            } else {
+                                colors.text_secondary
+                            })
+                            .when(can_next, |el| {
+                                el.cursor_pointer().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.model.update(cx, |m, cx| {
+                                            m.set_page(page + 1, cx);
+                                        });
+                                    }),
+                                )
+                            })
+                            .child("Next →"),
+                    ),
+            )
+    }
+
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let has_query = !model.query.is_empty();
@@ -512,7 +587,12 @@ impl Render for ResultsView {
         let model = self.model.clone();
         let model_read = model.read(cx);
         let start = model_read.page_start();
+        let page = model_read.page;
+        let page_size = model_read.page_size.max(1);
+        let total_loaded = model_read.results.len();
+        let total_pages = total_loaded.div_ceil(page_size).max(1);
         let page_hits = model_read.current_page_results().to_vec();
+        let shown = page_hits.len();
         let has_results = !page_hits.is_empty();
         let hover_index = self.hover_index;
         let colors = theme::active_colors(cx);
@@ -536,24 +616,45 @@ impl Render for ResultsView {
                 }
             }))
             .when(has_results, |this: Div| {
-                this.child(self.render_header(cx)).child(
-                    list(
-                        self.list_state.clone(),
-                        cx.processor(move |this, ix, _window, cx| {
-                            let (hit, is_selected) = match page_hits.get(ix).cloned() {
-                                Some(hit) => {
-                                    let sel = model.read(cx).is_selected(start + ix);
-                                    (hit, sel)
-                                }
-                                None => return div().into_any_element(),
-                            };
+                this.child(self.render_header(cx))
+                    .child(
+                        div().flex_1().w_full().overflow_hidden().child(
+                            list(
+                                self.list_state.clone(),
+                                cx.processor(move |this, ix, _window, cx| {
+                                    let global_index = start + ix;
+                                    let (hit, is_selected) = match page_hits.get(ix).cloned() {
+                                        Some(hit) => {
+                                            let sel = model.read(cx).is_selected(global_index);
+                                            (hit, sel)
+                                        }
+                                        None => return div().into_any_element(),
+                                    };
 
-                            let is_hover = hover_index == Some(ix);
-                            this.render_row(start + ix, &hit, is_selected, is_hover, &query, cx)
-                        }),
+                                    let is_hover = hover_index == Some(global_index);
+                                    this.render_row(
+                                        global_index,
+                                        &hit,
+                                        is_selected,
+                                        is_hover,
+                                        &query,
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .size_full(),
+                        ),
                     )
-                    .size_full(),
-                )
+                    .when(total_pages > 1, |this: Div| {
+                        this.child(self.render_pagination_footer(
+                            page,
+                            total_pages,
+                            start,
+                            shown,
+                            total_loaded,
+                            cx,
+                        ))
+                    })
             })
             .when(!has_results, |this: Div| {
                 this.child(self.render_empty_state(cx))

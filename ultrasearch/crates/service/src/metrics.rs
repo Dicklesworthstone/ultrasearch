@@ -4,10 +4,16 @@ use anyhow::Result;
 use core_types::config::MetricsSection;
 use ipc::MetricsSnapshot;
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder, opts};
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
+
+const LATENCY_WINDOW_CAPACITY: usize = 256;
 
 /// Shared metrics handle for the service.
 pub struct ServiceMetrics {
@@ -16,6 +22,7 @@ pub struct ServiceMetrics {
     pub request_latency: Histogram,
     pub worker_failures: IntCounter,
     pub worker_failure_threshold: u64,
+    recent_latencies_ms: Mutex<VecDeque<f64>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +61,7 @@ impl ServiceMetrics {
             request_latency,
             worker_failures,
             worker_failure_threshold: cfg.worker_failure_threshold,
+            recent_latencies_ms: Mutex::new(VecDeque::with_capacity(LATENCY_WINDOW_CAPACITY)),
         })
     }
 
@@ -61,11 +69,32 @@ impl ServiceMetrics {
     pub fn record_request(&self, latency_secs: f64) {
         self.requests_total.inc();
         self.request_latency.observe(latency_secs);
+        let ms = latency_secs * 1000.0;
+        if ms.is_finite() && ms >= 0.0 {
+            let mut ring = self.recent_latencies_ms.lock();
+            if ring.len() >= LATENCY_WINDOW_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(ms);
+        }
     }
 
     /// Record a successful request with a Duration.
     pub fn record_request_duration(&self, duration: Duration) {
         self.record_request(duration.as_secs_f64());
+    }
+
+    fn latency_quantiles_ms(&self) -> (Option<f64>, Option<f64>) {
+        let ring = self.recent_latencies_ms.lock();
+        if ring.is_empty() {
+            return (None, None);
+        }
+        let mut sorted: Vec<f64> = ring.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let p50_idx = ((n - 1) * 50) / 100;
+        let p95_idx = ((n - 1) * 95) / 100;
+        (Some(sorted[p50_idx]), Some(sorted[p95_idx]))
     }
 
     /// Record a worker failure; returns true if the threshold has been met/exceeded.
@@ -94,9 +123,10 @@ impl ServiceMetrics {
         content_enqueued: Option<u64>,
         content_dropped: Option<u64>,
     ) -> ServiceMetricsSnapshot {
+        let (p50, p95) = self.latency_quantiles_ms();
         ServiceMetricsSnapshot {
-            search_latency_ms_p50: None,
-            search_latency_ms_p95: None,
+            search_latency_ms_p50: p50,
+            search_latency_ms_p95: p95,
             worker_failures: self.worker_failures.get(),
             queue_depth,
             active_workers,
@@ -106,17 +136,8 @@ impl ServiceMetrics {
     }
 
     /// Render a lightweight metrics snapshot for status reporting.
-    /// Note: Prometheus crate does not expose quantiles; we return None for p50/p95 for now.
     pub fn snapshot(&self) -> ServiceMetricsSnapshot {
-        ServiceMetricsSnapshot {
-            search_latency_ms_p50: None,
-            search_latency_ms_p95: None,
-            worker_failures: self.worker_failures.get(),
-            queue_depth: None,
-            active_workers: None,
-            content_enqueued: None,
-            content_dropped: None,
-        }
+        self.snapshot_with_queue_state(None, None, None, None)
     }
 }
 
@@ -187,6 +208,51 @@ pub fn global_scrape_metrics() -> Option<Vec<u8>> {
     with_global_metrics(|m| scrape_metrics(m).unwrap_or_default())
 }
 
+/// Spawn a lightweight Prometheus HTTP `/metrics` exporter bound to `bind` on the active Tokio runtime.
+pub fn start_metrics_http_server(bind: &str, metrics: Arc<ServiceMetrics>) -> Result<SocketAddr> {
+    let std_listener = std::net::TcpListener::bind(bind)?;
+    std_listener.set_nonblocking(true)?;
+    let local_addr = std_listener.local_addr()?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let mut req_buf = [0u8; 1024];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req_line = std::str::from_utf8(&req_buf[..n])
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("");
+                let is_metrics_path = req_line.starts_with("GET /metrics")
+                    || req_line.starts_with("GET / ")
+                    || req_line.is_empty();
+                if is_metrics_path {
+                    let body = scrape_metrics(&metrics).unwrap_or_default();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                } else {
+                    let resp =
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp).await;
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    Ok(local_addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,10 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn request_latency_recorded() {
+    fn request_latency_recorded_and_quantiles_computed() {
         let metrics = ServiceMetrics::new(&MetricsSection::default()).unwrap();
-        metrics.record_request(0.01);
-        assert!(metrics.requests_total.get() >= 1);
+        for ms in 1..=20 {
+            metrics.record_request(ms as f64 / 1000.0);
+        }
+        assert_eq!(metrics.requests_total.get(), 20);
+        let snap = metrics.snapshot();
+        let p50 = snap.search_latency_ms_p50.expect("p50 present");
+        let p95 = snap.search_latency_ms_p95.expect("p95 present");
+        assert!((9.0..=11.0).contains(&p50), "unexpected p50: {p50}");
+        assert!((18.0..=20.0).contains(&p95), "unexpected p95: {p95}");
     }
 
     #[test]
@@ -230,5 +303,27 @@ mod tests {
         assert!(metrics.worker_failures.get() > 0);
         metrics.reset_worker_failures();
         assert_eq!(metrics.worker_failures.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_http_server_serves_prometheus_payload() {
+        let metrics = Arc::new(ServiceMetrics::new(&MetricsSection::default()).unwrap());
+        metrics.record_request(0.025);
+        let addr = start_metrics_http_server("127.0.0.1:0", metrics).unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "response: {text}");
+        assert!(text.contains("requests_total 1"), "response: {text}");
+        assert!(
+            text.contains("request_latency_seconds_count 1"),
+            "response: {text}"
+        );
     }
 }

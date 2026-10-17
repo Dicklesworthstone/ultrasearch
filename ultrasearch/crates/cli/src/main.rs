@@ -130,28 +130,34 @@ impl SearchQueryArgs {
         );
         let mut clauses = Vec::with_capacity(3);
         if let Some(text) = text {
-            let modifier = if self.prefix {
-                TermModifier::Prefix
-            } else if self.phrase {
-                TermModifier::Phrase
-            } else if let Some(distance) = self.fuzzy {
-                TermModifier::Fuzzy(distance)
+            let has_explicit_modifier =
+                self.field.is_some() || self.prefix || self.phrase || self.fuzzy.is_some();
+            if !has_explicit_modifier && ipc::has_human_filter_tokens(text) {
+                clauses.push(ipc::parse_query_str(text));
             } else {
-                TermModifier::Term
-            };
-            clauses.push(QueryExpr::Term(TermExpr {
-                field: self.field.map(|field| match field {
-                    SearchFieldArg::Name => FieldKind::Name,
-                    SearchFieldArg::Path => FieldKind::Path,
-                    SearchFieldArg::Ext => FieldKind::Ext,
-                    SearchFieldArg::Content => FieldKind::Content,
-                }),
-                // Preserve the exact raw expression, including whitespace and
-                // embedded field qualifiers. Literal interpretation is selected
-                // only by the explicit modifier flags above.
-                value: text.to_string(),
-                modifier,
-            }));
+                let modifier = if self.prefix {
+                    TermModifier::Prefix
+                } else if self.phrase {
+                    TermModifier::Phrase
+                } else if let Some(distance) = self.fuzzy {
+                    TermModifier::Fuzzy(distance)
+                } else {
+                    TermModifier::Term
+                };
+                clauses.push(QueryExpr::Term(TermExpr {
+                    field: self.field.map(|field| match field {
+                        SearchFieldArg::Name => FieldKind::Name,
+                        SearchFieldArg::Path => FieldKind::Path,
+                        SearchFieldArg::Ext => FieldKind::Ext,
+                        SearchFieldArg::Content => FieldKind::Content,
+                    }),
+                    // Preserve the exact raw expression, including whitespace and
+                    // embedded field qualifiers. Literal interpretation is selected
+                    // only by the explicit modifier flags above.
+                    value: text.to_string(),
+                    modifier,
+                }));
+            }
         }
         if let Some(size) =
             inclusive_filter(FieldKind::Size, self.min_size, self.max_size, |lo, hi| {
@@ -317,7 +323,16 @@ async fn main() -> Result<()> {
             } => {
                 let mut cfg = load_or_create_config(None)?;
                 let vols = if volume.is_empty() {
-                    cfg.volumes.clone()
+                    let discovered: Vec<String> = ntfs_watcher::discover_volumes()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flat_map(|v| v.drive_letters.into_iter().map(|l| format!("{l}:\\")))
+                        .collect();
+                    if discovered.is_empty() {
+                        cfg.volumes.clone()
+                    } else {
+                        discovered
+                    }
                 } else {
                     volume
                 };
@@ -850,5 +865,36 @@ mod tests {
                     .contains("require Windows named-pipe IPC")
             );
         }
+    }
+
+    #[test]
+    fn human_filter_tokens_build_structured_query_ast_in_cli() -> Result<()> {
+        let request = parse_search(&["ext:rs kind:code size:>1kb report"])?;
+        assert_eq!(
+            request.query,
+            QueryExpr::And(vec![
+                QueryExpr::Term(TermExpr {
+                    field: Some(FieldKind::Ext),
+                    value: "rs".into(),
+                    modifier: TermModifier::Term,
+                }),
+                QueryExpr::Term(TermExpr {
+                    field: Some(FieldKind::Kind),
+                    value: "code".into(),
+                    modifier: TermModifier::Term,
+                }),
+                QueryExpr::Range(RangeExpr {
+                    field: FieldKind::Size,
+                    op: RangeOp::Gt,
+                    value: RangeValue::U64 { lo: 1024, hi: None },
+                }),
+                QueryExpr::Term(TermExpr {
+                    field: None,
+                    value: "report".into(),
+                    modifier: TermModifier::Term,
+                }),
+            ])
+        );
+        Ok(())
     }
 }

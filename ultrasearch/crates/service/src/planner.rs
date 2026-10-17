@@ -20,7 +20,7 @@ impl QueryPlanner {
                     // Not(A and B) -> Not(A) or Not(B)
                     QueryExpr::Or(
                         subs.into_iter()
-                            .map(|s| QueryExpr::Not(Box::new(Self::push_down_not(s))))
+                            .map(|s| Self::push_down_not(QueryExpr::Not(Box::new(s))))
                             .collect(),
                     )
                 }
@@ -28,7 +28,7 @@ impl QueryPlanner {
                     // Not(A or B) -> Not(A) and Not(B)
                     QueryExpr::And(
                         subs.into_iter()
-                            .map(|s| QueryExpr::Not(Box::new(Self::push_down_not(s))))
+                            .map(|s| Self::push_down_not(QueryExpr::Not(Box::new(s))))
                             .collect(),
                     )
                 }
@@ -127,5 +127,19 @@ mod tests {
             assert!(matches!(subs[0], QueryExpr::Not(_)));
             assert!(matches!(subs[1], QueryExpr::Not(_)));
         }
+    }
+
+    #[test]
+    fn test_de_morgan_eliminates_nested_double_negation() {
+        // Not(And([Not(A), B])) -> Or([A, Not(B)])
+        let q = QueryExpr::Not(Box::new(QueryExpr::And(vec![
+            QueryExpr::Not(Box::new(term("A"))),
+            term("B"),
+        ])));
+        let optimized = QueryPlanner::optimize(q);
+        assert_eq!(
+            optimized,
+            QueryExpr::Or(vec![term("A"), QueryExpr::Not(Box::new(term("B")))])
+        );
     }
 }

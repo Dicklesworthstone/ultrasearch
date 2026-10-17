@@ -1,10 +1,7 @@
 use crate::background::{set_tray_status, TrayState};
 use crate::ipc::client::IpcClient;
 use gpui::*;
-use ipc::{
-    MetricsSnapshot, QueryExpr, SearchHit, SearchMode, SearchRequest, StatusRequest, TermExpr,
-    TermModifier, VolumeStatus,
-};
+use ipc::{MetricsSnapshot, SearchHit, SearchMode, SearchRequest, StatusRequest, VolumeStatus};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -13,6 +10,7 @@ use uuid::Uuid;
 pub enum UpdateStatus {
     Idle,
     Checking,
+    UpToDate { version: String },
     Available { version: String, notes: String },
     NeedsOptIn,
     Downloading { version: String, progress: u8 },
@@ -280,11 +278,7 @@ impl SearchAppModel {
 
                     let req = SearchRequest {
                         id: Uuid::new_v4(),
-                        query: QueryExpr::Term(TermExpr {
-                            field: None,
-                            value: query_clone.clone(),
-                            modifier: TermModifier::Term,
-                        }),
+                        query: ipc::parse_query_str(&query_clone),
                         limit: 100,
                         mode: mode.into(),
                         timeout: Some(Duration::from_secs(5)),
@@ -455,30 +449,12 @@ impl SearchAppModel {
             cx.notify();
             return;
         }
-        self.updates.status = UpdateStatus::Checking;
+        let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        self.updates.status = UpdateStatus::UpToDate {
+            version: current_version,
+        };
         self.update_tray_status();
         cx.notify();
-        let client = self.client.clone();
-        cx.spawn(|this: WeakEntity<SearchAppModel>, cx: &mut AsyncApp| {
-            let async_app = cx.clone();
-            async move {
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                let fake_version = "v0.2.0".to_string();
-                let fake_notes = "Performance improvements, UI polish, and bug fixes.".to_string();
-                let _ = async_app.update(|app| {
-                    this.update(app, |model, cx| {
-                        let _ = &client; // reserved for real check call
-                        model.updates.status = UpdateStatus::Available {
-                            version: fake_version.clone(),
-                            notes: fake_notes.clone(),
-                        };
-                        model.update_tray_status();
-                        cx.notify();
-                    })
-                });
-            }
-        })
-        .detach();
     }
 
     pub fn start_update_download(&mut self, cx: &mut Context<SearchAppModel>) {
@@ -575,12 +551,6 @@ impl SearchAppModel {
         if self.history.len() > MAX_HISTORY {
             self.history.pop_back();
         }
-    }
-}
-
-impl Default for SearchAppModel {
-    fn default() -> Self {
-        panic!("SearchAppModel must be created with new(cx), not default()")
     }
 }
 

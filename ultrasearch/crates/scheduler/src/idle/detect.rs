@@ -56,6 +56,17 @@ where
         }
     }
 
+    /// Return the current `(warm_idle, deep_idle)` thresholds.
+    pub fn thresholds(&self) -> (Duration, Duration) {
+        (self.warm_idle, self.deep_idle)
+    }
+
+    /// Update the `(warm_idle, deep_idle)` thresholds dynamically (clamping `deep_idle >= warm_idle`).
+    pub fn set_thresholds(&mut self, warm_idle: Duration, deep_idle: Duration) {
+        self.warm_idle = warm_idle;
+        self.deep_idle = deep_idle.max(warm_idle);
+    }
+
     /// Read the current idle state and update transition bookkeeping.
     pub fn sample(&mut self) -> IdleSample {
         let idle_for = (self.reader)()

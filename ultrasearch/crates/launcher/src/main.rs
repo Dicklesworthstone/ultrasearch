@@ -3,18 +3,20 @@
 use anyhow::{Context, Result};
 use console::style;
 use dotenvy::{dotenv, from_path};
+#[cfg(windows)]
 use ipc::{StatusRequest, client::PipeClient};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::{
     env,
-    io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    thread::sleep,
-    time::Duration,
 };
+#[cfg(windows)]
+use std::{io::Write, thread::sleep, time::Duration};
+#[cfg(windows)]
 use tokio::runtime::Runtime;
+#[cfg(windows)]
 use uuid::Uuid;
 
 /// Ensures a child process is terminated if this guard is dropped.
@@ -58,6 +60,17 @@ impl Drop for ChildGuard {
     }
 }
 
+fn configure_no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 fn main() -> Result<()> {
     let show_console = env::args().any(|a| {
         a.eq_ignore_ascii_case("--show-console") || a.eq_ignore_ascii_case("-show-console")
@@ -65,7 +78,6 @@ fn main() -> Result<()> {
     let exe_dir = current_exe_dir()?;
     load_env(&exe_dir);
 
-    let service_path = resolve_binary(&exe_dir, "service")?;
     let ui_path = resolve_binary(&exe_dir, "ui")?;
 
     if show_console {
@@ -76,27 +88,43 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut service_cmd = Command::new(&service_path);
-    service_cmd
-        .arg("--console")
-        .stdin(Stdio::null())
-        .creation_flags(0x08000000); // CREATE_NO_WINDOW
-    if show_console {
-        service_cmd
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+    let mut service = if is_ipc_already_running() {
+        if show_console {
+            println!(
+                "{}",
+                style("existing service detected via IPC; reusing running service").green()
+            );
+        }
+        None
     } else {
-        service_cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-    let mut service = ChildGuard::spawn("service", &mut service_cmd)?;
-    if show_console {
-        println!("{}", style("service started, waiting for IPC...").dim());
-    }
-
-    wait_for_ipc_ready(&mut service)?;
+        let service_path = resolve_binary(&exe_dir, "service")?;
+        let mut service_cmd = Command::new(&service_path);
+        service_cmd.arg("--console").stdin(Stdio::null());
+        configure_no_window(&mut service_cmd);
+        if show_console {
+            service_cmd
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        } else {
+            service_cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let mut guard = ChildGuard::spawn("service", &mut service_cmd)?;
+        if show_console {
+            println!("{}", style("service started, waiting for IPC...").dim());
+        }
+        wait_for_ipc_ready(&mut guard)?;
+        Some(guard)
+    };
 
     let mut ui_cmd = Command::new(&ui_path);
-    ui_cmd.stdin(Stdio::null()).creation_flags(0x08000000);
+    for arg in env::args().skip(1) {
+        if !arg.eq_ignore_ascii_case("--show-console") && !arg.eq_ignore_ascii_case("-show-console")
+        {
+            ui_cmd.arg(arg);
+        }
+    }
+    ui_cmd.stdin(Stdio::null());
+    configure_no_window(&mut ui_cmd);
     if show_console {
         ui_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
@@ -107,9 +135,11 @@ fn main() -> Result<()> {
         println!("{}", style("ui launched; press Ctrl+C to exit").dim());
     }
 
-    // When UI exits, tear down service.
+    // When UI exits, tear down service only if we spawned it ourselves.
     ui.wait()?;
-    service.kill_if_running();
+    if let Some(ref mut guard) = service {
+        guard.kill_if_running();
+    }
     if show_console {
         println!("{}", style("UltraSearch closed").green());
     }
@@ -152,10 +182,28 @@ fn load_env(exe_dir: &Path) {
     }
 }
 
+fn is_ipc_already_running() -> bool {
+    #[cfg(not(windows))]
+    {
+        false
+    }
+
+    #[cfg(windows)]
+    {
+        let Ok(rt) = Runtime::new() else {
+            return false;
+        };
+        let client = PipeClient::default().with_request_timeout(Duration::from_millis(400));
+        rt.block_on(client.status(StatusRequest { id: Uuid::new_v4() }))
+            .is_ok()
+    }
+}
+
 fn wait_for_ipc_ready(service: &mut ChildGuard) -> Result<()> {
     #[cfg(not(windows))]
     {
-        return Ok(()); // IPC pipe only on Windows; nothing to probe elsewhere.
+        let _ = service;
+        Ok(()) // IPC pipe only on Windows; nothing to probe elsewhere.
     }
 
     #[cfg(windows)]

@@ -16,10 +16,7 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 futures = "0.3"
 uuid = { workspace = true }
-tray-icon = "0.19"
-muda = "0.15"
 image = "0.25"
-global-hotkey = "0.6"
 md5 = "0.7"
 sysinfo = { workspace = true }
 toml = { workspace = true }
@@ -31,6 +28,9 @@ pulldown-cmark = "0.10"
 winres = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.19"
+muda = "0.15"
+global-hotkey = "0.6"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",

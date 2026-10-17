@@ -25,7 +25,7 @@ use crate::{
     init_tracing_with_config,
     meta_ingest::ingest_with_paths,
     metrics::{init_metrics_from_config, set_global_metrics},
-    priority::apply_background_priorities,
+    priority::apply_service_priorities,
     scanner::{initialize_indexes, watch_changes},
     scheduler_runtime::SchedulerRuntime,
     search_handler::set_search_handler,
@@ -44,8 +44,10 @@ pub fn run_app_with_options(
     mut shutdown_rx: mpsc::Receiver<()>,
     opts: BootstrapOptions,
 ) -> Result<()> {
-    // Always drop to background-friendly priorities before heavy work.
-    apply_background_priorities();
+    // Keep the service host at Normal priority so IPC and search remain responsive.
+    // Heavy content extraction runs in child index-worker processes at Idle priority.
+    apply_service_priorities();
+    core_types::install_opt_in_crash_hook("service");
 
     let _guard = init_tracing_with_config(&cfg.logging)?;
 
@@ -60,7 +62,13 @@ pub fn run_app_with_options(
 
     if cfg.metrics.enabled {
         let metrics = Arc::new(init_metrics_from_config(&cfg.metrics)?);
-        set_global_metrics(metrics);
+        set_global_metrics(metrics.clone());
+        if let Err(e) = crate::metrics::start_metrics_http_server(&cfg.metrics.bind, metrics) {
+            tracing::warn!(
+                bind = %cfg.metrics.bind,
+                "failed to start Prometheus /metrics HTTP listener: {e}"
+            );
+        }
     }
 
     let mut pending_jobs = Vec::new();

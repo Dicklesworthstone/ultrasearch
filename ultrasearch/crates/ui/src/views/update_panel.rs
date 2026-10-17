@@ -20,8 +20,9 @@ impl Render for UpdatePanel {
         let updates = &model.updates;
 
         let status_text = match &updates.status {
-            UpdateStatus::Idle => "Up to date".into(),
+            UpdateStatus::Idle => format!("Up to date (v{})", env!("CARGO_PKG_VERSION")),
             UpdateStatus::Checking => "Checking for updates…".into(),
+            UpdateStatus::UpToDate { version } => format!("Up to date ({version})"),
             UpdateStatus::NeedsOptIn => "Enable update checks to proceed".into(),
             UpdateStatus::Available { version, .. } => format!("Update available: {version}"),
             UpdateStatus::Downloading { version, progress } => {

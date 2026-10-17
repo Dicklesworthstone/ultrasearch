@@ -18,6 +18,7 @@ actions!(
         FinishOnboarding,
         OpenContainingFolder,
         ShowProperties,
+        ToggleStatus,
         CloseStatus,
         CheckForUpdates,
         DownloadUpdate,

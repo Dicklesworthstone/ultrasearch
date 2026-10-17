@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 ipc = { path = "../ipc" }
 core-types = { path = "../core-types" }
+ntfs-watcher = { path = "../ntfs-watcher" }
 console = { workspace = true }
 indicatif = { workspace = true }
 serde_json = { workspace = true }

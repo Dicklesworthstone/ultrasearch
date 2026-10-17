@@ -1,4 +1,4 @@
-use crate::actions::{MinimizeToTray, ToggleShortcuts};
+use crate::actions::{MinimizeToTray, ToggleShortcuts, ToggleStatus};
 use crate::model::state::{BackendMode, SearchAppModel};
 use crate::theme;
 use gpui::prelude::*;
@@ -30,6 +30,22 @@ impl SearchView {
         self.focus_handle.clone()
     }
 
+    fn clamp_char_boundary(s: &str, idx: usize) -> usize {
+        let mut pos = idx.min(s.len());
+        while pos > 0 && !s.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        pos
+    }
+
+    fn clamped_selection(&self, s: &str) -> Option<(usize, usize)> {
+        self.selection.and_then(|(start, end)| {
+            let cs = Self::clamp_char_boundary(s, start.min(end));
+            let ce = Self::clamp_char_boundary(s, start.max(end));
+            (cs < ce).then_some((cs, ce))
+        })
+    }
+
     fn clear_selection(&mut self) {
         self.selection = None;
     }
@@ -43,36 +59,42 @@ impl SearchView {
     }
 
     fn replace_selection(&mut self, text: &str) {
-        if let Some((s, e)) = self.selection.take() {
-            let mut current = self.input_text.to_string();
+        let mut current = self.input_text.to_string();
+        if let Some((s, e)) = self.clamped_selection(&current) {
+            self.selection = None;
             current.replace_range(s..e, text);
             self.cursor = s + text.len();
             self.input_text = current.into();
         } else {
+            self.selection = None;
             self.insert_at_cursor(text);
         }
     }
 
     fn insert_at_cursor(&mut self, text: &str) {
         let mut current = self.input_text.to_string();
-        current.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        let pos = Self::clamp_char_boundary(&current, self.cursor);
+        current.insert_str(pos, text);
+        self.cursor = pos + text.len();
         self.input_text = current.into();
     }
 
     fn delete_backward(&mut self) {
-        if let Some((s, e)) = self.selection.take() {
-            let mut current = self.input_text.to_string();
+        let mut current = self.input_text.to_string();
+        if let Some((s, e)) = self.clamped_selection(&current) {
+            self.selection = None;
             current.replace_range(s..e, "");
             self.cursor = s;
             self.input_text = current.into();
             return;
         }
-        if self.cursor == 0 {
+        self.selection = None;
+        let pos = Self::clamp_char_boundary(&current, self.cursor);
+        if pos == 0 {
+            self.cursor = 0;
             return;
         }
-        let mut current = self.input_text.to_string();
-        if let Some((idx, len)) = current[..self.cursor]
+        if let Some((idx, len)) = current[..pos]
             .char_indices()
             .last()
             .map(|(i, c)| (i, c.len_utf8()))
@@ -84,33 +106,41 @@ impl SearchView {
     }
 
     fn delete_forward(&mut self) {
-        if let Some((s, e)) = self.selection.take() {
-            let mut current = self.input_text.to_string();
+        let mut current = self.input_text.to_string();
+        if let Some((s, e)) = self.clamped_selection(&current) {
+            self.selection = None;
             current.replace_range(s..e, "");
             self.cursor = s;
             self.input_text = current.into();
             return;
         }
-        let current = self.input_text.to_string();
-        if self.cursor >= current.len() {
+        self.selection = None;
+        let pos = Self::clamp_char_boundary(&current, self.cursor);
+        if pos >= current.len() {
+            self.cursor = current.len();
             return;
         }
-        if let Some((off, ch)) = current[self.cursor..].char_indices().next() {
-            let mut new = current;
-            let start = self.cursor + off;
-            new.drain(start..start + ch.len_utf8());
-            self.input_text = new.into();
+        if let Some((off, ch)) = current[pos..].char_indices().next() {
+            let start = pos + off;
+            current.drain(start..start + ch.len_utf8());
+            self.cursor = pos;
+            self.input_text = current.into();
         }
     }
 
     fn move_cursor_left(&mut self, selecting: bool) {
-        if self.cursor == 0 {
+        let current = self.input_text.to_string();
+        let pos = Self::clamp_char_boundary(&current, self.cursor);
+        if pos == 0 {
+            self.cursor = 0;
             return;
         }
-        let current = self.input_text.to_string();
-        if let Some((idx, _)) = current[..self.cursor].char_indices().last() {
+        if let Some((idx, _)) = current[..pos].char_indices().last() {
             if selecting {
-                let anchor = self.selection.map(|(s, _)| s).unwrap_or(self.cursor);
+                let anchor = self
+                    .clamped_selection(&current)
+                    .map(|(s, _)| s)
+                    .unwrap_or(pos);
                 self.cursor = idx;
                 self.set_selection(anchor, self.cursor);
             } else {
@@ -122,13 +152,18 @@ impl SearchView {
 
     fn move_cursor_right(&mut self, selecting: bool) {
         let current = self.input_text.to_string();
-        if self.cursor >= current.len() {
+        let pos = Self::clamp_char_boundary(&current, self.cursor);
+        if pos >= current.len() {
+            self.cursor = current.len();
             return;
         }
-        if let Some((off, ch)) = current[self.cursor..].char_indices().next() {
-            let new_pos = self.cursor + off + ch.len_utf8();
+        if let Some((off, ch)) = current[pos..].char_indices().next() {
+            let new_pos = pos + off + ch.len_utf8();
             if selecting {
-                let anchor = self.selection.map(|(s, _)| s).unwrap_or(self.cursor);
+                let anchor = self
+                    .clamped_selection(&current)
+                    .map(|(s, _)| s)
+                    .unwrap_or(pos);
                 self.cursor = new_pos;
                 self.set_selection(anchor, self.cursor);
             } else {
@@ -140,7 +175,12 @@ impl SearchView {
 
     fn move_cursor_home(&mut self, selecting: bool) {
         if selecting {
-            let anchor = self.selection.map(|(s, _)| s).unwrap_or(self.cursor);
+            let current = self.input_text.to_string();
+            let pos = Self::clamp_char_boundary(&current, self.cursor);
+            let anchor = self
+                .clamped_selection(&current)
+                .map(|(s, _)| s)
+                .unwrap_or(pos);
             self.cursor = 0;
             self.set_selection(anchor, self.cursor);
         } else {
@@ -152,7 +192,12 @@ impl SearchView {
     fn move_cursor_end(&mut self, selecting: bool) {
         let end = self.input_text.len();
         if selecting {
-            let anchor = self.selection.map(|(s, _)| s).unwrap_or(self.cursor);
+            let current = self.input_text.to_string();
+            let pos = Self::clamp_char_boundary(&current, self.cursor);
+            let anchor = self
+                .clamped_selection(&current)
+                .map(|(s, _)| s)
+                .unwrap_or(pos);
             self.cursor = end;
             self.set_selection(anchor, self.cursor);
         } else {
@@ -162,16 +207,16 @@ impl SearchView {
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some((s, e)) = self.selection {
-            let current = self.input_text.to_string();
+        let current = self.input_text.to_string();
+        if let Some((s, e)) = self.clamped_selection(&current) {
             let clip = current[s..e].to_string();
             cx.write_to_clipboard(ClipboardItem::new_string(clip));
         }
     }
 
     fn cut_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some((s, e)) = self.selection {
-            let mut current = self.input_text.to_string();
+        let mut current = self.input_text.to_string();
+        if let Some((s, e)) = self.clamped_selection(&current) {
             cx.write_to_clipboard(ClipboardItem::new_string(current[s..e].to_string()));
             current.replace_range(s..e, "");
             self.input_text = current.into();
@@ -418,6 +463,25 @@ impl Render for SearchView {
                                     .text_color(colors.text_primary)
                                     .text_size(px(12.))
                                     .cursor_pointer()
+                                    .child("Service Health")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(Box::new(ToggleStatus), cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(colors.bg)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .text_color(colors.text_primary)
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
                                     .child("Help / Shortcuts")
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -573,8 +637,9 @@ impl Render for SearchView {
                                         .child("Search files by name or content...")
                                 } else {
                                     let text = self.input_text.to_string();
+                                    let cursor = Self::clamp_char_boundary(&text, self.cursor);
                                     let (sel_start, sel_end) =
-                                        self.selection.unwrap_or((self.cursor, self.cursor));
+                                        self.clamped_selection(&text).unwrap_or((cursor, cursor));
                                     let head = SharedString::from(text[..sel_start].to_string());
                                     let sel_str =
                                         SharedString::from(text[sel_start..sel_end].to_string());

@@ -27,7 +27,7 @@ pub struct AppConfig {
     pub scheduler: SchedulerSection,
     #[serde(default)]
     pub paths: PathsSection,
-    #[serde(default)]
+    #[serde(default, alias = "indexing")]
     pub extract: ExtractSection,
     #[serde(default)]
     pub semantic: SemanticSection,
@@ -217,6 +217,8 @@ pub struct FeaturesSection {
     pub mem_opt_tuning: bool,
     #[serde(default)]
     pub auto_tuning: bool,
+    #[serde(default)]
+    pub telemetry_opt_in: bool,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -232,6 +234,7 @@ impl Default for FeaturesSection {
             log_dataset_mode: false,
             mem_opt_tuning: false,
             auto_tuning: false,
+            telemetry_opt_in: false,
         }
     }
 }
@@ -495,70 +498,83 @@ fn apply_placeholders(cfg: &mut AppConfig) {
 }
 
 /// Simple environment variable expansion.
-/// Supports $VAR on all platforms and %VAR% on Windows.
+/// Supports `$VAR` (longest-match first) and `%VAR%` (case-insensitive) on all platforms.
 fn expand_env_vars(input: &str) -> String {
+    expand_env_vars_with(input, std::env::vars())
+}
+
+fn expand_env_vars_with<I>(input: &str, vars: I) -> String
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut env_pairs: Vec<(String, String)> = vars.into_iter().collect();
+    // Sort longest key first so `$FOO_BAR` is expanded before `$FOO`.
+    env_pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+
     let mut result = input.to_string();
 
     // 1. Unix-style $VAR
-    // We use a simple loop to find $VAR patterns.
-    // Note: This is a basic implementation. For robust shell expansion, a crate like `shellexpand` is better,
-    // but we want to minimize deps.
     if result.contains('$') {
-        for (key, value) in std::env::vars() {
+        for (key, value) in &env_pairs {
+            if key.is_empty() {
+                continue;
+            }
             let mut token = String::with_capacity(key.len() + 1);
             token.push('$');
-            token.push_str(&key);
+            token.push_str(key);
             if result.contains(&token) {
-                result = result.replace(&token, &value);
+                result = result.replace(&token, value);
             }
         }
     }
 
-    // 2. Windows-style %VAR%
-    #[cfg(windows)]
-    {
-        if result.contains('%') {
-            use std::collections::HashMap;
+    // 2. Windows-style %VAR% (enabled on all platforms for config portability)
+    if result.contains('%') {
+        use std::collections::HashMap;
 
-            // Build a case-insensitive map of env vars to avoid %PROGRAMDATA% mismatch.
-            let mut env_map: HashMap<String, String> = HashMap::new();
-            for (k, v) in std::env::vars() {
-                env_map.insert(k.to_ascii_uppercase(), v);
-            }
-
-            let mut out = String::with_capacity(result.len());
-            let mut chars = result.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch == '%' {
-                    let mut name = String::new();
-                    while let Some(&c) = chars.peek() {
-                        chars.next();
-                        if c == '%' {
-                            break;
-                        }
-                        name.push(c);
-                    }
-
-                    if name.is_empty() {
-                        out.push('%');
-                        continue;
-                    }
-
-                    let key = name.to_ascii_uppercase();
-                    if let Some(val) = env_map.get(&key) {
-                        out.push_str(val);
-                    } else {
-                        // Unknown token; preserve original text.
-                        out.push('%');
-                        out.push_str(&name);
-                        out.push('%');
-                    }
-                } else {
-                    out.push(ch);
-                }
-            }
-            result = out;
+        let mut env_map: HashMap<String, String> = HashMap::with_capacity(env_pairs.len());
+        for (k, v) in env_pairs {
+            env_map.insert(k.to_ascii_uppercase(), v);
         }
+
+        let mut out = String::with_capacity(result.len());
+        let mut chars = result.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                let mut name = String::new();
+                let mut closed = false;
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '%' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c);
+                }
+
+                if !closed {
+                    out.push('%');
+                    out.push_str(&name);
+                    continue;
+                }
+                if name.is_empty() {
+                    out.push('%');
+                    continue;
+                }
+
+                let key = name.to_ascii_uppercase();
+                if let Some(val) = env_map.get(&key) {
+                    out.push_str(val);
+                } else {
+                    out.push('%');
+                    out.push_str(&name);
+                    out.push('%');
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        result = out;
     }
 
     result
@@ -688,5 +704,27 @@ mod tests {
         "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.extract.max_chars_per_file, 12_345);
+    }
+
+    #[test]
+    fn indexing_section_alias_and_env_var_expansion_work_deterministically() {
+        let toml_str = r#"
+            [indexing]
+            max_bytes_per_file = 4194304
+            ocr_enabled = true
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.extract.max_bytes_per_file, 4_194_304);
+        assert!(cfg.extract.ocr_enabled);
+
+        let expanded = expand_env_vars_with(
+            "$HOME_CUSTOM/sub/%PROGRAMDATA%/end",
+            vec![
+                ("HOME".to_string(), "/short".to_string()),
+                ("HOME_CUSTOM".to_string(), "/longer/root".to_string()),
+                ("ProgramData".to_string(), "C:/ProgramData".to_string()),
+            ],
+        );
+        assert_eq!(expanded, "/longer/root/sub/C:/ProgramData/end");
     }
 }

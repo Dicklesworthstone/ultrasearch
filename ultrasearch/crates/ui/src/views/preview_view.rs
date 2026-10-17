@@ -2,20 +2,52 @@ use crate::model::state::SearchAppModel;
 use crate::theme;
 use gpui::prelude::*;
 use gpui::{InteractiveElement, UniformListScrollHandle, *};
+use std::io::Read;
 use std::process::Command;
+
+const MAX_LOCAL_PREVIEW_BYTES: usize = 8 * 1024;
+
+fn read_bounded_text_preview(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(1024);
+    file.take(MAX_LOCAL_PREVIEW_BYTES as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() || buf.contains(&0) {
+        return None;
+    }
+    let text = match std::str::from_utf8(&buf) {
+        Ok(valid) => valid.to_owned(),
+        Err(err) if err.error_len().is_none() && err.valid_up_to() > 0 => {
+            // Truncated mid-codepoint at the 8 KiB boundary.
+            String::from_utf8_lossy(&buf[..err.valid_up_to()]).into_owned()
+        }
+        Err(_) => return None,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
 
 pub struct PreviewView {
     model: Entity<SearchAppModel>,
     snippet_scroll: UniformListScrollHandle,
     last_item_id: Option<String>,
+    cached_file_preview: Option<String>,
 }
 
 impl PreviewView {
     pub fn new(model: Entity<SearchAppModel>, cx: &mut Context<PreviewView>) -> Self {
         cx.observe(&model, |this: &mut PreviewView, model, cx| {
-            let selected_path = model
-                .read(cx)
-                .selected_row()
+            let selected_row = model.read(cx).selected_row().cloned();
+            let selected_path = selected_row
+                .as_ref()
                 .and_then(|hit| hit.path.clone())
                 .unwrap_or_default();
             if this
@@ -25,6 +57,15 @@ impl PreviewView {
                 .unwrap_or(true)
             {
                 this.snippet_scroll = UniformListScrollHandle::new();
+                this.cached_file_preview = if selected_row
+                    .as_ref()
+                    .and_then(|h| h.snippet.as_ref())
+                    .is_none()
+                {
+                    read_bounded_text_preview(&selected_path)
+                } else {
+                    None
+                };
                 this.last_item_id = Some(selected_path);
                 cx.notify();
             }
@@ -34,6 +75,7 @@ impl PreviewView {
             model,
             snippet_scroll: UniformListScrollHandle::new(),
             last_item_id: None,
+            cached_file_preview: None,
         }
     }
 
@@ -97,7 +139,10 @@ impl PreviewView {
 
     fn format_modified_time(timestamp: i64) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let datetime = UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64);
+        let Ok(secs) = u64::try_from(timestamp) else {
+            return "Unknown".to_string();
+        };
+        let datetime = UNIX_EPOCH + std::time::Duration::from_secs(secs);
 
         if let Ok(duration) = SystemTime::now().duration_since(datetime) {
             let days = duration.as_secs() / 86400;
@@ -280,7 +325,11 @@ impl Render for PreviewView {
                         .child(self.render_info_row("Match Score", score, "⭐", cx)),
                 );
 
-            if let Some(snippet) = hit.snippet.clone() {
+            if let Some(snippet) = hit
+                .snippet
+                .clone()
+                .or_else(|| self.cached_file_preview.clone())
+            {
                 content = content.child(
                     div()
                         .flex()

@@ -17,6 +17,7 @@ use ui::views::preview_view::PreviewView;
 use ui::views::quick_search::QuickBarView;
 use ui::views::results_table::ResultsView;
 use ui::views::search_view::SearchView;
+use ui::views::status_view::StatusView;
 use ui::views::update_panel::UpdatePanel;
 
 use ui::actions::*;
@@ -30,6 +31,7 @@ struct UltraSearchWindow {
     onboarding_view: Entity<OnboardingView>,
     update_panel: Entity<UpdatePanel>,
     help_panel: Entity<HelpPanel>,
+    status_view: Entity<StatusView>,
     focus_handle: FocusHandle,
 }
 
@@ -48,6 +50,7 @@ impl UltraSearchWindow {
         let onboarding_view = cx.new(|cx| OnboardingView::new(model.clone(), cx));
         let update_panel = cx.new(|cx| UpdatePanel::new(model.clone(), cx));
         let help_panel = cx.new(HelpPanel::new);
+        let status_view = cx.new(|cx| StatusView::new(model.clone(), cx));
 
         let focus_handle = cx.focus_handle();
 
@@ -59,6 +62,7 @@ impl UltraSearchWindow {
             onboarding_view,
             update_panel,
             help_panel,
+            status_view,
             focus_handle,
         }
     }
@@ -135,6 +139,20 @@ impl UltraSearchWindow {
     ) {
         self.model.update(cx, |model, cx| {
             model.show_shortcuts = false;
+            cx.notify();
+        });
+    }
+
+    fn on_toggle_status(&mut self, _: &ToggleStatus, _window: &mut Window, cx: &mut Context<Self>) {
+        self.model.update(cx, |model, cx| {
+            model.show_status = !model.show_status;
+            cx.notify();
+        });
+    }
+
+    fn on_close_status(&mut self, _: &CloseStatus, _window: &mut Window, cx: &mut Context<Self>) {
+        self.model.update(cx, |model, cx| {
+            model.show_status = false;
             cx.notify();
         });
     }
@@ -307,6 +325,8 @@ impl UltraSearchWindow {
                 })
                 .detach();
             }
+            #[cfg(not(target_os = "windows"))]
+            let _ = &path;
         }
     }
 
@@ -368,6 +388,7 @@ impl Render for UltraSearchWindow {
         let show_onboarding = read.show_onboarding;
         let conflict = read.hotkey_conflict.clone();
         let show_shortcuts = read.show_shortcuts;
+        let show_status = read.show_status;
 
         div()
             .track_focus(&self.focus_handle)
@@ -395,6 +416,8 @@ impl Render for UltraSearchWindow {
             .on_action(cx.listener(Self::on_hotkey_conflict_powertoys))
             .on_action(cx.listener(Self::on_toggle_shortcuts))
             .on_action(cx.listener(Self::on_close_shortcuts))
+            .on_action(cx.listener(Self::on_toggle_status))
+            .on_action(cx.listener(Self::on_close_status))
             .size_full()
             .flex()
             .flex_col()
@@ -465,6 +488,18 @@ impl Render for UltraSearchWindow {
                         .size_full()
                         .bg(hsla(0.0, 0.0, 0.0, 0.5)) // Dim background
                         .child(self.onboarding_view.clone()),
+                )
+            })
+            // Service Health Status Overlay
+            .when(show_status, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(hsla(0.0, 0.0, 0.0, 0.5))
+                        .child(self.status_view.clone()),
                 )
             })
             // Shortcut overlay

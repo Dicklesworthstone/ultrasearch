@@ -219,19 +219,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             ticker.tick().await;
         }
         work_remaining = false;
-        let current = core_types::config::get_current_config();
-        // Changing index destinations requires a service restart, since readers
-        // and the dispatcher already own the original paths.
-        ensure!(
-            current.paths.meta_index == cfg.paths.meta_index
-                && current.paths.content_index == cfg.paths.content_index
-                && current.paths.state_dir == cfg.paths.state_dir
-                && current.paths.jobs_dir == cfg.paths.jobs_dir
-                && current.logging.file == cfg.logging.file
-                && current.semantic.index_dir == cfg.semantic.index_dir,
-            "runtime output paths changed; restart the service to apply them"
-        );
-        cfg = current;
+        cfg = adopt_runtime_config(&cfg, core_types::config::get_current_config());
         let requested = RESCAN_GENERATION.load(Ordering::Relaxed);
         if requested != generation {
             scans.clear();
@@ -1474,11 +1462,40 @@ fn reader_config(cfg: &AppConfig, retired_indices: &[String]) -> Result<ReaderCo
         );
         exclude_paths.push(canonical);
     }
+    let (chunk_size, max_records_per_tick) = usn_reader_limits(cfg);
     Ok(ReaderConfig {
-        chunk_size: 256 * 1024,
-        max_records_per_tick: BATCH_LIMIT,
+        chunk_size,
+        max_records_per_tick,
         exclude_paths,
     })
+}
+
+fn usn_reader_limits(cfg: &AppConfig) -> (usize, usize) {
+    let chunk_size = usize::try_from(cfg.scheduler.usn_chunk_bytes)
+        .unwrap_or(256 * 1024)
+        .clamp(64 * 1024, 16 * 1024 * 1024);
+    let max_records_per_tick = usize::try_from(cfg.scheduler.max_records_per_tick)
+        .unwrap_or(BATCH_LIMIT)
+        .clamp(1, BATCH_LIMIT);
+    (chunk_size, max_records_per_tick)
+}
+
+fn adopt_runtime_config(active: &AppConfig, mut candidate: AppConfig) -> AppConfig {
+    if candidate.paths.meta_index != active.paths.meta_index
+        || candidate.paths.content_index != active.paths.content_index
+        || candidate.paths.state_dir != active.paths.state_dir
+        || candidate.paths.jobs_dir != active.paths.jobs_dir
+        || candidate.logging.file != active.logging.file
+        || candidate.semantic.index_dir != active.semantic.index_dir
+    {
+        tracing::warn!(
+            "runtime output paths changed in reloaded config; preserving active session paths until service restart"
+        );
+        candidate.paths = active.paths.clone();
+        candidate.logging.file = active.logging.file.clone();
+        candidate.semantic.index_dir = active.semantic.index_dir.clone();
+    }
+    candidate
 }
 
 async fn commit_pending(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
@@ -4884,6 +4901,37 @@ mod tests {
             )?
             .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scanner_honors_scheduler_usn_limits_and_preserves_active_paths_on_reload() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut cfg = config(root.path());
+        cfg.scheduler.usn_chunk_bytes = 512 * 1024;
+        cfg.scheduler.max_records_per_tick = 256;
+        assert_eq!(usn_reader_limits(&cfg), (512 * 1024, 256));
+
+        // Values above BATCH_LIMIT must be clamped so event_changes never rejects a tick.
+        cfg.scheduler.usn_chunk_bytes = 1024;
+        cfg.scheduler.max_records_per_tick = 100_000;
+        assert_eq!(usn_reader_limits(&cfg), (64 * 1024, BATCH_LIMIT));
+
+        let mut candidate = cfg.clone();
+        candidate.paths.meta_index = "/new/meta".into();
+        candidate.paths.content_index = "/new/content".into();
+        candidate.logging.file = "/new/searchd.log".into();
+        candidate.semantic.index_dir = "/new/semantic".into();
+        candidate.scheduler.max_records_per_tick = 320;
+        candidate.extract.max_bytes_per_file = 123_456;
+
+        let adopted = adopt_runtime_config(&cfg, candidate);
+        assert_eq!(adopted.paths.meta_index, cfg.paths.meta_index);
+        assert_eq!(adopted.paths.content_index, cfg.paths.content_index);
+        assert_eq!(adopted.logging.file, cfg.logging.file);
+        assert_eq!(adopted.semantic.index_dir, cfg.semantic.index_dir);
+        assert_eq!(adopted.scheduler.max_records_per_tick, 320);
+        assert_eq!(adopted.extract.max_bytes_per_file, 123_456);
         Ok(())
     }
 }

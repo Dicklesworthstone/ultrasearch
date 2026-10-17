@@ -1,3 +1,4 @@
+use crate::planner::QueryPlanner;
 use crate::scanner::{Visibility, read_visibility};
 use anyhow::{Context, Result, bail, ensure};
 use content_index::{ContentIndex, open_or_create as open_content};
@@ -17,10 +18,11 @@ use std::time::Instant;
 use tantivy::collector::{Count, ScoreSegmentTweaker, ScoreTweaker, TopDocs};
 use tantivy::columnar::StrColumn;
 use tantivy::query::{
-    BooleanQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery,
-    TermQuery,
+    AllQuery, BooleanQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
+    QueryParserError, RangeQuery, TermQuery,
 };
 use tantivy::schema::{Document, Field, IndexRecordOption, TantivyDocument, Value};
+use tantivy::snippet::SnippetGenerator;
 use tantivy::{DocAddress, DocId, IndexReader, Score, Searcher, SegmentReader, Term};
 use tracing::warn;
 
@@ -29,6 +31,7 @@ use tracing::warn;
 // exact total and explicitly report truncation; callers can narrow the query.
 const MAX_SEARCH_WINDOW: usize = 10_000;
 const MAX_SEARCH_PAGE: usize = 1_000;
+const MAX_SNIPPET_CHARS: usize = 200;
 
 struct SearchWindow {
     offset: usize,
@@ -130,16 +133,11 @@ fn ranked_documents(
     Ok(found)
 }
 
-#[derive(Clone, Copy)]
-enum HitSource {
-    Metadata(DocAddress),
-    Content(DocAddress),
-}
-
 struct RankedHit {
     key: DocKey,
     score: Score,
-    source: HitSource,
+    meta_address: Option<DocAddress>,
+    content_address: Option<DocAddress>,
 }
 
 /// Trait for handling search requests.
@@ -216,48 +214,135 @@ impl UnifiedSearchHandler {
         })
     }
 
+    #[allow(dead_code)]
     fn build_meta_query(&self, expr: &QueryExpr) -> Result<Box<dyn Query>> {
-        self.build_query(expr, &self.meta.fields, &self.meta.index)
+        let optimized = QueryPlanner::optimize(expr.clone());
+        Ok(self
+            .build_meta_query_opt(&optimized)?
+            .unwrap_or_else(|| Box::new(EmptyQuery)))
     }
 
-    fn build_query(
-        &self,
-        expr: &QueryExpr,
-        fields: &MetaFields,
-        index: &tantivy::Index,
-    ) -> Result<Box<dyn Query>> {
+    fn build_meta_query_opt(&self, expr: &QueryExpr) -> Result<Option<Box<dyn Query>>> {
+        let fields = &self.meta.fields;
+        let index = &self.meta.index;
         Ok(match expr {
-            QueryExpr::Term(t) => self.term_query(t, fields, index)?,
-            QueryExpr::Range(range) => range_query(range, index)?,
-            QueryExpr::Not(inner) => Box::new(BooleanQuery::new(vec![(
-                Occur::MustNot,
-                self.build_query(inner, fields, index)?,
-            )])),
-            QueryExpr::And(items) => Box::new(BooleanQuery::new(
-                items
-                    .iter()
-                    .map(|q| Ok((Occur::Must, self.build_query(q, fields, index)?)))
-                    .collect::<Result<Vec<_>>>()?,
-            )),
-            QueryExpr::Or(items) => Box::new(BooleanQuery::new(
-                items
-                    .iter()
-                    .map(|q| Ok((Occur::Should, self.build_query(q, fields, index)?)))
-                    .collect::<Result<Vec<_>>>()?,
-            )),
+            QueryExpr::Term(t) => self.term_query_meta(t, fields, index, false)?,
+            QueryExpr::Range(range) => Some(range_query(range, index)?),
+            QueryExpr::Not(inner) => match inner.as_ref() {
+                QueryExpr::Term(t) => self
+                    .term_query_meta(t, fields, index, true)?
+                    .map(complement_query),
+                QueryExpr::Range(range) => Some(complement_query(range_query(range, index)?)),
+                other => self.build_meta_query_opt(other)?.map(complement_query),
+            },
+            QueryExpr::And(items) => {
+                if items.is_empty() {
+                    return Ok(None);
+                }
+                let mut clauses = Vec::with_capacity(items.len() + 1);
+                let mut has_positive = false;
+                let mut unrepresentable = false;
+                for item in items {
+                    if let QueryExpr::Not(neg_inner) = item {
+                        let sub = match neg_inner.as_ref() {
+                            QueryExpr::Term(t) => self.term_query_meta(t, fields, index, true)?,
+                            QueryExpr::Range(range) => Some(range_query(range, index)?),
+                            other => self.build_meta_query_opt(other)?,
+                        };
+                        if let Some(q) = sub {
+                            clauses.push((Occur::MustNot, q));
+                        } else {
+                            unrepresentable = true;
+                        }
+                    } else if let Some(q) = self.build_meta_query_opt(item)? {
+                        clauses.push((Occur::Must, q));
+                        has_positive = true;
+                    } else {
+                        unrepresentable = true;
+                    }
+                }
+                if unrepresentable {
+                    return Ok(None);
+                }
+                if !has_positive {
+                    clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
+                }
+                Some(Box::new(BooleanQuery::new(clauses)))
+            }
+            QueryExpr::Or(items) => {
+                if items.is_empty() {
+                    return Ok(None);
+                }
+                let mut clauses = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(q) = self.build_meta_query_opt(item)? {
+                        clauses.push((Occur::Should, q));
+                    }
+                }
+                if clauses.is_empty() {
+                    None
+                } else {
+                    Some(Box::new(BooleanQuery::new(clauses)))
+                }
+            }
         })
     }
 
-    fn term_query(
+    fn validate_raw_against_content_schema(&self, value: &str) -> Result<()> {
+        if let Some((content_idx, _)) = &self.content {
+            let default_fields = vec![
+                content_idx.fields.name,
+                content_idx.fields.path,
+                content_idx.fields.content,
+            ];
+            let mut parser = QueryParser::for_index(&content_idx.index, default_fields);
+            parser.set_conjunction_by_default();
+            parse_raw_query_allowing_pure_negation(&parser, value)?;
+        }
+        Ok(())
+    }
+
+    fn term_query_meta(
         &self,
         term: &TermExpr,
         fields: &MetaFields,
         index: &tantivy::Index,
-    ) -> Result<Box<dyn Query>> {
+        negated: bool,
+    ) -> Result<Option<Box<dyn Query>>> {
         validate_term_modifier(term.modifier)?;
         let value = term.value.trim();
         if value.is_empty() {
-            return Ok(Box::new(BooleanQuery::new(vec![])));
+            return Ok(None);
+        }
+
+        match term.field {
+            Some(
+                FieldKind::Size
+                | FieldKind::Modified
+                | FieldKind::Created
+                | FieldKind::Flags
+                | FieldKind::Volume,
+            ) => {
+                bail!("numeric metadata fields require a range query");
+            }
+            Some(FieldKind::Content) => {
+                if term.modifier == TermModifier::Term {
+                    self.validate_raw_against_content_schema(value)?;
+                }
+                return Ok(None);
+            }
+            Some(FieldKind::Kind) => {
+                return Ok(Some(kind_query(index, fields.ext, value, term.modifier)?));
+            }
+            None if negated => {
+                // Negating an unfielded term requires verifying `NOT content:...`,
+                // which the metadata index cannot evaluate on its own.
+                if term.modifier == TermModifier::Term {
+                    self.validate_raw_against_content_schema(value)?;
+                }
+                return Ok(None);
+            }
+            _ => {}
         }
 
         let target_fields: Vec<FieldKind> = match term.field {
@@ -292,17 +377,47 @@ impl UnifiedSearchHandler {
                         ));
                     }
                     TermModifier::Term => {
-                        let mut parser = QueryParser::for_index(
-                            index,
-                            vec![if matches!(field, FieldKind::Name) {
-                                fields.name
-                            } else {
-                                fields.path
-                            }],
-                        );
+                        let pf = if matches!(field, FieldKind::Name) {
+                            fields.name
+                        } else {
+                            fields.path
+                        };
+                        let mut parser = QueryParser::for_index(index, vec![pf]);
                         parser.set_conjunction_by_default();
-                        if let Ok(q) = parser.parse_query(value) {
-                            clauses.push((Occur::Should, q));
+                        match parse_raw_query_allowing_pure_negation(&parser, value) {
+                            Ok((q, pure_neg)) => {
+                                if (pure_neg || has_must_not_clause(q.as_ref()))
+                                    && term.field.is_none()
+                                {
+                                    // Unfielded raw negation (`-needle` / `NOT needle`) requires
+                                    // checking `content`, which the metadata index lacks.
+                                    let mut explicit_only = QueryParser::for_index(index, vec![]);
+                                    explicit_only.set_conjunction_by_default();
+                                    if matches!(
+                                        parse_raw_query_allowing_pure_negation(
+                                            &explicit_only,
+                                            value
+                                        ),
+                                        Err(QueryParserError::NoDefaultFieldDeclared)
+                                    ) {
+                                        self.validate_raw_against_content_schema(value)?;
+                                        return Ok(None);
+                                    }
+                                }
+                                let occur = if pure_neg && term.field.is_none() {
+                                    Occur::Must
+                                } else {
+                                    Occur::Should
+                                };
+                                clauses.push((occur, q));
+                            }
+                            Err(QueryParserError::FieldDoesNotExist(missing))
+                                if missing == "content" || missing == "content_lang" =>
+                            {
+                                self.validate_raw_against_content_schema(value)?;
+                                return Ok(None);
+                            }
+                            Err(err) => return Err(err.into()),
                         }
                     }
                 },
@@ -310,41 +425,84 @@ impl UnifiedSearchHandler {
             }
         }
 
-        Ok(Box::new(BooleanQuery::new(clauses)))
+        if clauses.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        }
     }
 
-    fn build_content_query(&self, expr: &QueryExpr) -> Result<Box<dyn Query>> {
-        if let Some((idx, _)) = &self.content {
-            // For content query, default fields might include content + name/path
-            // We can map QueryExpr fields to ContentFields
-            // This requires a specialized build_query or mapping logic.
-            // For simplicity, we reuse build_query but we need to map MetaFields-like structure or make build_query generic.
-            // Since MetaFields and ContentFields are different structs, we can't pass them easily unless we have a trait or adapter.
-            // But term_query matches on FieldKind. We can just reimplement term_query for ContentFields.
+    fn build_content_query_opt(&self, expr: &QueryExpr) -> Result<Option<Box<dyn Query>>> {
+        let (idx, _) = self
+            .content
+            .as_ref()
+            .context("content index not available")?;
+        let fields = &idx.fields;
+        let index = &idx.index;
 
-            Ok(match expr {
-                QueryExpr::Term(t) => self.term_query_content(t, &idx.fields, &idx.index)?,
-                QueryExpr::Range(range) => range_query(range, &idx.index)?,
-                QueryExpr::Not(inner) => Box::new(BooleanQuery::new(vec![(
-                    Occur::MustNot,
-                    self.build_content_query(inner)?,
-                )])),
-                QueryExpr::And(items) => Box::new(BooleanQuery::new(
-                    items
-                        .iter()
-                        .map(|q| Ok((Occur::Must, self.build_content_query(q)?)))
-                        .collect::<Result<Vec<_>>>()?,
-                )),
-                QueryExpr::Or(items) => Box::new(BooleanQuery::new(
-                    items
-                        .iter()
-                        .map(|q| Ok((Occur::Should, self.build_content_query(q)?)))
-                        .collect::<Result<Vec<_>>>()?,
-                )),
-            })
-        } else {
-            Err(anyhow::anyhow!("content index not available"))
-        }
+        Ok(match expr {
+            QueryExpr::Term(t) => self.term_query_content(t, fields, index, false)?,
+            QueryExpr::Range(range) => Some(range_query(range, index)?),
+            QueryExpr::Not(inner) => match inner.as_ref() {
+                QueryExpr::Term(t) => self
+                    .term_query_content(t, fields, index, true)?
+                    .map(complement_query),
+                QueryExpr::Range(range) => Some(complement_query(range_query(range, index)?)),
+                other => self.build_content_query_opt(other)?.map(complement_query),
+            },
+            QueryExpr::And(items) => {
+                if items.is_empty() {
+                    return Ok(None);
+                }
+                let mut clauses = Vec::with_capacity(items.len() + 1);
+                let mut has_positive = false;
+                let mut unrepresentable = false;
+                for item in items {
+                    if let QueryExpr::Not(neg_inner) = item {
+                        let sub = match neg_inner.as_ref() {
+                            QueryExpr::Term(t) => {
+                                self.term_query_content(t, fields, index, true)?
+                            }
+                            QueryExpr::Range(range) => Some(range_query(range, index)?),
+                            other => self.build_content_query_opt(other)?,
+                        };
+                        if let Some(q) = sub {
+                            clauses.push((Occur::MustNot, q));
+                        } else {
+                            unrepresentable = true;
+                        }
+                    } else if let Some(q) = self.build_content_query_opt(item)? {
+                        clauses.push((Occur::Must, q));
+                        has_positive = true;
+                    } else {
+                        unrepresentable = true;
+                    }
+                }
+                if unrepresentable {
+                    return Ok(None);
+                }
+                if !has_positive {
+                    clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
+                }
+                Some(Box::new(BooleanQuery::new(clauses)))
+            }
+            QueryExpr::Or(items) => {
+                if items.is_empty() {
+                    return Ok(None);
+                }
+                let mut clauses = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(q) = self.build_content_query_opt(item)? {
+                        clauses.push((Occur::Should, q));
+                    }
+                }
+                if clauses.is_empty() {
+                    None
+                } else {
+                    Some(Box::new(BooleanQuery::new(clauses)))
+                }
+            }
+        })
     }
 
     fn term_query_content(
@@ -352,27 +510,55 @@ impl UnifiedSearchHandler {
         term: &TermExpr,
         fields: &content_index::ContentFields,
         index: &tantivy::Index,
-    ) -> Result<Box<dyn Query>> {
+        negated: bool,
+    ) -> Result<Option<Box<dyn Query>>> {
         validate_term_modifier(term.modifier)?;
         let value = term.value.trim();
         if value.is_empty() {
-            return Ok(Box::new(BooleanQuery::new(vec![])));
+            return Ok(None);
+        }
+
+        match term.field {
+            Some(
+                FieldKind::Size
+                | FieldKind::Modified
+                | FieldKind::Created
+                | FieldKind::Flags
+                | FieldKind::Volume,
+            ) => {
+                bail!("numeric metadata fields require a range query");
+            }
+            Some(FieldKind::Kind) => {
+                return Ok(Some(kind_query(index, fields.ext, value, term.modifier)?));
+            }
+            _ => {}
         }
 
         let target_fields: Vec<FieldKind> = match term.field {
             Some(f) => vec![f],
-            None => vec![FieldKind::Name, FieldKind::Content], // Default to Name + Content
+            None if negated => vec![FieldKind::Name, FieldKind::Path, FieldKind::Content],
+            None => vec![FieldKind::Name, FieldKind::Content],
         };
 
         let mut clauses = Vec::new();
         for field in target_fields {
-            // Map FieldKind to tantivy::schema::Field in ContentFields
+            if matches!(field, FieldKind::Ext) {
+                let query = if term.modifier == TermModifier::Term {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(fields.ext, value),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>
+                } else {
+                    modified_text_query(index, fields.ext, value, term.modifier)?
+                };
+                clauses.push((Occur::Should, query));
+                continue;
+            }
+
             let t_field = match field {
                 FieldKind::Name => Some(fields.name),
                 FieldKind::Path => Some(fields.path),
-                FieldKind::Ext => Some(fields.ext),
                 FieldKind::Content => Some(fields.content),
-                // Other fields like size/modified handled in ranges or ignored for text search
                 _ => None,
             };
 
@@ -385,16 +571,29 @@ impl UnifiedSearchHandler {
                         ));
                     }
                     TermModifier::Term => {
+                        if term.field.is_none() {
+                            let default_fields = vec![fields.name, fields.path, fields.content];
+                            let mut multi_parser = QueryParser::for_index(index, default_fields);
+                            multi_parser.set_conjunction_by_default();
+                            let (mq, pure_neg) =
+                                parse_raw_query_allowing_pure_negation(&multi_parser, value)?;
+                            if pure_neg || has_must_not_clause(mq.as_ref()) {
+                                return Ok(Some(mq));
+                            }
+                        }
                         let mut parser = QueryParser::for_index(index, vec![tf]);
                         parser.set_conjunction_by_default();
-                        if let Ok(q) = parser.parse_query(value) {
-                            clauses.push((Occur::Should, q));
-                        }
+                        let (q, _) = parse_raw_query_allowing_pure_negation(&parser, value)?;
+                        clauses.push((Occur::Should, q));
                     }
                 }
             }
         }
-        Ok(Box::new(BooleanQuery::new(clauses)))
+        if clauses.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        }
     }
 
     fn search_visible(
@@ -404,17 +603,19 @@ impl UnifiedSearchHandler {
     ) -> Result<SearchResponse> {
         let start = Instant::now();
         let window = SearchWindow::for_request(req);
+        let optimized_expr = QueryPlanner::optimize(req.query.clone());
         // Freeze each reader once for ranking, counting, and stored-field reads.
         // The caller holds the visibility guard through this whole operation.
         let meta_searcher = self.meta_reader.searcher();
         let content_searcher = self.content.as_ref().map(|(_, reader)| reader.searcher());
         let mut ranked = HashMap::<DocKey, RankedHit>::new();
         let mut total = 0u64;
-        let mut metadata_predicate = None;
 
-        if req.mode != SearchMode::Content {
-            let query = self.build_meta_query(&req.query)?;
-            metadata_predicate = Some(query.box_clone());
+        let meta_plan = if req.mode != SearchMode::Content {
+            let query = self
+                .build_meta_query_opt(&optimized_expr)?
+                .unwrap_or_else(|| Box::new(EmptyQuery));
+            let predicate = query.box_clone();
             let visible = visible_query(
                 query,
                 self.meta.fields.doc_key,
@@ -422,36 +623,36 @@ impl UnifiedSearchHandler {
                 self.meta.fields.path_exact,
                 visibility,
             )?;
-            let (documents, count) =
-                ranked_documents(&meta_searcher, visible.as_ref(), window.candidates)?;
-            total = count as u64;
-            for ((score, Reverse(key)), address) in documents {
-                ranked.insert(
-                    key,
-                    RankedHit {
-                        key,
-                        score,
-                        source: HitSource::Metadata(address),
-                    },
-                );
-            }
-        }
+            Some((visible, predicate))
+        } else {
+            None
+        };
 
-        if req.mode != SearchMode::NameOnly {
+        let content_plan = if req.mode != SearchMode::NameOnly {
             let (content, _) = self
                 .content
                 .as_ref()
                 .context("content index is unavailable")?;
-            let searcher = content_searcher
+            let query = self
+                .build_content_query_opt(&optimized_expr)?
+                .unwrap_or_else(|| Box::new(EmptyQuery));
+            let snippet_query = query.box_clone();
+            let additions = meta_plan
                 .as_ref()
-                .context("content reader is unavailable")?;
-            let query = self.build_content_query(&req.query)?;
-            let additions = metadata_predicate.map(|metadata| {
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, query.box_clone()),
-                    (Occur::MustNot, metadata),
-                ])) as Box<dyn Query>
-            });
+                .map(|(_, metadata)| {
+                    let overlap = Box::new(BooleanQuery::new(vec![
+                        (Occur::Must, query.box_clone()),
+                        (Occur::MustNot, metadata.box_clone()),
+                    ])) as Box<dyn Query>;
+                    visible_query(
+                        overlap,
+                        content.fields.doc_key,
+                        content.fields.volume,
+                        content.fields.path_exact,
+                        visibility,
+                    )
+                })
+                .transpose()?;
             let visible = visible_query(
                 query,
                 content.fields.doc_key,
@@ -459,38 +660,106 @@ impl UnifiedSearchHandler {
                 content.fields.path_exact,
                 visibility,
             )?;
-            let (documents, count) =
-                ranked_documents(searcher, visible.as_ref(), window.candidates)?;
-            if let Some(additions) = additions {
-                // Published content rows have the same metadata as their one
-                // same-key metadata row: apply_metadata copies the committed
-                // worker snapshot or removes both rows, and pending mutations
-                // are masked. Shared field IDs/options were verified on open.
-                // Thus |M union C| = |M| + |C and not M| without collecting an
-                // unbounded set of document identities. Scores do not affect
-                // membership in this cloned metadata predicate.
-                let additions = visible_query(
-                    additions,
-                    content.fields.doc_key,
-                    content.fields.volume,
-                    content.fields.path_exact,
-                    visibility,
-                )?;
-                total += searcher.search(additions.as_ref(), &Count)? as u64;
+            Some((visible, additions, snippet_query))
+        } else {
+            None
+        };
+
+        let (meta_outcome, content_outcome) = std::thread::scope(|scope| -> Result<_> {
+            let meta_handle = meta_plan.as_ref().map(|(visible, _)| {
+                let searcher = &meta_searcher;
+                let candidates = window.candidates;
+                scope.spawn(move || ranked_documents(searcher, visible.as_ref(), candidates))
+            });
+
+            let content_res: Result<_> = if let Some((visible, additions, _)) = &content_plan {
+                let searcher = content_searcher
+                    .as_ref()
+                    .context("content reader is unavailable")?;
+                let (documents, count) =
+                    ranked_documents(searcher, visible.as_ref(), window.candidates)?;
+                let added_count = if let Some(additions) = additions {
+                    // Published content rows have the same metadata as their one
+                    // same-key metadata row: apply_metadata copies the committed
+                    // worker snapshot or removes both rows, and pending mutations
+                    // are masked. Shared field IDs/options were verified on open.
+                    // Thus |M union C| = |M| + |C and not M| without collecting an
+                    // unbounded set of document identities. Scores do not affect
+                    // membership in this cloned metadata predicate.
+                    searcher.search(additions.as_ref(), &Count)? as u64
+                } else {
+                    count as u64
+                };
+                Ok(Some((documents, added_count)))
             } else {
-                total = count as u64;
+                Ok(None)
+            };
+
+            let meta_res =
+                match meta_handle {
+                    Some(handle) => Some(handle.join().map_err(|_| {
+                        anyhow::anyhow!("metadata search worker thread panicked")
+                    })??),
+                    None => None,
+                };
+
+            Ok::<_, anyhow::Error>((meta_res, content_res?))
+        })?;
+
+        if let Some((documents, count)) = meta_outcome {
+            total = count as u64;
+            for ((score, Reverse(key)), address) in documents {
+                ranked.insert(
+                    key,
+                    RankedHit {
+                        key,
+                        score,
+                        meta_address: Some(address),
+                        content_address: None,
+                    },
+                );
+            }
+        }
+
+        if let Some((documents, added_count)) = content_outcome {
+            if meta_plan.is_some() {
+                total += added_count;
+            } else {
+                total = added_count;
             }
             for ((score, Reverse(key)), address) in documents {
                 ranked
                     .entry(key)
-                    .and_modify(|hit| hit.score = hit.score.max(score))
+                    .and_modify(|hit| {
+                        hit.score = hit.score.max(score);
+                        hit.content_address = Some(address);
+                    })
                     .or_insert(RankedHit {
                         key,
                         score,
-                        source: HitSource::Content(address),
+                        meta_address: None,
+                        content_address: Some(address),
                     });
             }
         }
+
+        let snippet_generator =
+            if let (Some((content, _)), Some(searcher), Some((_, _, snippet_query))) =
+                (&self.content, &content_searcher, &content_plan)
+            {
+                let mut snippet_gen = SnippetGenerator::create(
+                    searcher,
+                    snippet_query.as_ref(),
+                    content.fields.content,
+                )
+                .ok();
+                if let Some(ref mut g) = snippet_gen {
+                    g.set_max_num_chars(MAX_SNIPPET_CHARS);
+                }
+                snippet_gen
+            } else {
+                None
+            };
 
         // With max-score merging, a union top-k hit must occur in at least one
         // source's top-k: that source's k preceding distinct keys would
@@ -508,28 +777,44 @@ impl UnifiedSearchHandler {
             .skip(window.offset)
             .take(window.limit)
             .map(|hit| {
-                let loaded = match hit.source {
-                    HitSource::Metadata(address) => to_hit(
+                let mut loaded = if let Some(address) = hit.meta_address {
+                    to_hit(
                         &meta_searcher.doc::<TantivyDocument>(address)?,
                         &self.meta.fields,
                         hit.score,
-                    ),
-                    HitSource::Content(address) => {
-                        let (content, _) = self
-                            .content
-                            .as_ref()
-                            .context("content index is unavailable")?;
-                        let searcher = content_searcher
-                            .as_ref()
-                            .context("content reader is unavailable")?;
-                        to_hit_content(
-                            &searcher.doc::<TantivyDocument>(address)?,
-                            &content.fields,
-                            hit.score,
-                        )
-                    }
+                    )
+                    .context("search result has no valid stored identity")?
+                } else if let Some(address) = hit.content_address {
+                    let (content, _) = self
+                        .content
+                        .as_ref()
+                        .context("content index is unavailable")?;
+                    let searcher = content_searcher
+                        .as_ref()
+                        .context("content reader is unavailable")?;
+                    to_hit_content(
+                        &searcher.doc::<TantivyDocument>(address)?,
+                        &content.fields,
+                        hit.score,
+                        snippet_generator.as_ref(),
+                    )
+                    .context("search result has no valid stored identity")?
+                } else {
+                    bail!("ranked hit has neither metadata nor content address");
+                };
+
+                if loaded.snippet.is_none()
+                    && let Some(content_address) = hit.content_address
+                    && let (Some((content, _)), Some(searcher)) = (&self.content, &content_searcher)
+                {
+                    let content_doc = searcher.doc::<TantivyDocument>(content_address)?;
+                    loaded.snippet = extract_content_snippet(
+                        &content_doc,
+                        &content.fields,
+                        snippet_generator.as_ref(),
+                    );
                 }
-                .context("search result has no valid stored identity")?;
+
                 ensure!(
                     loaded.key == hit.key,
                     "stored and ranked document identities differ"
@@ -580,6 +865,120 @@ impl SearchHandler for UnifiedSearchHandler {
             }
         }
     }
+}
+
+fn complement_query(inner: Box<dyn Query>) -> Box<dyn Query> {
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Must, Box::new(AllQuery)),
+        (Occur::MustNot, inner),
+    ]))
+}
+
+fn has_must_not_clause(query: &dyn Query) -> bool {
+    query
+        .as_any()
+        .downcast_ref::<BooleanQuery>()
+        .is_some_and(|bq| {
+            bq.clauses()
+                .iter()
+                .any(|(occur, _)| *occur == Occur::MustNot)
+        })
+}
+
+fn parse_raw_query_allowing_pure_negation(
+    parser: &QueryParser,
+    value: &str,
+) -> std::result::Result<(Box<dyn Query>, bool), QueryParserError> {
+    match parser.parse_query(value) {
+        Ok(q) => Ok((normalize_raw_boolean_query(q), false)),
+        Err(QueryParserError::AllButQueryForbidden) => {
+            let rewritten = format!("* {value}");
+            match parser.parse_query(&rewritten) {
+                Ok(q) => Ok((normalize_raw_boolean_query(q), true)),
+                Err(_) => {
+                    let rewritten_and = format!("* AND ({value})");
+                    let q = parser.parse_query(&rewritten_and)?;
+                    Ok((normalize_raw_boolean_query(q), true))
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn normalize_raw_boolean_query(query: Box<dyn Query>) -> Box<dyn Query> {
+    if let Some(bq) = query.as_any().downcast_ref::<BooleanQuery>()
+        && !bq.clauses().is_empty()
+        && bq
+            .clauses()
+            .iter()
+            .all(|(occur, _)| *occur == Occur::MustNot)
+    {
+        let mut clauses = Vec::with_capacity(bq.clauses().len() + 1);
+        clauses.push((Occur::Must, Box::new(AllQuery) as Box<dyn Query>));
+        for (occur, sub) in bq.clauses() {
+            clauses.push((*occur, sub.box_clone()));
+        }
+        return Box::new(BooleanQuery::new(clauses));
+    }
+    query
+}
+
+fn kind_extensions(kind: &str) -> Result<&'static [&'static str]> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "docs" | "doc" | "document" | "documents" => Ok(&[
+            "pdf", "doc", "docx", "txt", "md", "rtf", "odt", "pages", "tex", "epub", "xls", "xlsx",
+            "ppt", "pptx", "csv",
+        ]),
+        "code" | "src" | "source" => Ok(&[
+            "rs", "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "hpp", "cs", "go", "java", "kt",
+            "swift", "rb", "php", "sh", "ps1", "sql", "html", "css", "scss", "toml", "yaml", "yml",
+            "json", "xml",
+        ]),
+        "image" | "images" | "img" | "photo" | "photos" => Ok(&[
+            "jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico", "tiff", "tif", "heic", "raw",
+        ]),
+        "video" | "videos" | "movie" | "movies" => Ok(&[
+            "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpeg", "mpg",
+        ]),
+        "audio" | "music" | "sound" => {
+            Ok(&["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus"])
+        }
+        "archive" | "archives" | "zip" | "compressed" => Ok(&[
+            "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "cab", "iso",
+        ]),
+        "data" | "dataset" | "db" | "database" => Ok(&[
+            "json", "jsonl", "csv", "tsv", "parquet", "db", "sqlite", "sqlite3", "xml", "yaml",
+            "yml", "toml",
+        ]),
+        "exec" | "executable" | "bin" | "app" => Ok(&[
+            "exe", "msi", "bat", "cmd", "ps1", "com", "dll", "sys", "app", "sh",
+        ]),
+        other => bail!("unsupported file kind: {other}"),
+    }
+}
+
+fn kind_query(
+    index: &tantivy::Index,
+    ext_field: Field,
+    value: &str,
+    modifier: TermModifier,
+) -> Result<Box<dyn Query>> {
+    validate_term_modifier(modifier)?;
+    let exts = kind_extensions(value)?;
+    let mut clauses = Vec::with_capacity(exts.len());
+    for &ext in exts {
+        let q = if modifier == TermModifier::Term {
+            Box::new(TermQuery::new(
+                Term::from_field_text(ext_field, ext),
+                IndexRecordOption::WithFreqs,
+            )) as Box<dyn Query>
+        } else {
+            modified_text_query(index, ext_field, ext, modifier)?
+        };
+        clauses.push((Occur::Should, q));
+    }
+    Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
 fn range_query(range: &RangeExpr, index: &tantivy::Index) -> Result<Box<dyn Query>> {
@@ -745,11 +1144,51 @@ fn visible_query(
     Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
+fn truncate_snippet_chars(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut end_byte = trimmed.len();
+    for (count, (idx, _)) in trimmed.char_indices().enumerate() {
+        if count == max_chars {
+            end_byte = idx;
+            break;
+        }
+    }
+    if end_byte < trimmed.len() {
+        format!("{}…", trimmed[..end_byte].trim_end())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_content_snippet(
+    doc: &TantivyDocument,
+    fields: &content_index::ContentFields,
+    snippet_generator: Option<&SnippetGenerator>,
+) -> Option<String> {
+    if let Some(generator) = snippet_generator {
+        let snippet = generator.snippet_from_doc(doc);
+        let fragment = snippet.fragment().trim();
+        if !fragment.is_empty() {
+            return Some(truncate_snippet_chars(fragment, MAX_SNIPPET_CHARS));
+        }
+    }
+    let raw = doc
+        .get_first(fields.content)
+        .and_then(|v| v.as_str())?
+        .trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(truncate_snippet_chars(raw, MAX_SNIPPET_CHARS))
+    }
+}
+
 // Helper to map content doc to SearchHit
-fn to_hit_content<D: Document>(
-    doc: &D,
+fn to_hit_content(
+    doc: &TantivyDocument,
     fields: &content_index::ContentFields,
     score: Score,
+    snippet_generator: Option<&SnippetGenerator>,
 ) -> Option<SearchHit> {
     let mut key = None;
     let mut name = None;
@@ -757,7 +1196,6 @@ fn to_hit_content<D: Document>(
     let mut ext = None;
     let mut size = None;
     let mut modified = None;
-    let snippet = None; // TODO: snippet generation
 
     for (field, value) in doc.iter_fields_and_values() {
         match field {
@@ -769,10 +1207,11 @@ fn to_hit_content<D: Document>(
             f if f == fields.ext => ext = value.as_str().map(|s| s.to_string()),
             f if f == fields.size => size = value.as_u64(),
             f if f == fields.modified => modified = value.as_i64(),
-            // TODO: snippet from content field
             _ => {}
         }
     }
+
+    let snippet = extract_content_snippet(doc, fields, snippet_generator);
 
     key.map(|doc_key| SearchHit {
         key: doc_key,
@@ -1830,6 +2269,286 @@ mod tests {
         assert!(response.hits.is_empty());
         assert_eq!(response.served_by.as_deref(), Some("service-unavailable"));
         assert!(response.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn pure_and_nested_negation_across_all_modes_pagination_and_visibility() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut alpha_meta = file(2, 1, "alpha report", r"C:\docs\alpha.txt");
+        alpha_meta.size = 50;
+        let mut beta_both = file(2, 2, "beta summary", r"C:\docs\beta.txt");
+        beta_both.size = 150;
+        let mut gamma_secret = file(2, 3, "gamma memo", r"C:\docs\gamma.txt");
+        gamma_secret.size = 250;
+        let mut delta_moved = file(3, 4, "delta notes", r"C:\Archive\Sub\delta.txt");
+        delta_moved.size = 350;
+
+        fixture.put(&alpha_meta, None)?;
+        fixture.put(&beta_both, Some("ordinary body"))?;
+        fixture.put(&gamma_secret, Some("secret classified payload"))?;
+        fixture.put(&delta_moved, Some("ordinary archive body"))?;
+        fixture.commit()?;
+
+        let vis = Visibility::default();
+
+        // 1. Pure metadata negation: Not(Name("alpha")) matches beta, gamma, delta in metadata
+        // and beta, gamma, delta in content.
+        let not_alpha = QueryExpr::Not(Box::new(literal(
+            FieldKind::Name,
+            "alpha",
+            TermModifier::Term,
+        )));
+        assert_query_members(
+            &fixture,
+            &not_alpha,
+            &[beta_both.key, gamma_secret.key, delta_moved.key],
+            &[beta_both.key, gamma_secret.key, delta_moved.key],
+            &vis,
+        )?;
+
+        // 2. Pure content negation: Not(Content("secret")) is empty in metadata-only index
+        // and matches beta + delta in content index (and therefore Auto/Hybrid).
+        let not_secret = QueryExpr::Not(Box::new(literal(
+            FieldKind::Content,
+            "secret",
+            TermModifier::Term,
+        )));
+        assert_query_members(
+            &fixture,
+            &not_secret,
+            &[],
+            &[beta_both.key, delta_moved.key],
+            &vis,
+        )?;
+
+        // 3. Unfielded negation: Not(Term(None, "secret")) must not match gamma_secret via
+        // metadata index when running Auto/Hybrid.
+        let not_unfielded_secret = QueryExpr::Not(Box::new(QueryExpr::Term(TermExpr {
+            field: None,
+            value: "secret".into(),
+            modifier: TermModifier::Term,
+        })));
+        assert_query_members(
+            &fixture,
+            &not_unfielded_secret,
+            &[],
+            &[beta_both.key, delta_moved.key],
+            &vis,
+        )?;
+
+        // 4. Raw negative query "-beta" on Name field vs unfielded:
+        let raw_not_beta_name = literal(FieldKind::Name, "-beta", TermModifier::Term);
+        assert_query_members(
+            &fixture,
+            &raw_not_beta_name,
+            &[alpha_meta.key, gamma_secret.key, delta_moved.key],
+            &[gamma_secret.key, delta_moved.key],
+            &vis,
+        )?;
+
+        // 5. Negated range: Not(Size >= 200) -> alpha (50, meta-only) and beta (150, both).
+        let not_large = QueryExpr::Not(Box::new(range(
+            FieldKind::Size,
+            RangeOp::Ge,
+            RangeValue::U64 { lo: 200, hi: None },
+        )));
+        assert_query_members(
+            &fixture,
+            &not_large,
+            &[alpha_meta.key, beta_both.key],
+            &[beta_both.key],
+            &vis,
+        )?;
+
+        // 6. Double negation & De Morgan: Not(Not(Name("beta"))) -> beta_both
+        let double_neg = QueryExpr::Not(Box::new(QueryExpr::Not(Box::new(literal(
+            FieldKind::Name,
+            "beta",
+            TermModifier::Term,
+        )))));
+        assert_query_members(
+            &fixture,
+            &double_neg,
+            &[beta_both.key],
+            &[beta_both.key],
+            &vis,
+        )?;
+
+        // 7. Nested De Morgan with mixed positive/negative clauses + visibility + pagination:
+        // Not(Or([Name("alpha"), Content("secret")])) -> And([Not(Name("alpha")), Not(Content("secret"))])
+        let neither_alpha_nor_secret = QueryExpr::Not(Box::new(QueryExpr::Or(vec![
+            literal(FieldKind::Name, "alpha", TermModifier::Term),
+            literal(FieldKind::Content, "secret", TermModifier::Term),
+        ])));
+        assert_query_members(
+            &fixture,
+            &neither_alpha_nor_secret,
+            &[],
+            &[beta_both.key, delta_moved.key],
+            &vis,
+        )?;
+
+        let mut masked_vis = Visibility::default();
+        masked_vis
+            .directories
+            .insert(3, vec!["c:/archive/sub".into()]);
+        assert_query_members(
+            &fixture,
+            &neither_alpha_nor_secret,
+            &[],
+            &[beta_both.key],
+            &masked_vis,
+        )?;
+
+        for mode in [SearchMode::Auto, SearchMode::Hybrid, SearchMode::NameOnly] {
+            let page1 = fixture.search(
+                &SearchRequest::with_query(not_alpha.clone())
+                    .with_mode(mode)
+                    .with_limit(2)
+                    .with_offset(0),
+                &vis,
+            )?;
+            let page2 = fixture.search(
+                &SearchRequest::with_query(not_alpha.clone())
+                    .with_mode(mode)
+                    .with_limit(2)
+                    .with_offset(2),
+                &vis,
+            )?;
+            assert_eq!(page1.total, 3);
+            assert_eq!(page2.total, 3);
+            assert_eq!(page1.hits.len(), 2);
+            assert_eq!(page2.hits.len(), 1);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_raw_and_numeric_term_queries_reject_the_whole_request() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        fixture.put(&file(2, 1, "needle", r"C:\needle.txt"), Some("needle"))?;
+        fixture.commit()?;
+
+        let invalid = [
+            QueryExpr::Term(TermExpr {
+                field: None,
+                value: "[unclosed".into(),
+                modifier: TermModifier::Term,
+            }),
+            QueryExpr::Term(TermExpr {
+                field: None,
+                value: "unknown_field:needle".into(),
+                modifier: TermModifier::Term,
+            }),
+            literal(FieldKind::Size, "100", TermModifier::Term),
+            literal(FieldKind::Modified, "200", TermModifier::Term),
+            literal(FieldKind::Created, "100", TermModifier::Prefix),
+            literal(FieldKind::Kind, "nonexistent_kind", TermModifier::Term),
+        ];
+
+        for bad in invalid {
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Auto,
+                SearchMode::Hybrid,
+            ] {
+                let req = SearchRequest::with_query(bad.clone()).with_mode(mode);
+                assert!(
+                    fixture.search(&req, &Visibility::default()).is_err(),
+                    "expected error for {bad:?} in {mode:?}"
+                );
+                let resp = fixture.handler.search(req);
+                assert!(resp.hits.is_empty());
+                assert!(resp.truncated);
+                assert_eq!(resp.served_by.as_deref(), Some("service-unavailable"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn field_kind_expansion_and_exact_content_extension_matching() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut rust_file = file(2, 1, "lib.rs", r"C:\src\lib.rs");
+        rust_file.ext = Some("rs".into());
+        let mut pdf_file = file(2, 2, "manual.pdf", r"C:\docs\manual.pdf");
+        pdf_file.ext = Some("pdf".into());
+        let mut special_ext = file(2, 3, "template.c++", r"C:\src\template.c++");
+        special_ext.ext = Some("c++".into());
+
+        fixture.put(&rust_file, Some("fn main() {}"))?;
+        fixture.put(&pdf_file, Some("user guide"))?;
+        fixture.put(&special_ext, Some("template class"))?;
+        fixture.commit()?;
+
+        let vis = Visibility::default();
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Kind, "code", TermModifier::Term),
+            &[rust_file.key],
+            &[rust_file.key],
+            &vis,
+        )?;
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Kind, "docs", TermModifier::Term),
+            &[pdf_file.key],
+            &[pdf_file.key],
+            &vis,
+        )?;
+        assert_query_members(
+            &fixture,
+            &literal(FieldKind::Ext, "c++", TermModifier::Term),
+            &[special_ext.key],
+            &[special_ext.key],
+            &vis,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn content_and_hybrid_hits_populate_bounded_snippets() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let doc = file(2, 1, "architecture.md", r"C:\docs\architecture.md");
+        let body = format!(
+            "{} ultrasearch_unique_token_xyz {}",
+            "prefix words ".repeat(10),
+            "suffix words ".repeat(30)
+        );
+        fixture.put(&doc, Some(&body))?;
+        fixture.commit()?;
+
+        for mode in [SearchMode::Content, SearchMode::Auto, SearchMode::Hybrid] {
+            let resp = fixture.search(
+                &request(
+                    "ultrasearch_unique_token_xyz",
+                    Some(FieldKind::Content),
+                    mode,
+                ),
+                &Visibility::default(),
+            )?;
+            assert_eq!(resp.hits.len(), 1);
+            let snippet = resp.hits[0]
+                .snippet
+                .as_deref()
+                .expect("content hit should populate snippet");
+            assert!(
+                snippet.contains("ultrasearch_unique_token_xyz"),
+                "snippet should contain matched token: {snippet}"
+            );
+            assert!(snippet.chars().count() <= 203);
+        }
+
+        // Metadata match on a content-indexed file in Hybrid/Auto should also populate fallback excerpt
+        let resp = fixture.search(
+            &request("architecture", Some(FieldKind::Name), SearchMode::Hybrid),
+            &Visibility::default(),
+        )?;
+        assert_eq!(resp.hits.len(), 1);
+        assert!(resp.hits[0].snippet.is_some());
         Ok(())
     }
 }

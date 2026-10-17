@@ -102,17 +102,35 @@ impl ExtractorStack {
 
     /// Build a stack optionally including Extractous when the feature is enabled.
     pub fn with_extractous_enabled(enable: bool) -> Self {
-        if enable {
-            #[cfg(feature = "extractous_backend")]
-            {
-                return Self::new(vec![
-                    Box::new(SimpleTextExtractor),
-                    Box::new(ExtractousExtractor::new()),
-                    Box::new(NoopExtractor),
-                ]);
-            }
+        Self::with_options(enable, false, false)
+    }
+
+    /// Build a stack with optional Extractous, Windows IFilter, and OCR backends.
+    pub fn with_options(enable_extractous: bool, enable_ifilter: bool, enable_ocr: bool) -> Self {
+        let mut backends: Vec<Box<dyn Extractor + Send + Sync>> =
+            vec![Box::new(SimpleTextExtractor)];
+
+        #[cfg(windows)]
+        if enable_ifilter {
+            backends.push(Box::new(ifilter::IFilterExtractor::new()));
         }
-        Self::simple_only()
+        #[cfg(not(windows))]
+        let _ = enable_ifilter;
+
+        if enable_ocr && let Ok(manager) = component_manager::ComponentManager::with_default_path()
+        {
+            backends.push(Box::new(ocr::OcrExtractor::new(manager)));
+        }
+
+        #[cfg(feature = "extractous_backend")]
+        if enable_extractous {
+            backends.push(Box::new(ExtractousExtractor::new()));
+        }
+        #[cfg(not(feature = "extractous_backend"))]
+        let _ = enable_extractous;
+
+        backends.push(Box::new(NoopExtractor));
+        Self::new(backends)
     }
 
     pub fn new(backends: Vec<Box<dyn Extractor + Send + Sync>>) -> Self {
@@ -218,7 +236,7 @@ impl Extractor for NoopExtractor {
     }
 }
 
-/// Plain-text extractor for lightweight formats (txt/log/rs/toml/json/md).
+/// Plain-text extractor for lightweight text, source code, markup, and config formats.
 pub struct SimpleTextExtractor;
 
 impl Extractor for SimpleTextExtractor {
@@ -230,7 +248,109 @@ impl Extractor for SimpleTextExtractor {
         if let Some(ext) = resolve_ext(ctx) {
             matches!(
                 ext.as_str(),
-                "txt" | "log" | "md" | "json" | "jsonl" | "toml" | "rs" | "ts" | "tsx" | "csv"
+                "txt"
+                    | "log"
+                    | "md"
+                    | "markdown"
+                    | "rst"
+                    | "adoc"
+                    | "org"
+                    | "tex"
+                    | "json"
+                    | "jsonl"
+                    | "ndjson"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+                    | "env"
+                    | "properties"
+                    | "csv"
+                    | "tsv"
+                    | "xml"
+                    | "svg"
+                    | "sql"
+                    | "graphql"
+                    | "gql"
+                    | "proto"
+                    | "html"
+                    | "htm"
+                    | "css"
+                    | "scss"
+                    | "sass"
+                    | "less"
+                    | "js"
+                    | "jsx"
+                    | "mjs"
+                    | "cjs"
+                    | "ts"
+                    | "tsx"
+                    | "vue"
+                    | "svelte"
+                    | "rs"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "cc"
+                    | "cxx"
+                    | "hpp"
+                    | "hh"
+                    | "hxx"
+                    | "cs"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "scala"
+                    | "swift"
+                    | "zig"
+                    | "d"
+                    | "nim"
+                    | "v"
+                    | "py"
+                    | "pyi"
+                    | "rb"
+                    | "php"
+                    | "pl"
+                    | "pm"
+                    | "lua"
+                    | "r"
+                    | "jl"
+                    | "ex"
+                    | "exs"
+                    | "erl"
+                    | "hrl"
+                    | "hs"
+                    | "ml"
+                    | "mli"
+                    | "fs"
+                    | "fsx"
+                    | "clj"
+                    | "cljs"
+                    | "el"
+                    | "lisp"
+                    | "scm"
+                    | "dart"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "ps1"
+                    | "psm1"
+                    | "psd1"
+                    | "bat"
+                    | "cmd"
+                    | "cmake"
+                    | "make"
+                    | "mk"
+                    | "gradle"
+                    | "dockerfile"
+                    | "tf"
+                    | "hcl"
+                    | "nix"
+                    | "just"
             )
         } else {
             false
@@ -249,25 +369,7 @@ impl Extractor for SimpleTextExtractor {
         key: DocKey,
         file: &fs::File,
     ) -> Result<ExtractedContent, ExtractError> {
-        let meta = file
-            .metadata()
-            .map_err(|e| ExtractError::Failed(e.to_string()))?;
-        let max_bytes = ctx.max_bytes as u64;
-        if meta.len() > max_bytes {
-            return Err(ExtractError::FileTooLarge {
-                bytes: meta.len(),
-                max_bytes,
-            });
-        }
-
-        // The file can grow after metadata() (notably an active log). Bound the
-        // actual read as well, rather than allowing fs::read to allocate until
-        // a moving EOF before the worker can reject its changed snapshot.
-        let mut source = file;
-        source
-            .rewind()
-            .map_err(|e| ExtractError::Failed(e.to_string()))?;
-        let data = read_bounded(source, ctx.max_bytes)?;
+        let data = read_file_snapshot(file, ctx.max_bytes)?;
         self.extract_bytes(ctx, key, &data)
     }
 
@@ -299,6 +401,63 @@ impl Extractor for SimpleTextExtractor {
             bytes_processed: used_bytes,
         })
     }
+}
+
+pub(crate) fn read_file_snapshot(
+    file: &fs::File,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ExtractError> {
+    let meta = file
+        .metadata()
+        .map_err(|e| ExtractError::Failed(e.to_string()))?;
+    let max_bytes_u64 = max_bytes as u64;
+    if meta.len() > max_bytes_u64 {
+        return Err(ExtractError::FileTooLarge {
+            bytes: meta.len(),
+            max_bytes: max_bytes_u64,
+        });
+    }
+
+    // The file can grow after metadata() (notably an active log). Bound the
+    // actual read as well, rather than allowing fs::read to allocate until
+    // a moving EOF before the worker can reject its changed snapshot.
+    let mut source = file;
+    source
+        .rewind()
+        .map_err(|e| ExtractError::Failed(e.to_string()))?;
+    read_bounded(source, max_bytes)
+}
+
+pub(crate) fn with_snapshot_tempfile<T>(
+    ctx: &ExtractContext,
+    bytes: &[u8],
+    f: impl FnOnce(&Path) -> Result<T, ExtractError>,
+) -> Result<T, ExtractError> {
+    if bytes.len() > ctx.max_bytes {
+        return Err(ExtractError::FileTooLarge {
+            bytes: bytes.len() as u64,
+            max_bytes: ctx.max_bytes as u64,
+        });
+    }
+    let suffix = resolve_ext(ctx)
+        .filter(|ext| {
+            !ext.is_empty()
+                && ext
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_default();
+    let mut temp = tempfile::Builder::new()
+        .prefix("ultrasearch-snapshot-")
+        .suffix(&suffix)
+        .tempfile()
+        .map_err(|e| ExtractError::Failed(format!("failed to create snapshot tempfile: {e}")))?;
+    use std::io::Write;
+    temp.write_all(bytes)
+        .and_then(|()| temp.flush())
+        .map_err(|e| ExtractError::Failed(format!("failed to write snapshot tempfile: {e}")))?;
+    f(temp.path())
 }
 
 fn read_bounded(source: impl Read, max_bytes: usize) -> Result<Vec<u8>, ExtractError> {
@@ -372,6 +531,42 @@ impl ExtractousExtractor {
         let max_chars = ctx.max_chars.min(i32::MAX as usize) as i32;
         extractous::Extractor::new().set_extract_string_max_length(max_chars)
     }
+
+    fn extract_from_path(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        path: &Path,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let meta = fs::metadata(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+
+        let max_bytes = ctx.max_bytes as u64;
+        if meta.len() > max_bytes {
+            return Err(ExtractError::FileTooLarge {
+                bytes: meta.len(),
+                max_bytes,
+            });
+        }
+
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| ExtractError::Failed("snapshot path is not valid UTF-8".into()))?;
+        let engine = self.build_engine(ctx);
+        let (text_raw, _metadata) = engine
+            .extract_file_to_string(path_str)
+            .map_err(|e| ExtractError::Failed(e.to_string()))?;
+
+        let (text, truncated, bytes_processed) = enforce_limits_str(&text_raw, ctx);
+
+        Ok(ExtractedContent {
+            key,
+            lang: None,
+            content_lang: None,
+            truncated,
+            bytes_processed,
+            text,
+        })
+    }
 }
 
 #[cfg(feature = "extractous_backend")]
@@ -388,39 +583,37 @@ impl Extractor for ExtractousExtractor {
     }
 
     fn supports(&self, ctx: &ExtractContext) -> bool {
-        fs::metadata(ctx.path)
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
+        if let Some(ext) = resolve_ext(ctx) {
+            !ext.is_empty()
+        } else {
+            fs::metadata(ctx.path)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false)
+        }
     }
 
     fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
-        let path = Path::new(ctx.path);
-        let meta = fs::metadata(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        self.extract_from_path(ctx, key, Path::new(ctx.path))
+    }
 
-        let max_bytes = ctx.max_bytes as u64;
-        if meta.len() > max_bytes {
-            return Err(ExtractError::FileTooLarge {
-                bytes: meta.len(),
-                max_bytes,
-            });
-        }
+    fn extract_file(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        file: &fs::File,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let bytes = read_file_snapshot(file, ctx.max_bytes)?;
+        self.extract_bytes(ctx, key, &bytes)
+    }
 
-        let engine = self.build_engine(ctx);
-        let (text, _metadata) = engine
-            .extract_file_to_string(ctx.path)
-            .map_err(|e| ExtractError::Failed(e.to_string()))?;
-
-        let byte_len = text.len();
-        let char_len = text.chars().count();
-        let truncated = byte_len > ctx.max_bytes || char_len > ctx.max_chars;
-
-        Ok(ExtractedContent {
-            key,
-            lang: None,
-            content_lang: None,
-            truncated,
-            bytes_processed: byte_len.min(ctx.max_bytes),
-            text,
+    fn extract_bytes(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        bytes: &[u8],
+    ) -> Result<ExtractedContent, ExtractError> {
+        with_snapshot_tempfile(ctx, bytes, |temp_path| {
+            self.extract_from_path(ctx, key, temp_path)
         })
     }
 }
@@ -813,5 +1006,95 @@ mod tests {
         let extractor = ExtractousExtractor::new();
         assert!(extractor.supports(&ctx));
         // We don't call extract() to avoid requiring the full Graal runtime during tests.
+    }
+
+    #[test]
+    fn simple_text_supports_source_code_markup_and_config_formats() {
+        let stack = ExtractorStack::with_defaults();
+        let key = DocKey::from_parts(3, 19);
+        for (ext, sample) in [
+            ("py", "def compute_rank():\n    return 42\n"),
+            ("go", "package main\nfunc main() {}\n"),
+            ("cpp", "#include <vector>\nint main() { return 0; }\n"),
+            ("yaml", "scheduler:\n  max_records_per_tick: 512\n"),
+            ("html", "<html><body><h1>UltraSearch</h1></body></html>"),
+            ("sql", "SELECT id, path FROM files WHERE size > 100;"),
+            ("sh", "#!/usr/bin/env bash\necho hello\n"),
+            ("ps1", "Write-Host 'UltraSearch'"),
+        ] {
+            let ctx = ExtractContext {
+                path: "in_memory_source",
+                max_bytes: 4096,
+                max_chars: 4096,
+                ext_hint: Some(ext),
+                mime_hint: None,
+            };
+            assert!(
+                SimpleTextExtractor.supports(&ctx),
+                "SimpleTextExtractor must support .{ext}"
+            );
+            let out = stack.extract_bytes(key, &ctx, sample.as_bytes()).unwrap();
+            assert_eq!(out.text, sample);
+            assert!(!out.truncated);
+        }
+    }
+
+    #[test]
+    fn snapshot_tempfile_isolates_bytes_from_replaced_path_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().join("document.png");
+        fs::write(&original_path, b"live-on-disk-corrupted").unwrap();
+        let captured = b"verified-snapshot-payload";
+        let ctx = ExtractContext {
+            path: original_path.to_str().unwrap(),
+            max_bytes: 1024,
+            max_chars: 1024,
+            ext_hint: Some("png"),
+            mime_hint: None,
+        };
+        let mut observed_temp_path = std::path::PathBuf::new();
+        let read_back = with_snapshot_tempfile(&ctx, captured, |temp_path| {
+            observed_temp_path = temp_path.to_path_buf();
+            assert_ne!(temp_path, original_path.as_path());
+            assert!(
+                temp_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".png")
+            );
+            fs::read(temp_path).map_err(|e| ExtractError::Failed(e.to_string()))
+        })
+        .unwrap();
+        assert_eq!(read_back, captured);
+        assert!(
+            !observed_temp_path.exists(),
+            "snapshot tempfile must be cleaned up on drop"
+        );
+    }
+
+    #[test]
+    fn ocr_extractor_snapshot_methods_enforce_size_limits_without_reading_live_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = component_manager::ComponentManager::new(dir.path());
+        let ocr = ocr::OcrExtractor::new(manager);
+        let ctx = ExtractContext {
+            path: "/nonexistent/replaced/image.png",
+            max_bytes: 4,
+            max_chars: 100,
+            ext_hint: Some("png"),
+            mime_hint: None,
+        };
+        assert!(ocr.supports(&ctx));
+        let err = ocr
+            .extract_bytes(&ctx, DocKey::from_parts(1, 7), b"12345")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtractError::FileTooLarge {
+                bytes: 5,
+                max_bytes: 4
+            }
+        ));
     }
 }

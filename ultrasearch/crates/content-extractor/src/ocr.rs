@@ -45,38 +45,33 @@ impl OcrExtractor {
 
         None
     }
-}
 
-impl Extractor for OcrExtractor {
-    fn name(&self) -> &'static str {
-        "ocr-tesseract"
-    }
-
-    fn supports(&self, ctx: &ExtractContext) -> bool {
-        // Check if extension is an image
-        if let Some(ext) = super::resolve_ext(ctx) {
-            match ext.as_str() {
-                "png" | "jpg" | "jpeg" | "tiff" | "bmp" | "webp" => true,
-                _ => false, // PDF OCR handled by Extractous usually, or specialized PDF pipeline
-            }
-        } else {
-            false
+    fn extract_from_path(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        input_path: &Path,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let meta =
+            std::fs::metadata(input_path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        let max_bytes = ctx.max_bytes as u64;
+        if meta.len() > max_bytes {
+            return Err(ExtractError::FileTooLarge {
+                bytes: meta.len(),
+                max_bytes,
+            });
         }
-    }
 
-    fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
         let tesseract_bin = self
             .get_tesseract_path()
             .ok_or_else(|| ExtractError::Failed("tesseract binary not found".into()))?;
 
-        let input_path = Path::new(ctx.path);
-
         // Run tesseract: tesseract <image> stdout
         let output = Command::new(tesseract_bin)
             .arg(input_path)
-            .arg("stdout") // Write to stdout
+            .arg("stdout")
             .arg("-l")
-            .arg("eng") // Default to English for now, config later
+            .arg("eng")
             .output()
             .map_err(|e| ExtractError::Failed(format!("failed to spawn tesseract: {e}")))?;
 
@@ -92,10 +87,52 @@ impl Extractor for OcrExtractor {
         Ok(ExtractedContent {
             key,
             text,
-            lang: Some("eng".into()), // Assumption
+            lang: Some("eng".into()),
             truncated,
             content_lang: None,
             bytes_processed: used_bytes,
+        })
+    }
+}
+
+impl Extractor for OcrExtractor {
+    fn name(&self) -> &'static str {
+        "ocr-tesseract"
+    }
+
+    fn supports(&self, ctx: &ExtractContext) -> bool {
+        if let Some(ext) = super::resolve_ext(ctx) {
+            matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "tiff" | "tif" | "bmp" | "webp"
+            )
+        } else {
+            false
+        }
+    }
+
+    fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
+        self.extract_from_path(ctx, key, Path::new(ctx.path))
+    }
+
+    fn extract_file(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        file: &std::fs::File,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let bytes = crate::read_file_snapshot(file, ctx.max_bytes)?;
+        self.extract_bytes(ctx, key, &bytes)
+    }
+
+    fn extract_bytes(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        bytes: &[u8],
+    ) -> Result<ExtractedContent, ExtractError> {
+        crate::with_snapshot_tempfile(ctx, bytes, |temp_path| {
+            self.extract_from_path(ctx, key, temp_path)
         })
     }
 }

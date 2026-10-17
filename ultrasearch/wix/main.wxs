@@ -41,59 +41,45 @@
       <Directory Id="CommonAppDataFolder">
         <Directory Id="UltraSearchData" Name="UltraSearch">
           <Component Id="cmp_data_dir" Guid="F6FA2E26-39E9-4A1A-9B0E-2ACF26E7D111" KeyPath="yes">
-            <CreateFolder>
-              <util:PermissionEx User="Users" GenericAll="yes" />
-            </CreateFolder>
+            <CreateFolder />
           </Component>
           <Directory Id="UltraSearchConfig" Name="config">
             <Component Id="cmp_config_dir" Guid="7C3BEF3F-3D87-4E6A-8D7C-7C2D40F0A222">
               <CreateFolder>
-                <util:PermissionEx User="Users" GenericAll="yes" />
+                <util:PermissionEx User="Users" GenericRead="yes" GenericWrite="yes" Delete="yes" />
               </CreateFolder>
             </Component>
           </Directory>
           <Directory Id="UltraSearchLog" Name="log">
             <Component Id="cmp_log_dir" Guid="2F7E0D40-6D5C-4958-AE9C-06442E9B3333">
-              <CreateFolder>
-                <util:PermissionEx User="Users" GenericAll="yes" />
-              </CreateFolder>
+              <CreateFolder />
             </Component>
           </Directory>
           <Directory Id="UltraSearchIndex" Name="index">
             <Directory Id="UltraSearchIndexMeta" Name="meta">
               <Component Id="cmp_index_meta" Guid="0C0B3E5D-5C7A-4E61-9E2A-136D2AE44444">
-                <CreateFolder>
-                  <util:PermissionEx User="Users" GenericAll="yes" />
-                </CreateFolder>
+                <CreateFolder />
               </Component>
             </Directory>
             <Directory Id="UltraSearchIndexContent" Name="content">
               <Component Id="cmp_index_content" Guid="6C2F9C7E-2F2E-4D19-91E2-7B7B5BE55555">
-                <CreateFolder>
-                  <util:PermissionEx User="Users" GenericAll="yes" />
-                </CreateFolder>
+                <CreateFolder />
               </Component>
             </Directory>
             <Directory Id="UltraSearchIndexSemantic" Name="semantic">
               <Component Id="cmp_index_semantic" Guid="9D6C1B9F-7A3D-4EAF-8C1B-9A9A6AE66666">
-                <CreateFolder>
-                  <util:PermissionEx User="Users" GenericAll="yes" />
-                </CreateFolder>
+                <CreateFolder />
               </Component>
             </Directory>
           </Directory>
           <Directory Id="UltraSearchState" Name="volumes">
             <Component Id="cmp_state_dir" Guid="1E5DF4B1-5D4C-4B61-8F9E-5C5C7AF77777">
-              <CreateFolder>
-                <util:PermissionEx User="Users" GenericAll="yes" />
-              </CreateFolder>
+              <CreateFolder />
             </Component>
           </Directory>
           <Directory Id="UltraSearchJobs" Name="jobs">
             <Component Id="cmp_jobs_dir" Guid="3A8E6C23-7F9D-4C3B-9D1C-6E6E8AF88888">
-              <CreateFolder>
-                <util:PermissionEx User="Users" GenericAll="yes" />
-              </CreateFolder>
+              <CreateFolder />
             </Component>
           </Directory>
         </Directory>
@@ -108,6 +94,10 @@
 
       <Component Id="cmp_launcher_exe" Guid="*" Win64="yes">
         <File Id="fil_launcher_exe" Source="$(var.CargoTargetBinDir)\launcher.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmp_cli_exe" Guid="*" Win64="yes">
+        <File Id="fil_cli_exe" Source="$(var.CargoTargetBinDir)\cli.exe" KeyPath="yes" />
       </Component>
 
       <Component Id="cmp_shortcuts" Guid="*">
@@ -197,6 +187,7 @@
     <Feature Id="MainFeature" Title="UltraSearch" Level="1">
       <ComponentRef Id="cmp_ui_exe" />
       <ComponentRef Id="cmp_launcher_exe" />
+      <ComponentRef Id="cmp_cli_exe" />
       <ComponentRef Id="cmp_service_exe" />
       <ComponentRef Id="cmp_index_worker_exe" />
       <ComponentRef Id="cmp_protocol_handler" />
@@ -216,10 +207,10 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dicklesworthstone/ultrasearch" />
     <Property Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" />
 
-    <!-- Custom action: ensure ProgramData tree writable by Users (S-1-5-32-545). -->
+    <!-- Custom action: ensure only the ProgramData\UltraSearch\config subtree is writable by Users (S-1-5-32-545). -->
     <CustomAction Id="GrantProgramDataAcls"
-                  Directory="UltraSearchData"
-                  ExeCommand='cmd.exe /C icacls "[UltraSearchData]" /grant "*S-1-5-32-545:(OI)(CI)M" /T /C /Q'
+                  Directory="UltraSearchConfig"
+                  ExeCommand='cmd.exe /C icacls "[UltraSearchConfig]" /grant "*S-1-5-32-545:(OI)(CI)M" /T /C /Q'
                   Execute="deferred"
                   Return="check"
                   Impersonate="no" />

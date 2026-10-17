@@ -39,10 +39,15 @@ pub fn init_tracing_with_config(
         fs::create_dir_all(dir).context("create log directory")?;
     }
 
-    // Size-based rotation with a conservative default (2 MiB). We avoid deleting old logs to
-    // honor the no-delete policy; rotated files are timestamp-suffixed.
+    // Size- and period-based rotation with bounded retention ring (`retain` slots).
     let max_bytes = cfg.max_size_mb.saturating_mul(1024 * 1024);
-    let sized_writer = SizeRotatingWriter::new(dir.to_path_buf(), file.to_string(), max_bytes)?;
+    let sized_writer = SizeRotatingWriter::with_options(
+        dir.to_path_buf(),
+        file.to_string(),
+        max_bytes,
+        cfg.retain,
+        &cfg.roll,
+    )?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(sized_writer);
 
@@ -53,11 +58,6 @@ pub fn init_tracing_with_config(
         .with_target(true)
         .with_thread_ids(true)
         .with_line_number(true);
-
-    // Try to init. If it fails (already set), we just return the guard?
-    // Wait, if we don't init, the guard might be useless if the subscriber isn't using it.
-    // But if it's already set, we can't change it.
-    // We'll log a warning if we can't init.
 
     let registry = tracing_subscriber::registry().with(filter).with(file_layer);
 
@@ -112,8 +112,36 @@ fn split_dir_file(path: &Path) -> Result<(&Path, &str)> {
     Ok((dir, file))
 }
 
-/// A simple size-rotating writer: when the active log exceeds `max_bytes`,
-/// the file is renamed with a timestamp suffix and a new file is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollPolicy {
+    Daily,
+    Hourly,
+    SizeOnly,
+}
+
+impl RollPolicy {
+    fn from_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "hourly" => Self::Hourly,
+            "size" => Self::SizeOnly,
+            _ => Self::Daily,
+        }
+    }
+
+    fn current_bucket(self) -> Option<u64> {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match self {
+            Self::Daily => Some(secs / 86_400),
+            Self::Hourly => Some(secs / 3_600),
+            Self::SizeOnly => None,
+        }
+    }
+}
+
+/// A size- and period-rotating writer with a bounded retention ring (`retain` files).
 #[derive(Clone)]
 struct SizeRotatingWriter {
     inner: Arc<Inner>,
@@ -123,19 +151,34 @@ struct Inner {
     dir: PathBuf,
     file_name: String,
     max_bytes: u64,
+    retain: u32,
+    roll_policy: RollPolicy,
     state: Mutex<WriterState>,
 }
 
 struct WriterState {
-    file: File,
+    file: Option<File>,
     current_size: u64,
+    period_bucket: Option<u64>,
 }
 
 impl SizeRotatingWriter {
+    #[allow(dead_code)]
     fn new(dir: PathBuf, file_name: String, max_bytes: u64) -> io::Result<Self> {
+        Self::with_options(dir, file_name, max_bytes, 7, "daily")
+    }
+
+    fn with_options(
+        dir: PathBuf,
+        file_name: String,
+        max_bytes: u64,
+        retain: u32,
+        roll: &str,
+    ) -> io::Result<Self> {
         if !dir.exists() {
             fs::create_dir_all(&dir)?;
         }
+        let roll_policy = RollPolicy::from_str(roll);
         let path = dir.join(&file_name);
         let file = File::options().create(true).append(true).open(&path)?;
         let current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -143,37 +186,43 @@ impl SizeRotatingWriter {
             inner: Arc::new(Inner {
                 dir,
                 file_name,
-                max_bytes: max_bytes.max(1), // guard against zero
-                state: Mutex::new(WriterState { file, current_size }),
+                max_bytes: max_bytes.max(1),
+                retain: retain.max(1),
+                roll_policy,
+                state: Mutex::new(WriterState {
+                    file: Some(file),
+                    current_size,
+                    period_bucket: roll_policy.current_bucket(),
+                }),
             }),
         })
     }
 
     fn rotate_locked(inner: &Inner, state: &mut WriterState) -> io::Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let rotated_name = format!("{}.{}", inner.file_name, timestamp);
-        let rotated_path = inner.dir.join(rotated_name);
         let active_path = inner.dir.join(&inner.file_name);
-        // Close current file by dropping it after rename.
-        drop(std::mem::replace(
-            &mut state.file,
-            File::options()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(inner.dir.join("__temp__.log"))?,
-        ));
-        let _ = fs::rename(&active_path, &rotated_path);
+        // Drop active file handle before renaming so Windows allows moving the file.
+        drop(state.file.take());
+
+        // Shift bounded retention slots: `.{retain-1}` -> `.{retain}`, ..., `.1` -> `.2`
+        for idx in (1..inner.retain).rev() {
+            let src = inner.dir.join(format!("{}.{}", inner.file_name, idx));
+            let dst = inner.dir.join(format!("{}.{}", inner.file_name, idx + 1));
+            if src.exists() {
+                let _ = fs::rename(&src, &dst);
+            }
+        }
+        let first_slot = inner.dir.join(format!("{}.1", inner.file_name));
+        let _ = fs::rename(&active_path, &first_slot);
+
         let new_file = File::options()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&active_path)?;
         *state = WriterState {
-            file: new_file,
+            file: Some(new_file),
             current_size: 0,
+            period_bucket: inner.roll_policy.current_bucket(),
         };
         Ok(())
     }
@@ -197,10 +246,25 @@ struct SizeRotatingWriterHandle {
 impl Write for SizeRotatingWriterHandle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut state = self.inner.state.lock();
-        if state.current_size + buf.len() as u64 > self.inner.max_bytes {
+        let now_bucket = self.inner.roll_policy.current_bucket();
+        let period_changed = now_bucket != state.period_bucket && state.current_size > 0;
+        let size_exceeded = state.current_size + buf.len() as u64 > self.inner.max_bytes;
+        if period_changed || size_exceeded {
             SizeRotatingWriter::rotate_locked(&self.inner, &mut state)?;
         }
-        let written = state.file.write(buf)?;
+        let file = match state.file.as_mut() {
+            Some(f) => f,
+            None => {
+                let active_path = self.inner.dir.join(&self.inner.file_name);
+                let reopened = File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&active_path)?;
+                state.file = Some(reopened);
+                state.file.as_mut().expect("just inserted")
+            }
+        };
+        let written = file.write(buf)?;
         state.current_size = state
             .current_size
             .saturating_add(written as u64)
@@ -210,7 +274,10 @@ impl Write for SizeRotatingWriterHandle {
 
     fn flush(&mut self) -> io::Result<()> {
         let mut state = self.inner.state.lock();
-        state.file.flush()
+        if let Some(file) = state.file.as_mut() {
+            file.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -224,5 +291,35 @@ impl Write for SizeRotatingWriter {
     fn flush(&mut self) -> io::Result<()> {
         let mut handle = self.make_writer();
         handle.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn size_rotating_writer_caps_retained_files_without_temp_leak() -> io::Result<()> {
+        let dir = tempdir()?;
+        let mut writer = SizeRotatingWriter::with_options(
+            dir.path().to_path_buf(),
+            "searchd.log".into(),
+            16,
+            2,
+            "size",
+        )?;
+
+        for i in 0..5 {
+            writeln!(writer, "line-number-{i:04}")?;
+        }
+        writer.flush()?;
+
+        assert!(dir.path().join("searchd.log").exists());
+        assert!(dir.path().join("searchd.log.1").exists());
+        assert!(dir.path().join("searchd.log.2").exists());
+        assert!(!dir.path().join("searchd.log.3").exists());
+        assert!(!dir.path().join("__temp__.log").exists());
+        Ok(())
     }
 }

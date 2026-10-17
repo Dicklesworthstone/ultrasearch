@@ -77,6 +77,14 @@
         <File Id="fil_index_worker_exe" Source="$(var.CargoTargetBinDir)\index-worker.exe" KeyPath="yes" />
       </Component>
 
+      <Component Id="cmp_launcher_exe" Guid="*" Win64="yes">
+        <File Id="fil_launcher_exe" Source="$(var.CargoTargetBinDir)\launcher.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmp_cli_exe" Guid="*" Win64="yes">
+        <File Id="fil_cli_exe" Source="$(var.CargoTargetBinDir)\cli.exe" KeyPath="yes" />
+      </Component>
+
       <!-- Protocol Handler Component -->
       <Component Id="cmp_protocol_handler" Guid="*">
         <RegistryKey Root="HKCR" Key="ultrasearch">
@@ -113,6 +121,8 @@
     <Feature Id="MainFeature" Title="UltraSearch" Level="1">
       <ComponentRef Id="cmp_start_menu_folder" />
       <ComponentRef Id="cmp_ui_exe" />
+      <ComponentRef Id="cmp_launcher_exe" />
+      <ComponentRef Id="cmp_cli_exe" />
       <ComponentRef Id="cmp_service_exe" />
       <ComponentRef Id="cmp_index_worker_exe" />
       <ComponentRef Id="cmp_protocol_handler" />

@@ -92,6 +92,7 @@ impl FstIndex {
 /// Builder for FST index.
 pub struct FstBuilder {
     writer: MapBuilder<BufWriter<File>>,
+    pending: Vec<Vec<u8>>,
 }
 
 impl FstBuilder {
@@ -99,36 +100,33 @@ impl FstBuilder {
     pub fn new(path: &Path) -> Result<Self> {
         let file = File::create(path)?;
         let writer = MapBuilder::new(BufWriter::new(file))?;
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            pending: Vec::new(),
+        })
     }
 
     /// Insert a batch of entries.
     ///
     /// `entries` is a list of `(normalized_name, doc_key)`.
-    /// This function sorts them internally to satisfy FST insertion requirements.
+    /// Entries are buffered across batches and globally sorted and deduplicated in [`Self::finish`].
     pub fn insert_batch(&mut self, entries: Vec<(String, DocKey)>) -> Result<()> {
-        // Transform to encoded keys: name + \0 + doc_key(BE)
-        let mut keys: Vec<Vec<u8>> = entries
-            .into_iter()
-            .map(|(name, dk)| {
-                let mut k = name.into_bytes();
-                k.push(0);
-                k.extend_from_slice(&dk.0.to_be_bytes());
-                k
-            })
-            .collect();
-
-        keys.sort();
-        keys.dedup(); // Dedup exact matches just in case
-
-        for k in keys {
-            self.writer.insert(&k, 2)?;
-        }
+        self.pending.extend(entries.into_iter().map(|(name, dk)| {
+            let mut k = name.into_bytes();
+            k.push(0);
+            k.extend_from_slice(&dk.0.to_be_bytes());
+            k
+        }));
         Ok(())
     }
 
-    /// Finish writing the index.
-    pub fn finish(self) -> Result<()> {
+    /// Finish writing the index after globally sorting and deduplicating all buffered batches.
+    pub fn finish(mut self) -> Result<()> {
+        self.pending.sort();
+        self.pending.dedup();
+        for k in &self.pending {
+            self.writer.insert(k, 2)?;
+        }
         self.writer.finish()?;
         Ok(())
     }
@@ -159,12 +157,6 @@ mod tests {
         // Exact match "foo" -> should return 1 and 3
         let mut hits: Vec<u128> = index.search("foo", 10).map(|k| k.0).collect();
         hits.sort();
-        // search("foo") is prefix search. It matches "foo\0..." (1, 3) and "foobar\0..." (2).
-        // Wait, "foobar" encoded is "foobar\0..."
-        // "foo" prefix matches "foobar" string.
-        // So hits should include 2?
-        // "foo" bytes match prefix of "foobar".
-        // Yes.
         assert_eq!(hits, vec![1, 2, 3]);
 
         // Prefix "foob" -> 2
@@ -183,6 +175,30 @@ mod tests {
         let hits: Vec<u128> = index.search("foo", 1).map(|k| k.0).collect();
         assert_eq!(hits.len(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn multi_batch_out_of_order_insertion_succeeds_and_deduplicates() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("multi-batch.fst");
+
+        let mut builder = FstBuilder::new(&path)?;
+        builder.insert_batch(vec![
+            ("zeta".to_string(), DocKey(10)),
+            ("mu".to_string(), DocKey(20)),
+        ])?;
+        builder.insert_batch(vec![
+            ("alpha".to_string(), DocKey(30)),
+            ("zeta".to_string(), DocKey(10)), // duplicate across batches
+        ])?;
+        builder.finish()?;
+
+        let index = FstIndex::open(&path)?;
+        let alpha_hits: Vec<DocKey> = index.search("alpha", 10).collect();
+        assert_eq!(alpha_hits, vec![DocKey(30)]);
+        let zeta_hits: Vec<DocKey> = index.search("zeta", 10).collect();
+        assert_eq!(zeta_hits, vec![DocKey(10)]);
         Ok(())
     }
 

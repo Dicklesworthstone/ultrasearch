@@ -211,9 +211,152 @@ impl FileFlags {
     }
 }
 
+/// Scrubs user-identifiable paths (Windows `C:\Users\<user>\...`, Unix `/home/<user>/...`,
+/// macOS `/Users/<user>/...`) from panic/crash strings before any opt-in crash report is stored.
+pub fn scrub_pii(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Match Windows user profile: `<Drive>:\Users\<username>` or `<Drive>:/Users/<username>`
+        if i + 9 < chars.len()
+            && chars[i].is_ascii_alphabetic()
+            && chars[i + 1] == ':'
+            && (chars[i + 2] == '\\' || chars[i + 2] == '/')
+        {
+            let rest: String = chars[i + 3..i + 8].iter().collect();
+            let sep = chars[i + 8];
+            if rest.eq_ignore_ascii_case("users") && (sep == '\\' || sep == '/') {
+                out.push(chars[i]);
+                out.push(':');
+                out.push(sep);
+                out.push_str("Users");
+                out.push(sep);
+                out.push_str("<REDACTED>");
+                i += 9;
+                while i < chars.len()
+                    && chars[i] != '\\'
+                    && chars[i] != '/'
+                    && !chars[i].is_whitespace()
+                    && chars[i] != '"'
+                    && chars[i] != '\''
+                {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Match Unix `/home/<username>` or `/Users/<username>`
+        if chars[i] == '/' {
+            let remaining: String = chars[i..].iter().take(8).collect();
+            if remaining.starts_with("/home/") && remaining.len() > 6 {
+                out.push_str("/home/<REDACTED>");
+                i += 6;
+                while i < chars.len()
+                    && chars[i] != '/'
+                    && !chars[i].is_whitespace()
+                    && chars[i] != '"'
+                    && chars[i] != '\''
+                {
+                    i += 1;
+                }
+                continue;
+            }
+            if remaining.starts_with("/Users/") && remaining.len() > 7 {
+                out.push_str("/Users/<REDACTED>");
+                i += 7;
+                while i < chars.len()
+                    && chars[i] != '/'
+                    && !chars[i].is_whitespace()
+                    && chars[i] != '"'
+                    && chars[i] != '\''
+                {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Installs an opt-in panic hook that writes a PII-scrubbed crash report to
+/// `{data_dir}/log/crash_reports.jsonl` ONLY when `features.telemetry_opt_in` is true.
+pub fn install_opt_in_crash_hook(component: &'static str) {
+    use std::io::Write;
+    use std::sync::Once;
+
+    static HOOK_ONCE: Once = Once::new();
+    HOOK_ONCE.call_once(move || {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let cfg = config::get_current_config();
+            if cfg.features.telemetry_opt_in {
+                let raw_msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic".to_string()
+                };
+                let scrubbed_msg = scrub_pii(&raw_msg);
+                let scrubbed_loc = info
+                    .location()
+                    .map(|l| scrub_pii(&format!("{}:{}:{}", l.file(), l.line(), l.column())))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let report = serde_json::json!({
+                    "component": component,
+                    "timestamp": ts,
+                    "message": scrubbed_msg,
+                    "location": scrubbed_loc,
+                });
+
+                let log_dir = std::path::Path::new(&cfg.app.data_dir).join("log");
+                if std::fs::create_dir_all(&log_dir).is_ok() {
+                    let report_path = log_dir.join("crash_reports.jsonl");
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(report_path)
+                    {
+                        let _ = writeln!(file, "{report}");
+                    }
+                }
+            }
+            prev(info);
+        }));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_pii_redacts_windows_and_unix_user_paths() {
+        let win = r#"Failed to open C:\Users\AliceSmith\Documents\secret_tax_2025.pdf"#;
+        assert_eq!(
+            scrub_pii(win),
+            r#"Failed to open C:\Users\<REDACTED>\Documents\secret_tax_2025.pdf"#
+        );
+
+        let unix = "panic reading /home/bob_jones/.ssh/id_rsa and /Users/charlie/Desktop/notes.txt";
+        assert_eq!(
+            scrub_pii(unix),
+            "panic reading /home/<REDACTED>/.ssh/id_rsa and /Users/<REDACTED>/Desktop/notes.txt"
+        );
+    }
 
     #[test]
     fn index_paths_normalize_windows_names_and_match_component_boundaries() {

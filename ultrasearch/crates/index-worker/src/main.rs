@@ -47,6 +47,12 @@ struct Args {
     /// Enable Extractous backend (requires feature extractous_backend).
     #[arg(long, default_value = "false")]
     enable_extractous: bool,
+    /// Enable Windows IFilter backend for legacy Office/RTF/MSG documents.
+    #[arg(long, default_value = "false")]
+    enable_ifilter: bool,
+    /// Enable OCR (Tesseract) backend for image documents.
+    #[arg(long, default_value = "false")]
+    enable_ocr: bool,
     /// Emit full JSON to stdout instead of a text preview.
     #[arg(long, default_value = "false")]
     json: bool,
@@ -133,9 +139,15 @@ fn main() -> Result<()> {
 
     let mut args = Args::parse();
 
-    // Allow env override for Extractous toggle.
+    // Allow env override for Extractous / IFilter / OCR toggles.
     if let Ok(val) = env::var("ULTRASEARCH_ENABLE_EXTRACTOUS") {
         args.enable_extractous = matches!(val.as_str(), "1" | "true" | "TRUE");
+    }
+    if let Ok(val) = env::var("ULTRASEARCH_ENABLE_IFILTER") {
+        args.enable_ifilter = matches!(val.as_str(), "1" | "true" | "TRUE");
+    }
+    if let Ok(val) = env::var("ULTRASEARCH_ENABLE_OCR") {
+        args.enable_ocr = matches!(val.as_str(), "1" | "true" | "TRUE");
     }
 
     #[cfg(not(feature = "extractous_backend"))]
@@ -158,7 +170,8 @@ fn main() -> Result<()> {
         args.enable_extractous = false;
     }
 
-    let stack = ExtractorStack::with_extractous_enabled(args.enable_extractous);
+    let stack =
+        ExtractorStack::with_options(args.enable_extractous, args.enable_ifilter, args.enable_ocr);
 
     // Open index writer once for the run.
     let index: ContentIndex = content_index::open_or_create(&args.index_dir)?;
@@ -1416,6 +1429,8 @@ mod tests {
             max_bytes: 1024,
             max_chars: 1024,
             enable_extractous: false,
+            enable_ifilter: false,
+            enable_ocr: false,
             json: false,
             preview_chars: 0,
             job_file: None,

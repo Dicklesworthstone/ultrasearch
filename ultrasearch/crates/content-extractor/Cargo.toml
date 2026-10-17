@@ -23,9 +23,8 @@ sha2 = "0.10.9"
 reqwest = { version = "0.12.24", features = ["stream"] }
 which = "8.0.0"
 windows = { workspace = true }
-
-[dev-dependencies]
 tempfile = "*"
+
 
 [package.metadata.doc]
 instructions = "Enable feature `extractous_backend` only after installing GraalVM CE 23.x; set GRAALVM_HOME or JAVA_HOME for build.rs."

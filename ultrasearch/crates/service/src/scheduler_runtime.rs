@@ -84,7 +84,9 @@ fn requires_content(batch: &IndexBatch) -> bool {
 /// Runtime wrapper that drives a simple scheduling loop and dispatches content batches.
 pub struct SchedulerRuntime {
     config: SchedulerConfig,
+    adaptive: Option<scheduler::AdaptivePolicy>,
     idle: IdleTracker,
+    last_idle_state: scheduler::idle::IdleState,
     load: SystemLoadSampler,
     content_jobs: VecDeque<JobSpec>,
     job_rx: mpsc::Receiver<Submission>,
@@ -100,9 +102,11 @@ pub struct SchedulerRuntime {
 
 impl SchedulerRuntime {
     pub fn new(app_cfg: &AppConfig) -> Self {
+        let warm_idle = Duration::from_secs(app_cfg.scheduler.idle_warm_seconds);
+        let deep_idle = Duration::from_secs(app_cfg.scheduler.idle_deep_seconds).max(warm_idle);
         let config = SchedulerConfig {
-            warm_idle: Duration::from_secs(app_cfg.scheduler.idle_warm_seconds),
-            deep_idle: Duration::from_secs(app_cfg.scheduler.idle_deep_seconds),
+            warm_idle,
+            deep_idle,
             cpu_metadata_max: app_cfg.scheduler.cpu_soft_limit_pct as f32,
             cpu_content_max: app_cfg.scheduler.cpu_hard_limit_pct as f32,
             disk_busy_threshold_bps: app_cfg.scheduler.disk_busy_bytes_per_s,
@@ -110,6 +114,9 @@ impl SchedulerRuntime {
             power_save_mode: app_cfg.scheduler.power_save_mode,
             ..SchedulerConfig::default()
         };
+
+        let adaptive = (app_cfg.features.adaptive_scheduler || app_cfg.features.auto_tuning)
+            .then(|| scheduler::AdaptivePolicy::new(config.clone()));
 
         let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
         let (tx, rx) = mpsc::channel(MAX_PENDING_SUBMISSIONS);
@@ -125,6 +132,7 @@ impl SchedulerRuntime {
 
         Self {
             idle: IdleTracker::new(config.warm_idle, config.deep_idle),
+            last_idle_state: scheduler::idle::IdleState::Active,
             load: SystemLoadSampler::new(config.disk_busy_threshold_bps),
             content_jobs: VecDeque::new(),
             job_rx: rx,
@@ -132,6 +140,7 @@ impl SchedulerRuntime {
             legacy_retry: None,
             runtime_id,
             dispatcher: JobDispatcher::new(app_cfg),
+            adaptive,
             config,
             live,
             current_volumes: app_cfg.volumes.clone(),
@@ -148,13 +157,34 @@ impl SchedulerRuntime {
             scanner::request_rescan();
         }
 
-        self.config.warm_idle = Duration::from_secs(app_cfg.scheduler.idle_warm_seconds);
-        self.config.deep_idle = Duration::from_secs(app_cfg.scheduler.idle_deep_seconds);
+        let warm_idle = Duration::from_secs(app_cfg.scheduler.idle_warm_seconds);
+        let deep_idle = Duration::from_secs(app_cfg.scheduler.idle_deep_seconds).max(warm_idle);
+        self.config.warm_idle = warm_idle;
+        self.config.deep_idle = deep_idle;
         self.config.cpu_metadata_max = app_cfg.scheduler.cpu_soft_limit_pct as f32;
         self.config.cpu_content_max = app_cfg.scheduler.cpu_hard_limit_pct as f32;
         self.config.disk_busy_threshold_bps = app_cfg.scheduler.disk_busy_bytes_per_s;
         self.config.content_batch_size = app_cfg.scheduler.content_batch_size as usize;
         self.config.power_save_mode = app_cfg.scheduler.power_save_mode;
+
+        self.idle.set_thresholds(warm_idle, deep_idle);
+        self.load
+            .set_disk_threshold(self.config.disk_busy_threshold_bps);
+
+        if app_cfg.features.adaptive_scheduler || app_cfg.features.auto_tuning {
+            match self.adaptive.as_mut() {
+                Some(adaptive) => adaptive.sync_base_config(&self.config),
+                None => self.adaptive = Some(scheduler::AdaptivePolicy::new(self.config.clone())),
+            }
+        } else {
+            self.adaptive = None;
+        }
+    }
+
+    fn effective_config(&self) -> &SchedulerConfig {
+        self.adaptive
+            .as_ref()
+            .map_or(&self.config, scheduler::AdaptivePolicy::config)
     }
 
     /// Submit a content indexing job (path + doc ids).
@@ -262,6 +292,17 @@ impl SchedulerRuntime {
         let app_cfg = core_types::config::get_current_config();
         self.update_config(&app_cfg);
 
+        if let Some(adaptive) = self.adaptive.as_mut() {
+            adaptive.update(&load);
+        }
+
+        if idle_sample.state == scheduler::idle::IdleState::DeepIdle
+            && self.last_idle_state != scheduler::idle::IdleState::DeepIdle
+        {
+            crate::memory::trim_working_set();
+        }
+        self.last_idle_state = idle_sample.state;
+
         self.receive_submissions();
         self.update_live_counts();
 
@@ -283,11 +324,13 @@ impl SchedulerRuntime {
         update_content_remaining(ct as u64, workers);
         update_status_metrics(None);
 
+        let policy_cfg = self.effective_config();
+
         // Extraction follows idle/load policy. Bounded deletion, reset, and
         // metadata-only batches do not extract content and must remain usable
         // while the user is active. Preserve older legacy work as a FIFO barrier.
         let allow_content =
-            self.force_allow_content || allow_content_jobs(idle_sample.state, load, &self.config);
+            self.force_allow_content || allow_content_jobs(idle_sample.state, load, policy_cfg);
         self.allow_content.store(allow_content, Ordering::Relaxed);
         if !allow_content
             && (self.legacy_retry.is_some()
@@ -301,8 +344,7 @@ impl SchedulerRuntime {
         }
 
         if self.legacy_retry.is_none() && !self.content_jobs.is_empty() {
-            let batch_size = self
-                .config
+            let batch_size = policy_cfg
                 .content_batch_size
                 .min(self.content_jobs.len())
                 .max(1);
@@ -1016,6 +1058,56 @@ mod tests {
         );
         drop(runtime);
         contender.try_lock()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_reload_updates_idle_tracker_disk_sampler_and_adaptive_policy_and_trims_on_deep_idle()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let mut cfg = AppConfig::default();
+        cfg.scheduler.idle_warm_seconds = 10;
+        cfg.scheduler.idle_deep_seconds = 30;
+        cfg.scheduler.disk_busy_bytes_per_s = 123_456;
+        cfg.features.adaptive_scheduler = false;
+        let _restore = RestoreConfig::install(&cfg)?;
+
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        assert_eq!(
+            runtime.idle.thresholds(),
+            (Duration::from_secs(10), Duration::from_secs(30))
+        );
+        assert_eq!(runtime.load.disk_threshold(), 123_456);
+        assert!(runtime.adaptive.is_none());
+
+        // Hot-reload thresholds and enable adaptive_scheduler
+        cfg.scheduler.idle_warm_seconds = 25;
+        cfg.scheduler.idle_deep_seconds = 90;
+        cfg.scheduler.disk_busy_bytes_per_s = 987_654;
+        cfg.features.adaptive_scheduler = true;
+        core_types::config::set_current_config(cfg.clone())?;
+
+        let trims_before = crate::memory::working_set_trim_count();
+        power_tick(&mut runtime, false).await;
+        let trims_after_first_deep_idle = crate::memory::working_set_trim_count();
+        assert_eq!(
+            trims_after_first_deep_idle,
+            trims_before + 1,
+            "transitioning into DeepIdle must trigger working-set trim"
+        );
+        assert_eq!(
+            runtime.idle.thresholds(),
+            (Duration::from_secs(25), Duration::from_secs(90))
+        );
+        assert_eq!(runtime.load.disk_threshold(), 987_654);
+        assert!(runtime.adaptive.is_some());
+
+        // Staying in DeepIdle should not repeatedly trim on every tick
+        power_tick(&mut runtime, false).await;
+        assert_eq!(
+            crate::memory::working_set_trim_count(),
+            trims_after_first_deep_idle
+        );
         Ok(())
     }
 }

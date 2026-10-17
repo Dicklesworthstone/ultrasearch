@@ -160,6 +160,9 @@ impl JobDispatcher {
                 .arg(&job_file_for_spawn)
                 .arg("--index-dir")
                 .arg(&index_dir_for_spawn);
+            if core_types::config::get_current_config().extract.ocr_enabled {
+                command.arg("--enable-ocr");
+            }
 
             #[cfg(target_os = "windows")]
             let job = {

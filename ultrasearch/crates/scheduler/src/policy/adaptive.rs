@@ -27,6 +27,15 @@ impl AdaptivePolicy {
         &self.config
     }
 
+    /// Synchronize non-adaptive base fields from a newly reloaded configuration.
+    pub fn sync_base_config(&mut self, base: &SchedulerConfig) {
+        self.config.warm_idle = base.warm_idle;
+        self.config.deep_idle = base.deep_idle;
+        self.config.cpu_metadata_max = base.cpu_metadata_max;
+        self.config.disk_busy_threshold_bps = base.disk_busy_threshold_bps;
+        self.config.power_save_mode = base.power_save_mode;
+    }
+
     /// Update internal state and adjust config if needed.
     pub fn update(&mut self, load: &SystemLoad) {
         // Smooth CPU load to avoid jerky reactions

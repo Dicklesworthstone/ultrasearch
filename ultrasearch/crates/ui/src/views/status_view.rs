@@ -137,10 +137,11 @@ impl Render for StatusView {
             .flex()
             .items_center()
             .justify_center()
-            .on_action(cx.listener(|_, _: &CloseStatus, _window, _| {
-                // Action handled by window to close view, or model update
-                // Wait, we need to close it.
-                // Window listener will toggle flag.
+            .on_action(cx.listener(|this, _: &CloseStatus, _window, cx| {
+                this.model.update(cx, |m, cx| {
+                    m.show_status = false;
+                    cx.notify();
+                });
             }))
             .child(
                 div()
@@ -177,8 +178,12 @@ impl Render for StatusView {
                                     .hover(|s| s.text_color(colors.text_primary))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| {
-                                            cx.dispatch_action(&CloseStatus);
+                                        cx.listener(|this, _, window, cx| {
+                                            this.model.update(cx, |m, cx| {
+                                                m.show_status = false;
+                                                cx.notify();
+                                            });
+                                            window.dispatch_action(Box::new(CloseStatus), cx);
                                         }),
                                     ),
                             ),

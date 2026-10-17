@@ -1,14 +1,20 @@
 use anyhow::Result;
+#[cfg(target_os = "windows")]
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
+#[cfg(target_os = "windows")]
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use once_cell::sync::OnceCell;
 use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(target_os = "windows")]
 use std::thread;
+#[cfg(target_os = "windows")]
 use std::time::Duration;
+#[cfg(target_os = "windows")]
 use sysinfo::System;
+#[cfg(target_os = "windows")]
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,6 +45,15 @@ pub enum UserAction {
     ToggleOptIn,
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn spawn() -> Result<Receiver<UserAction>> {
+    let (_tx, rx) = mpsc::channel();
+    let (status_tx, _status_rx) = mpsc::channel();
+    let _ = TRAY_STATE_TX.set(status_tx);
+    Ok(rx)
+}
+
+#[cfg(target_os = "windows")]
 pub fn spawn() -> Result<Receiver<UserAction>> {
     let (tx, rx) = mpsc::channel();
     let (status_tx, status_rx) = mpsc::channel();
@@ -162,7 +177,6 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
         });
 
         // 5. Run Platform Message Loop (Windows)
-        #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{
                 DispatchMessageW, GetMessageW, TranslateMessage, MSG,
@@ -173,16 +187,12 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
                 DispatchMessageW(&msg);
             }
         }
-
-        #[cfg(not(target_os = "windows"))]
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
     });
 
     Ok(rx)
 }
 
+#[cfg(target_os = "windows")]
 fn detect_powertoys_run() -> bool {
     let sys = System::new_all();
     sys.processes().values().any(|p| {

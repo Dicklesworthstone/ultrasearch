@@ -22,44 +22,27 @@ impl IFilterExtractor {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl Default for IFilterExtractor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Extractor for IFilterExtractor {
-    fn name(&self) -> &'static str {
-        "ifilter"
-    }
-
-    fn supports(&self, ctx: &ExtractContext) -> bool {
-        if let Some(ext) = super::resolve_ext(ctx) {
-            // Some legacy formats often have IFilters
-            matches!(ext.as_str(), "rtf" | "odt" | "msg")
-        } else {
-            false
+    fn extract_from_path(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        path: &Path,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let meta = std::fs::metadata(path).map_err(|e| ExtractError::Failed(e.to_string()))?;
+        let max_bytes = ctx.max_bytes as u64;
+        if meta.len() > max_bytes {
+            return Err(ExtractError::FileTooLarge {
+                bytes: meta.len(),
+                max_bytes,
+            });
         }
-    }
-
-    fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
-        let path = Path::new(ctx.path);
         let path_hstring = HSTRING::from(path.as_os_str());
 
         unsafe {
-            // Attempt init; track whether we should uninitialize.
             let coinit_hr = CoInitialize(None);
             let should_uninit = coinit_hr.is_ok();
-            // Defer uninit? In a thread pool, we might init once per thread.
-            // Here we are likely in a rayon thread.
-            // Ideally we should use a scope guard or just assume the thread is initialized by the runtime wrapper.
-            // But rayon threads are generic.
-            // Let's defer uninit for correctness in this scope.
-            // Actually, excessive init/uninit is slow.
 
-            // Scope guard for CoUninitialize
             struct CoGuard(bool);
             impl Drop for CoGuard {
                 fn drop(&mut self) {
@@ -105,18 +88,9 @@ impl Extractor for IFilterExtractor {
                 )));
             }
 
-            // Extract text chunks
-            let mut text = String::new();
-            let mut truncated = false;
-            let mut bytes_processed = 0;
-
-            // Stat chunk
-            // STAT_CHUNK struct.
-            // IFilter::GetChunk(&mut stat)
-
-            // Loop chunks
-            // Reading text: IFilter::GetText(&mut buffer)
-            // We need a buffer.
+            let mut raw_text = String::new();
+            let mut char_count = 0usize;
+            let mut truncated_early = false;
 
             loop {
                 let mut stat = STAT_CHUNK::default();
@@ -131,46 +105,84 @@ impl Extractor for IFilterExtractor {
                 }
 
                 if stat.flags.0 & CHUNK_TEXT.0 == CHUNK_TEXT.0 {
-                    // Read text
                     loop {
                         let mut buf = [0u16; 4096];
                         let mut count = buf.len() as u32;
                         let hr = filter.GetText(&mut count, PWSTR(buf.as_mut_ptr()));
 
-                        if hr == FILTER_E_NO_MORE_TEXT.0 {
-                            break;
-                        }
-                        if hr != S_OK.0 {
-                            break;
-                        }
-                        if count == 0 {
+                        if hr == FILTER_E_NO_MORE_TEXT.0 || hr != S_OK.0 || count == 0 {
                             break;
                         }
 
                         let chunk = String::from_utf16_lossy(&buf[..count as usize]);
-                        let (trimmed, was_trunc, used) = enforce_limits_str(&chunk, ctx);
-                        text.push_str(&trimmed);
-                        bytes_processed += used; // approximate bytes from the UTF-16 slice
-                        if was_trunc || text.len() >= ctx.max_chars {
-                            truncated = true;
+                        char_count = char_count.saturating_add(chunk.chars().count());
+                        raw_text.push_str(&chunk);
+                        if raw_text.len() > ctx.max_bytes || char_count > ctx.max_chars {
+                            truncated_early = true;
                             break;
                         }
                     }
                 }
 
-                if truncated {
+                if truncated_early {
                     break;
                 }
             }
 
+            let (text, truncated_by_limits, bytes_processed) = enforce_limits_str(&raw_text, ctx);
             Ok(ExtractedContent {
                 key,
                 text,
                 lang: None,
-                truncated,
+                truncated: truncated_early || truncated_by_limits,
                 content_lang: None,
                 bytes_processed,
             })
         }
+    }
+}
+
+impl Default for IFilterExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Extractor for IFilterExtractor {
+    fn name(&self) -> &'static str {
+        "ifilter"
+    }
+
+    fn supports(&self, ctx: &ExtractContext) -> bool {
+        if let Some(ext) = super::resolve_ext(ctx) {
+            matches!(ext.as_str(), "rtf" | "odt" | "msg" | "doc" | "xls" | "ppt")
+        } else {
+            false
+        }
+    }
+
+    fn extract(&self, ctx: &ExtractContext, key: DocKey) -> Result<ExtractedContent, ExtractError> {
+        self.extract_from_path(ctx, key, Path::new(ctx.path))
+    }
+
+    fn extract_file(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        file: &std::fs::File,
+    ) -> Result<ExtractedContent, ExtractError> {
+        let bytes = crate::read_file_snapshot(file, ctx.max_bytes)?;
+        self.extract_bytes(ctx, key, &bytes)
+    }
+
+    fn extract_bytes(
+        &self,
+        ctx: &ExtractContext,
+        key: DocKey,
+        bytes: &[u8],
+    ) -> Result<ExtractedContent, ExtractError> {
+        crate::with_snapshot_tempfile(ctx, bytes, |temp_path| {
+            self.extract_from_path(ctx, key, temp_path)
+        })
     }
 }
