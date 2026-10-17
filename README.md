@@ -55,12 +55,8 @@ This section is for people who just want to install and use UltraSearch. The res
 > **Download (Windows)**
 > **[https://github.com/Dicklesworthstone/ultrasearch/releases/latest](https://github.com/Dicklesworthstone/ultrasearch/releases/latest)**
 
-> [!IMPORTANT]
-> **There is currently no installer.** The MSI is built but deliberately not published, because uninstalling it fails and leaves a running service behind ([#3](https://github.com/Dicklesworthstone/ultrasearch/issues/3)). Removing it would require `sc delete` from an elevated prompt, so shipping it would be worse than shipping nothing.
->
-> Until #3 is fixed, the release publishes the binaries directly and steps 2 and 3 below do not apply. Download `ui.exe`, `service.exe`, `index-worker.exe`, `cli.exe` and `launcher.exe`, place them together in one directory, and run `ui.exe`. The Windows service is not registered automatically.
-
-Once the installer is restored you will see a `.exe` or `.msi` installer asset on that page; download it and continue with the steps below.
+> [!TIP]
+> **MSI Installer & Portable Binaries Available.** Download the `.msi` installer asset from the latest release page for automatic Windows Service registration and Start Menu shortcuts, or download the portable binaries (`launcher.exe`, `ui.exe`, `service.exe`, `index-worker.exe`, `cli.exe`) into a single directory and run `launcher.exe`.
 
 ### 2. Install
 
