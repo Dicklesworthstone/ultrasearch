@@ -1,3 +1,4 @@
+use super::worker_output::{OutputReservation, configure_command, record_problem};
 use anyhow::{Context, Result};
 use core_types::INDEX_WORKER_PROCESS_TIMEOUT;
 use core_types::config::AppConfig;
@@ -142,6 +143,7 @@ impl JobDispatcher {
         let job_file_for_spawn = job_file_path.clone();
         let index_dir_for_spawn = self.index_dir.clone();
         let index_dir_for_log = index_dir_for_spawn.clone();
+        let diagnostic_batch = work.clone();
 
         let status = task::spawn_blocking(move || -> anyhow::Result<ExitStatus> {
             // File writes and cleanup share the blocking owner's lifetime.
@@ -160,6 +162,8 @@ impl JobDispatcher {
                 .arg(&job_file_for_spawn)
                 .arg("--index-dir")
                 .arg(&index_dir_for_spawn);
+            configure_command(&mut command);
+            let output_slots = OutputReservation::reserve()?;
 
             #[cfg(target_os = "windows")]
             let job = {
@@ -197,16 +201,65 @@ impl JobDispatcher {
                 resume_worker_thread(child.child.id())?;
             }
 
-            let status = child.wait_for_exit(INDEX_WORKER_PROCESS_TIMEOUT)?;
+            let output = output_slots.start(&mut child.child)?;
+            let waited = child.wait_for_exit(INDEX_WORKER_PROCESS_TIMEOUT);
+            if waited.is_err() {
+                // Preserve the ownership/cleanup boundary even when polling
+                // fails rather than timing out. Keep the lease through report
+                // publication and receipt validation, not just child exit.
+                child.stop_and_reap();
+            }
+            // Contained descendants can inherit stdout/stderr. Close their job
+            // before waiting for EOF, while retaining the worker lane above.
+            #[cfg(target_os = "windows")]
+            drop(job);
+            let output = output.finish();
+            let committed = match &waited {
+                Ok(status) if status.success() => {
+                    // An empty batch also needs a real receipt. Neither successful
+                    // exit alone nor a receipt left by a failed attempt is an ACK.
+                    validate_worker_commit(&index_dir_for_spawn, batch_id).with_context(|| {
+                        format!(
+                            "worker batch {batch_id} exited successfully without its committed receipt; retained job file {}",
+                            job_file_for_spawn.display()
+                        )
+                    })
+                }
+                Ok(status) => Err(anyhow::anyhow!("worker exited with {status}")),
+                Err(error) => Err(anyhow::anyhow!("{error:#}")),
+            };
+            let deferred = committed.as_ref().ok().map(Vec::as_slice);
+            if committed.is_err()
+                || deferred.is_some_and(|keys| !keys.is_empty())
+                || output.incomplete()
+            {
+                let outcome = match &committed {
+                    Ok(keys) => format!(
+                        "worker committed; {} files deferred; output_incomplete={}",
+                        keys.len(),
+                        output.incomplete()
+                    ),
+                    Err(error) => format!("{error:#}"),
+                };
+                // Evidence is best-effort, never an acknowledgement. A full
+                // disk or log failure must neither consume a failed cursor nor
+                // force an otherwise committed batch to replay indefinitely.
+                match record_problem(
+                    &jobs_dir_for_spawn,
+                    &diagnostic_batch,
+                    &outcome,
+                    deferred,
+                    &output,
+                ) {
+                    Ok(path) => tracing::warn!(batch = %batch_id, diagnostics = %path.display(), "worker diagnostic report retained"),
+                    Err(error) => tracing::warn!(batch = %batch_id, %error, "cannot retain worker diagnostics; commit outcome is unchanged"),
+                }
+            } else {
+                output.log_warnings(batch_id);
+            }
+            let status = waited?;
             if status.success() {
-                // An empty batch also needs a real receipt. Neither successful
-                // exit alone nor a receipt left by a failed attempt is an ACK.
-                validate_worker_commit(&index_dir_for_spawn, batch_id).with_context(|| {
-                    format!(
-                        "worker batch {batch_id} exited successfully without its committed receipt; retained job file {}",
-                        job_file_for_spawn.display()
-                    )
-                })?;
+                committed?;
                 // Best-effort cleanup remains inside the owner of the reaped
                 // child and its permit; a later retry cannot overtake it.
                 std::fs::remove_file(&job_file_for_spawn).ok();
@@ -238,16 +291,18 @@ impl JobDispatcher {
     }
 }
 
-fn validate_worker_commit(index_dir: &Path, batch_id: uuid::Uuid) -> Result<()> {
+fn validate_worker_commit(index_dir: &Path, batch_id: uuid::Uuid) -> Result<Vec<core_types::DocKey>> {
     // Do not create an index here: an absent committed index is a failed ACK.
     let index = tantivy::Index::open_in_dir(index_dir)?;
     content_index::validate_schema(&index)?;
-    let committed = content_index::committed_batch(&index)?;
+    let outcome = content_index::batch_outcome(&index)?
+        .context("content index has no committed ingestion receipt")?;
+    let committed = outcome.receipt;
     anyhow::ensure!(
-        committed == Some(batch_id),
+        committed.complete && committed.batch_id == batch_id,
         "content index receipt {committed:?} does not match worker batch {batch_id}"
     );
-    Ok(())
+    Ok(outcome.deferred)
 }
 
 struct WorkerChild {
@@ -260,6 +315,13 @@ struct WorkerChild {
 }
 
 impl WorkerChild {
+    fn stop_and_reap(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus> {
         let started = Instant::now();
         loop {
@@ -289,12 +351,9 @@ impl WorkerChild {
 
 impl Drop for WorkerChild {
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            // Every error path owns its child until it has been stopped and
-            // reaped, so a later replay cannot race a leftover writer.
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        // Every error path owns its child until it has been stopped and
+        // reaped, so a later replay cannot race a leftover writer.
+        self.stop_and_reap();
     }
 }
 
@@ -376,6 +435,50 @@ fn resume_worker_thread(process_id: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_output_is_drained_but_never_substitutes_for_a_commit_receipt() -> Result<()> {
+        use std::process::{Command, Stdio};
+        // This is a real process/pipe test, not an NTFS worker simulation.
+        // Both streams exceed a pipe buffer; stopping reads at the tail limit
+        // would stall this child before it reaches its final markers.
+        let root = tempfile::tempdir()?;
+        let worker_lane = acquire_worker_lane().await?;
+        let slots = OutputReservation::reserve()?;
+        let script = "i=0; while [ $i -lt 10000 ]; do printf 'out-record\\n'; printf 'err-record\\n' >&2; i=$((i+1)); done; printf 'stdout-final\\n'; printf 'stderr-final\\n' >&2";
+        let mut child = WorkerChild {
+            child: Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+            _mutation_lease: None,
+            _worker_lane: Some(worker_lane),
+        };
+        let output = slots.start(&mut child.child)?;
+        assert!(child.wait_for_exit(Duration::from_secs(10))?.success());
+        let output = output.finish();
+        assert!(!output.incomplete());
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: Vec::new(),
+            reset_volumes: Vec::new(),
+        };
+        let content = root.path().join("absent-index");
+        assert!(validate_worker_commit(&content, batch.id).is_err());
+        let report = record_problem(root.path(), &batch, "receipt missing", None, &output)?;
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(report)?)?;
+        for (stream, suffix) in [("stdout", "stdout-final\n"), ("stderr", "stderr-final\n")] {
+            assert!(report["output"][stream]["text"].as_str().unwrap().ends_with(suffix));
+            assert!(report["output"][stream]["dropped_bytes"].as_u64().unwrap() > 0);
+        }
+        assert!(report["deferred_count"].is_null());
+        assert!(!content.exists());
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -506,7 +609,7 @@ mod tests {
         content_index::commit_partial_batch(&mut writer, requested)?;
         assert!(validate_worker_commit(&path, requested).is_err());
         content_index::commit_batch(&mut writer, requested)?;
-        validate_worker_commit(&path, requested)?;
+        assert!(validate_worker_commit(&path, requested)?.is_empty());
         // Deferrals are durable output, not a process failure. Their membership
         // in the pending intent is checked by the service before checkpointing.
         content_index::commit_batch_with_deferred(
@@ -514,7 +617,10 @@ mod tests {
             requested,
             &[core_types::DocKey::from_parts(7, 42)],
         )?;
-        validate_worker_commit(&path, requested)?;
+        assert_eq!(
+            validate_worker_commit(&path, requested)?,
+            [core_types::DocKey::from_parts(7, 42)]
+        );
         // An external plain commit no longer attests to this batch, even if its
         // previously stamped ingestion-generation sidecar was left untouched.
         writer.commit()?;
