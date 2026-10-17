@@ -20,13 +20,13 @@ if (-not $Version) {
 
 Write-Host "Building release binaries (version $Version)..."
 $TargetTriple = "x86_64-pc-windows-msvc"
-cargo build --locked --release --target $TargetTriple -p service -p index-worker -p ui -p launcher
+cargo build --locked --release --target $TargetTriple -p service -p index-worker -p ui -p launcher -p cli
 if ($LASTEXITCODE -ne 0) { throw "Release binary build failed (exit $LASTEXITCODE)" }
 
 # Honor the caller's target directory, including the managed RCH/DSR buildroot.
 $TargetRoot = if ($Env:CARGO_TARGET_DIR) { $Env:CARGO_TARGET_DIR } else { "target" }
 $BinDir = Join-Path (Join-Path $TargetRoot $TargetTriple) "release"
-foreach ($Binary in @("service.exe", "index-worker.exe", "ui.exe", "launcher.exe")) {
+foreach ($Binary in @("service.exe", "index-worker.exe", "ui.exe", "launcher.exe", "cli.exe")) {
     if (-not (Test-Path -LiteralPath (Join-Path $BinDir $Binary) -PathType Leaf)) {
         throw "Required installer binary missing: $(Join-Path $BinDir $Binary)"
     }
