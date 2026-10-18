@@ -22,16 +22,21 @@ impl IconCache {
     }
 
     pub fn get(&mut self, ext: &str, cx: &mut Context<Self>) -> Option<ImageSource> {
-        if let Some(src) = self.cache.get(ext) {
-            return Some(src.clone());
+        let trimmed = ext.trim();
+        if trimmed.is_empty() {
+            return None;
         }
 
-        // Ensure we have a normalized extension (with dot)
-        let ext_normalized = if ext.starts_with('.') {
-            ext.to_string()
+        // Ensure we have a normalized lowercase extension (with leading dot)
+        let ext_normalized = if trimmed.starts_with('.') {
+            trimmed.to_ascii_lowercase()
         } else {
-            format!(".{}", ext)
+            format!(".{}", trimmed.to_ascii_lowercase())
         };
+
+        if let Some(src) = self.cache.get(&ext_normalized) {
+            return Some(src.clone());
+        }
 
         if !self.pending.contains(&ext_normalized) {
             self.pending.insert(ext_normalized.clone());
@@ -48,9 +53,6 @@ impl IconCache {
                         .spawn(async move { load_icon_png(&ext_bg) })
                         .await;
 
-                    // Update model
-                    // Note: WeakEntity::update usually expects `&mut AsyncApp` or similar.
-                    // Since we have `mut cx: AsyncApp` (owned), we pass `&mut cx`.
                     let _ = this.update(
                         &mut cx,
                         |this: &mut IconCache, cx: &mut Context<IconCache>| {
@@ -60,7 +62,10 @@ impl IconCache {
                                 let hash = md5::compute(&ext_clone);
                                 let file_path = temp_dir.join(format!("{:x}.png", hash));
                                 if std::fs::write(&file_path, data).is_ok() {
-                                    // ImageSource::from(PathBuf) works
+                                    const MAX_ICON_CACHE_ENTRIES: usize = 256;
+                                    if this.cache.len() >= MAX_ICON_CACHE_ENTRIES {
+                                        this.cache.clear();
+                                    }
                                     let source = ImageSource::from(file_path);
                                     this.cache.insert(ext_clone, source);
                                     cx.notify();
@@ -91,7 +96,7 @@ fn load_icon_png(ext: &str) -> Option<Vec<u8>> {
     use windows::Win32::UI::Shell::{
         SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo};
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
     unsafe {
         let mut shfi = SHFILEINFOW::default();
@@ -111,7 +116,7 @@ fn load_icon_png(ext: &str) -> Option<Vec<u8>> {
 
         let hicon = shfi.hIcon;
 
-        let mut icon_info = std::mem::zeroed();
+        let mut icon_info = ICONINFO::default();
         if GetIconInfo(hicon, &mut icon_info).is_err() {
             let _ = DestroyIcon(hicon);
             return None;
@@ -126,7 +131,7 @@ fn load_icon_png(ext: &str) -> Option<Vec<u8>> {
             icon_info.hbmMask
         };
 
-        let mut bmp = std::mem::zeroed::<BITMAP>();
+        let mut bmp = BITMAP::default();
         GetObjectW(
             hbm,
             std::mem::size_of::<BITMAP>() as i32,

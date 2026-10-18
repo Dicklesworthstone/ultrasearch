@@ -36,12 +36,15 @@ struct UltraSearchWindow {
 }
 
 impl UltraSearchWindow {
-    fn new(cx: &mut Context<Self>, show_onboarding: bool) -> Self {
+    fn new(cx: &mut Context<Self>, show_onboarding: bool, initial_query: Option<String>) -> Self {
         let model = cx.new(SearchAppModel::new);
 
-        // Update model with onboarding state
-        model.update(cx, |model, _cx| {
+        // Update model with onboarding state and any initial URI/CLI query
+        model.update(cx, |model, cx| {
             model.show_onboarding = show_onboarding;
+            if let Some(q) = initial_query {
+                model.set_query(q, cx);
+            }
         });
 
         let search_view = cx.new(|cx| SearchView::new(model.clone(), cx));
@@ -180,6 +183,26 @@ impl UltraSearchWindow {
         self.model.update(cx, |model, cx| model.select_previous(cx));
     }
 
+    fn on_select_next_page(
+        &mut self,
+        _: &SelectNextPage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model
+            .update(cx, |model, cx| model.select_next_page(cx));
+    }
+
+    fn on_select_prev_page(
+        &mut self,
+        _: &SelectPrevPage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model
+            .update(cx, |model, cx| model.select_prev_page(cx));
+    }
+
     fn on_submit_search(&mut self, _: &SubmitSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.search_view.update(cx, |view, _cx| {
             window.focus(&view.focus_handle());
@@ -231,14 +254,13 @@ impl UltraSearchWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // For now, copy path to clipboard. TODO: add file drop clipboard on Windows.
         if let Some(path) = self
             .model
             .read(cx)
             .selected_row()
             .and_then(|hit| hit.path.clone())
         {
-            cx.write_to_clipboard(ClipboardItem::new_string(path));
+            ui::views::context_menu::copy_file_to_clipboard(&path, cx);
         }
     }
 
@@ -359,23 +381,15 @@ impl UltraSearchWindow {
     }
 
     fn open_selected(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self
+        let selected = self
             .model
             .read(cx)
             .selected_row()
-            .and_then(|hit| hit.path.clone())
-        {
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("explorer").arg(&path).spawn();
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open").arg(&path).spawn();
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+            .map(|hit| (hit.key, hit.path.clone()));
+        if let Some((key, path_opt)) = selected {
+            self.model.update(cx, |m, _| m.record_result_open(key));
+            if let Some(path) = path_opt {
+                ui::views::context_menu::open_path_in_os(&path);
             }
         }
     }
@@ -396,6 +410,8 @@ impl Render for UltraSearchWindow {
             .on_action(cx.listener(Self::on_clear_search))
             .on_action(cx.listener(Self::on_select_next))
             .on_action(cx.listener(Self::on_select_prev))
+            .on_action(cx.listener(Self::on_select_next_page))
+            .on_action(cx.listener(Self::on_select_prev_page))
             .on_action(cx.listener(Self::on_submit_search))
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_mode_metadata))
@@ -527,6 +543,27 @@ impl Render for UltraSearchWindow {
     }
 }
 
+fn parse_initial_query_from_args() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(q) = ui::model::state::parse_protocol_uri(&arg) {
+            return Some(q);
+        }
+        if arg == "--query" || arg == "-q" {
+            if let Some(val) = args.next() {
+                if !val.trim().is_empty() {
+                    return Some(val);
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--query=") {
+            if !val.trim().is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     // Provide a Tokio runtime so async tasks in the UI (status/search polling) have a reactor.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -535,8 +572,10 @@ fn main() {
         .expect("build tokio runtime");
     let _rt_guard = runtime.enter();
 
-    // Load configuration
+    // Load configuration and install opt-in crash hook
     let config = core_types::config::load_or_create_config(None).ok();
+    core_types::install_opt_in_crash_hook("ui");
+    let initial_query = parse_initial_query_from_args();
     let show_onboarding = config
         .as_ref()
         .map(|c| c.volumes.is_empty())
@@ -607,9 +646,16 @@ fn main() {
                                     // Activate app (bring to front)
                                     let _ = cx.update(|cx: &mut App| cx.activate(true));
                                 }
+                                ui::background::UserAction::ShowStatus => {
+                                    let _ = cx.update(|cx: &mut App| {
+                                        cx.activate(true);
+                                        cx.dispatch_action(&ToggleStatus);
+                                    });
+                                }
                                 ui::background::UserAction::ShowHelp => {
                                     let _ = cx.update(|cx: &mut App| {
-                                        cx.dispatch_action(&ToggleShortcuts)
+                                        cx.activate(true);
+                                        cx.dispatch_action(&ToggleShortcuts);
                                     });
                                 }
                                 ui::background::UserAction::Quit => {
@@ -620,57 +666,58 @@ fn main() {
                                 ui::background::UserAction::ToggleQuickSearch => {
                                     // Toggle Quick Search Window
                                     let _ = cx.update(|cx: &mut App| {
-                                        let mut global_state =
-                                            cx.global::<GlobalAppState>().quick_bar;
+                                        let global_state = cx.global::<GlobalAppState>().quick_bar;
 
-                                        if let Some(handle) = global_state.as_ref() {
+                                        if let Some(handle) = global_state {
                                             if handle
-                                                .update(cx, |view, window, _| {
-                                                    window.focus(&view.focus_handle())
+                                                .update(cx, |_, window, _| {
+                                                    window.remove_window();
                                                 })
                                                 .is_ok()
                                             {
-                                                // Window exists and activated
+                                                cx.update_global::<GlobalAppState, _>(
+                                                    |state, _| {
+                                                        state.quick_bar = None;
+                                                    },
+                                                );
                                                 return;
-                                            } else {
-                                                // Window dropped/closed
-                                                global_state = None;
                                             }
-                                        }
-
-                                        if global_state.is_none() {
-                                            let handle = cx
-                                                .open_window(
-                                                    WindowOptions {
-                                                        window_bounds: Some(
-                                                            WindowBounds::Windowed(Bounds {
-                                                                origin: Point {
-                                                                    x: px(120.0),
-                                                                    y: px(60.0),
-                                                                },
-                                                                size: Size {
-                                                                    width: px(1500.0),
-                                                                    height: px(900.0),
-                                                                },
-                                                            }),
-                                                        ),
-                                                        titlebar: None,
-                                                        window_background:
-                                                            WindowBackgroundAppearance::Transparent,
-                                                        kind: WindowKind::PopUp,
-                                                        ..WindowOptions::default()
-                                                    },
-                                                    |_, cx| {
-                                                        let model = cx.new(SearchAppModel::new);
-                                                        cx.new(|cx| QuickBarView::new(model, cx))
-                                                    },
-                                                )
-                                                .expect("failed to open quick bar");
-
                                             cx.update_global::<GlobalAppState, _>(|state, _| {
-                                                state.quick_bar = Some(handle);
+                                                state.quick_bar = None;
                                             });
                                         }
+
+                                        let handle = cx
+                                            .open_window(
+                                                WindowOptions {
+                                                    window_bounds: Some(WindowBounds::Windowed(
+                                                        Bounds {
+                                                            origin: Point {
+                                                                x: px(120.0),
+                                                                y: px(60.0),
+                                                            },
+                                                            size: Size {
+                                                                width: px(1500.0),
+                                                                height: px(900.0),
+                                                            },
+                                                        },
+                                                    )),
+                                                    titlebar: None,
+                                                    window_background:
+                                                        WindowBackgroundAppearance::Transparent,
+                                                    kind: WindowKind::PopUp,
+                                                    ..WindowOptions::default()
+                                                },
+                                                |_, cx| {
+                                                    let model = cx.new(SearchAppModel::new);
+                                                    cx.new(|cx| QuickBarView::new(model, cx))
+                                                },
+                                            )
+                                            .expect("failed to open quick bar");
+
+                                        cx.update_global::<GlobalAppState, _>(|state, _| {
+                                            state.quick_bar = Some(handle);
+                                        });
                                     });
                                 }
                                 ui::background::UserAction::CheckUpdates => {
@@ -711,6 +758,8 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-k", FocusSearch, None),
             KeyBinding::new("ctrl-k", FocusSearch, None),
+            KeyBinding::new("cmd-f", FocusSearch, None),
+            KeyBinding::new("ctrl-f", FocusSearch, None),
             KeyBinding::new("f1", ToggleShortcuts, None),
             KeyBinding::new("ctrl-/", ToggleShortcuts, None),
             KeyBinding::new("cmd-/", ToggleShortcuts, None),
@@ -718,6 +767,8 @@ fn main() {
             KeyBinding::new("enter", SubmitSearch, None),
             KeyBinding::new("down", SelectNext, None),
             KeyBinding::new("up", SelectPrev, None),
+            KeyBinding::new("pagedown", SelectNextPage, None),
+            KeyBinding::new("pageup", SelectPrevPage, None),
             KeyBinding::new("cmd-1", ModeMetadata, None),
             KeyBinding::new("ctrl-1", ModeMetadata, None),
             KeyBinding::new("cmd-2", ModeMixed, None),
@@ -730,6 +781,7 @@ fn main() {
             KeyBinding::new("ctrl-c", CopySelectedPath, None),
             KeyBinding::new("ctrl-shift-c", CopySelectedFile, None),
             KeyBinding::new("alt-enter", ShowProperties, None),
+            KeyBinding::new("ctrl-enter", OpenContainingFolder, None),
             KeyBinding::new("ctrl-shift-o", OpenContainingFolder, None),
             KeyBinding::new("cmd-q", QuitApp, None),
             KeyBinding::new("ctrl-q", QuitApp, None),
@@ -737,6 +789,7 @@ fn main() {
         ]);
 
         // Open the main window
+        let init_q = initial_query.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -762,16 +815,16 @@ fn main() {
                 app_id: Some("com.ultrasearch.desktop".to_string()),
                 ..WindowOptions::default()
             },
-            move |_, cx| cx.new(|cx| UltraSearchWindow::new(cx, show_onboarding)),
+            move |_, cx| cx.new(|cx| UltraSearchWindow::new(cx, show_onboarding, init_q.clone())),
         )
         .expect("Failed to open window");
 
         // Print startup message
         eprintln!("✅ UltraSearch started successfully!");
         eprintln!("🌀 Keyboard shortcuts:");
-        eprintln!("   Ctrl/Cmd+K    - Focus search");
+        eprintln!("   Ctrl/Cmd+K/F  - Focus search");
         eprintln!("   Escape        - Clear search");
-        eprintln!("   ↑/↓           - Navigate results");
+        eprintln!("   ↑/↓/PgUp/PgDn - Navigate results");
         eprintln!("   Ctrl+1/2/3    - Switch search modes");
         eprintln!("   Ctrl+Q        - Quit");
 

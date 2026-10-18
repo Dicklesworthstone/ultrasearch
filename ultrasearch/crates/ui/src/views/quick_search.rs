@@ -31,6 +31,26 @@ impl QuickBarView {
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
+
+    fn open_selected_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (query, selected) = {
+            let m = self.model.read(cx);
+            (
+                m.query.clone(),
+                m.selected_row().map(|h| (h.key, h.path.clone())),
+            )
+        };
+        self.model.update(cx, |m, _| {
+            m.push_history(&query);
+            if let Some((key, _)) = selected {
+                m.record_result_open(key);
+            }
+        });
+        if let Some((_, Some(path))) = selected {
+            crate::views::context_menu::open_path_in_os(&path);
+        }
+        window.remove_window();
+    }
 }
 
 impl Render for QuickBarView {
@@ -45,26 +65,33 @@ impl Render for QuickBarView {
             .on_action(cx.listener(|_, _: &ClearSearch, window, _cx| {
                 window.remove_window();
             }))
+            .on_action(cx.listener(|this, _: &SelectNext, _window, cx| {
+                this.model.update(cx, |m, cx| m.select_next(cx));
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrev, _window, cx| {
+                this.model.update(cx, |m, cx| m.select_previous(cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenSelected, window, cx| {
+                this.open_selected_and_close(window, cx);
+            }))
             .on_mouse_down_out(cx.listener(|_, _, window, _cx| {
                 window.remove_window();
             }))
-            .on_key_down({
-                let model = self.model.clone();
-                cx.listener(move |_, event: &KeyDownEvent, window, cx| {
-                    match event.keystroke.key.as_str() {
-                        "escape" => window.remove_window(),
-                        "arrowdown" => cx.dispatch_action(&SelectNext),
-                        "arrowup" => cx.dispatch_action(&SelectPrev),
-                        "enter" => {
-                            let query = model.read(cx).query.clone();
-                            model.update(cx, |m: &mut SearchAppModel, _| m.push_history(&query));
-                            cx.dispatch_action(&OpenSelected);
-                            window.remove_window();
-                        }
-                        _ => {}
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => window.remove_window(),
+                    "arrowdown" | "down" => {
+                        this.model.update(cx, |m, cx| m.select_next(cx));
                     }
-                })
-            })
+                    "arrowup" | "up" => {
+                        this.model.update(cx, |m, cx| m.select_previous(cx));
+                    }
+                    "enter" => {
+                        this.open_selected_and_close(window, cx);
+                    }
+                    _ => {}
+                }
+            }))
             .flex()
             .items_center()
             .justify_center()

@@ -260,10 +260,12 @@ impl Render for HelpPanel {
             Self::section(
                 "Navigation",
                 &[
-                    ("Ctrl/Cmd+K", "Focus search"),
+                    ("Ctrl/Cmd+K or Ctrl/Cmd+F", "Focus search"),
                     ("Up / Down", "Move selection"),
-                    ("Enter", "Open selected"),
-                    ("Ctrl+1/2/3", "Switch modes"),
+                    ("PageUp / PageDown", "Move selection by page"),
+                    ("Enter / Ctrl+O", "Open selected"),
+                    ("Escape", "Clear search / Dismiss overlay"),
+                    ("Ctrl+1 / 2 / 3", "Switch Name / Mixed / Content mode"),
                 ],
                 &self.filter,
                 cx,
@@ -271,10 +273,10 @@ impl Render for HelpPanel {
             Self::section(
                 "Actions",
                 &[
-                    ("Ctrl/Cmd+C", "Copy path"),
-                    ("Ctrl+Shift+C", "Copy file"),
-                    ("Ctrl+Shift+O", "Open folder"),
-                    ("Alt+Enter", "Properties"),
+                    ("Ctrl/Cmd+C", "Copy full path"),
+                    ("Ctrl+Shift+C", "Copy file to clipboard"),
+                    ("Ctrl+Enter / Ctrl+Shift+O", "Open containing folder"),
+                    ("Alt+Enter", "Show file properties"),
                 ],
                 &self.filter,
                 cx,
@@ -282,9 +284,10 @@ impl Render for HelpPanel {
             Self::section(
                 "System",
                 &[
-                    ("F1 / Ctrl+/", "Toggle help"),
-                    ("Alt+Space", "Quick Search palette"),
-                    ("Ctrl/Cmd+Q", "Quit"),
+                    ("F1 / Ctrl+/", "Toggle help & shortcuts"),
+                    ("Alt+Space", "Toggle Spotlight Quick Search bar"),
+                    ("Ctrl+M", "Minimize to system tray"),
+                    ("Ctrl/Cmd+Q", "Quit application"),
                 ],
                 &self.filter,
                 cx,

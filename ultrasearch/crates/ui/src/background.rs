@@ -36,6 +36,7 @@ pub fn set_tray_status(state: TrayState) {
 
 pub enum UserAction {
     Show,
+    ShowStatus,
     ShowHelp,
     Quit,
     ToggleQuickSearch,
@@ -77,6 +78,7 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
             // --- Tray ---
             let menu = Menu::new();
             let show_item = MenuItem::new("Show UltraSearch", true, None);
+            let status_item = MenuItem::new("⚙ Service Health", true, None);
             let status_indexing = CheckMenuItem::new("🔄 Indexing", true, false, None);
             let status_offline = CheckMenuItem::new("⚠ Offline", true, false, None);
             let status_update = CheckMenuItem::new("⬆ Update available", true, false, None);
@@ -86,6 +88,7 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
             let quit_item = MenuItem::new("✕ Quit", true, None);
             let _ = menu.append_items(&[
                 &show_item,
+                &status_item,
                 &status_indexing,
                 &status_offline,
                 &status_update,
@@ -117,6 +120,7 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
                 .unwrap();
 
             let show_id = show_item.id().clone();
+            let status_id = status_item.id().clone();
             let help_id = help_item.id().clone();
             let check_id = check_updates_item.id().clone();
             let restart_id = restart_item.id().clone();
@@ -148,6 +152,8 @@ pub fn spawn() -> Result<Receiver<UserAction>> {
                 if let Ok(event) = menu_rx.try_recv() {
                     if event.id == show_id {
                         let _ = tx_clone.send(UserAction::Show);
+                    } else if event.id == status_id {
+                        let _ = tx_clone.send(UserAction::ShowStatus);
                     } else if event.id == help_id {
                         let _ = tx_clone.send(UserAction::ShowHelp);
                     } else if event.id == check_id {

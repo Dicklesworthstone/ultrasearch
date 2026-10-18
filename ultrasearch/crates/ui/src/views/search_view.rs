@@ -256,6 +256,20 @@ impl SearchView {
         cx.notify();
     }
 
+    fn toggle_filter_token(&mut self, token: &str, cx: &mut Context<Self>) {
+        let current = self.input_text.to_string();
+        let mut parts: Vec<String> = current.split_whitespace().map(str::to_string).collect();
+        if let Some(pos) = parts.iter().position(|p| p.eq_ignore_ascii_case(token)) {
+            parts.remove(pos);
+        } else {
+            parts.push(token.to_string());
+        }
+        let updated = parts.join(" ");
+        self.cursor = updated.len();
+        self.selection = None;
+        self.handle_input(&updated, cx);
+    }
+
     fn set_mode(&mut self, mode: BackendMode, cx: &mut Context<Self>) {
         self.model.update(cx, |model, cx| {
             model.set_backend_mode(mode, cx);
@@ -663,7 +677,42 @@ impl Render for SearchView {
                             }),
                     )
                     .when(has_query, |this| {
+                        let is_pinned = self.model.read(cx).is_query_pinned(&query);
+                        let query_for_pin = query.clone();
                         this.child(
+                            div()
+                                .px_2()
+                                .py_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if is_pinned {
+                                    colors.match_highlight
+                                } else {
+                                    colors.border
+                                })
+                                .bg(if is_pinned {
+                                    colors.selection_bg
+                                } else {
+                                    colors.panel_bg
+                                })
+                                .text_size(px(11.))
+                                .text_color(if is_pinned {
+                                    colors.text_primary
+                                } else {
+                                    colors.text_secondary
+                                })
+                                .cursor_pointer()
+                                .child(if is_pinned { "📌 Pinned" } else { "📌 Pin" })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.model.update(cx, |m, cx| {
+                                            m.toggle_pin_query(&query_for_pin, cx);
+                                        });
+                                    }),
+                                ),
+                        )
+                        .child(
                             // Clear button (only shown when there's text)
                             div()
                                 .px_2()
@@ -715,25 +764,74 @@ impl Render for SearchView {
                             )),
                     ),
             )
-            .child(
-                // Inline helper tips
+            .child({
+                let chips: [(&'static str, &'static str); 6] = [
+                    ("📄 Docs", "kind:docs"),
+                    ("🧑‍💻 Code", "kind:code"),
+                    ("🖼 Images", "kind:image"),
+                    ("📅 Today", "modified:today"),
+                    ("📅 Last 7d", "modified:7d"),
+                    ("📦 >10MB", "size:>10mb"),
+                ];
+                let active_tokens: Vec<String> = query
+                    .split_whitespace()
+                    .map(|t| t.to_ascii_lowercase())
+                    .collect();
                 div()
                     .px_4()
                     .pb_2()
-                    .text_size(px(11.))
-                    .text_color(colors.text_secondary)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .child(
                         div()
                             .flex()
-                            .gap_3()
-                            .child("Name = fastest filenames")
-                            .child("Mixed = filenames + top snippets")
-                            .child("Content = full-text, richest results")
+                            .items_center()
+                            .gap_1p5()
+                            .children(chips.into_iter().map(|(label, token)| {
+                                let active = active_tokens.iter().any(|t| t == token);
+                                div()
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(if active {
+                                        colors.match_highlight
+                                    } else {
+                                        colors.border
+                                    })
+                                    .bg(if active {
+                                        colors.selection_bg
+                                    } else {
+                                        colors.panel_bg
+                                    })
+                                    .text_size(px(11.))
+                                    .text_color(if active {
+                                        colors.text_primary
+                                    } else {
+                                        colors.text_secondary
+                                    })
+                                    .hover(|s| s.text_color(colors.text_primary))
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.toggle_filter_token(token, cx);
+                                        }),
+                                    )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(colors.text_secondary)
                             .child(
                                 "Copy path: Ctrl/Cmd+C | Copy file: Ctrl+Shift+C | Properties: Alt+Enter",
                             ),
-                    ),
-            )
+                    )
+            })
             .child(
                 // Indexing progress snapshot
                 div()

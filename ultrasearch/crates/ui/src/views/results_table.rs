@@ -1,9 +1,8 @@
-use crate::actions::{CopySelectedPath, OpenContainingFolder, ShowProperties};
 use crate::globals::GlobalAppState;
 use crate::icon_cache::IconCache;
 use crate::model::state::SearchAppModel;
 use crate::theme;
-use crate::views::context_menu::{ContextMenu, ContextMenuItem};
+use crate::views::context_menu::{ContextMenu, ContextMenuCommand, ContextMenuItem};
 use gpui::prelude::*;
 use gpui::{InteractiveElement, *};
 use ipc::SearchHit;
@@ -167,33 +166,34 @@ impl ResultsView {
             ContextMenuItem {
                 label: "Open".into(),
                 icon: Some("📂"),
-                action: Box::new(crate::actions::OpenSelected),
+                command: ContextMenuCommand::Open,
             },
             ContextMenuItem {
                 label: "Open Containing Folder".into(),
                 icon: Some("🗂"),
-                action: Box::new(OpenContainingFolder),
+                command: ContextMenuCommand::OpenContainingFolder,
             },
             ContextMenuItem {
                 label: "Copy Full Path".into(),
                 icon: Some("📋"),
-                action: Box::new(CopySelectedPath),
+                command: ContextMenuCommand::CopyFullPath,
             },
             ContextMenuItem {
                 label: "Copy File".into(),
                 icon: Some("📄"),
-                action: Box::new(crate::actions::CopySelectedFile),
+                command: ContextMenuCommand::CopyFile,
             },
             ContextMenuItem {
                 label: "Properties".into(),
                 icon: Some("⚙"),
-                action: Box::new(ShowProperties),
+                command: ContextMenuCommand::Properties,
             },
         ];
 
         let origin = Point::new(px(0.), px(0.));
         let position = event.position;
         let screen_pos = origin + position;
+        let model = self.model.clone();
 
         let _handle = cx
             .open_window(
@@ -210,16 +210,22 @@ impl ResultsView {
                     kind: WindowKind::PopUp,
                     ..WindowOptions::default()
                 },
-                |_, cx| cx.new(|cx| ContextMenu::new(Point::default(), items, cx)),
+                move |_, cx| cx.new(|cx| ContextMenu::new(Point::default(), items, model, cx)),
             )
             .ok();
     }
 
     fn handle_double_click(&mut self, global_index: usize, cx: &mut Context<Self>) {
-        let model = self.model.read(cx);
-        if let Some(hit) = model.results.get(global_index) {
-            if let Some(path) = &hit.path {
-                self.open_file(path);
+        let hit_info = self
+            .model
+            .read(cx)
+            .results
+            .get(global_index)
+            .map(|h| (h.key, h.path.clone()));
+        if let Some((key, path_opt)) = hit_info {
+            self.model.update(cx, |m, _| m.record_result_open(key));
+            if let Some(path) = path_opt {
+                self.open_file(&path);
             }
         }
     }
@@ -543,9 +549,88 @@ impl ResultsView {
             )
     }
 
+    fn render_skeleton_loading(&self, cx: &mut Context<Self>) -> Div {
+        let colors = theme::active_colors(cx);
+        let widths = [px(180.), px(240.), px(150.), px(210.), px(190.), px(160.)];
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_header(cx))
+            .children(widths.into_iter().enumerate().map(|(i, w)| {
+                let row_bg = if i.is_multiple_of(2) {
+                    colors.bg
+                } else {
+                    colors.panel_bg
+                };
+                div()
+                    .w_full()
+                    .h(row_height())
+                    .flex()
+                    .items_center()
+                    .px_4()
+                    .gap_3()
+                    .bg(row_bg)
+                    .border_b_1()
+                    .border_color(colors.divider)
+                    .child(
+                        div()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .rounded_sm()
+                            .bg(colors.divider)
+                            .opacity(0.65),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .w(w)
+                                    .h(px(12.))
+                                    .rounded_sm()
+                                    .bg(colors.divider)
+                                    .opacity(0.75),
+                            )
+                            .child(
+                                div()
+                                    .w(px(280.))
+                                    .h(px(9.))
+                                    .rounded_sm()
+                                    .bg(colors.divider)
+                                    .opacity(0.45),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(56.))
+                            .h(px(10.))
+                            .rounded_sm()
+                            .bg(colors.divider)
+                            .opacity(0.5),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .h(px(10.))
+                            .rounded_sm()
+                            .bg(colors.divider)
+                            .opacity(0.5),
+                    )
+            }))
+    }
+
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
+        if model.status.in_flight {
+            return self.render_skeleton_loading(cx);
+        }
         let has_query = !model.query.is_empty();
+        let pinned = model.pinned_searches.clone();
+        let recent: Vec<String> = model.history.iter().take(6).cloned().collect();
         let colors = theme::active_colors(cx);
 
         div()
@@ -555,6 +640,7 @@ impl ResultsView {
             .items_center()
             .justify_center()
             .gap_4()
+            .p_6()
             .child(
                 div()
                     .text_size(px(48.))
@@ -577,6 +663,95 @@ impl ResultsView {
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
                         .child("Try different search terms or search mode"),
+                )
+            })
+            .when(!has_query && !pinned.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .mt_2()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(colors.text_secondary)
+                                .child("📌 Smart Folders (Pinned Searches)"),
+                        )
+                        .child(div().flex().flex_wrap().justify_center().gap_2().children(
+                            pinned.into_iter().map(|q| {
+                                let q_click = q.clone();
+                                div()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(colors.panel_bg)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .text_size(px(12.))
+                                    .text_color(colors.text_primary)
+                                    .hover(|s| {
+                                        s.bg(colors.selection_bg)
+                                            .border_color(colors.match_highlight)
+                                    })
+                                    .cursor_pointer()
+                                    .child(q)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.model.update(cx, |m, cx| {
+                                                m.set_query(q_click.clone(), cx);
+                                            });
+                                        }),
+                                    )
+                            }),
+                        )),
+                )
+            })
+            .when(!has_query && !recent.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .mt_2()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(colors.text_secondary)
+                                .child("🕘 Recent Searches"),
+                        )
+                        .child(div().flex().flex_wrap().justify_center().gap_2().children(
+                            recent.into_iter().map(|q| {
+                                let q_click = q.clone();
+                                div()
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(colors.bg)
+                                    .border_1()
+                                    .border_color(colors.divider)
+                                    .text_size(px(11.))
+                                    .text_color(colors.text_secondary)
+                                    .hover(|s| {
+                                        s.bg(colors.panel_bg).text_color(colors.text_primary)
+                                    })
+                                    .cursor_pointer()
+                                    .child(q)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.model.update(cx, |m, cx| {
+                                                m.set_query(q_click.clone(), cx);
+                                            });
+                                        }),
+                                    )
+                            }),
+                        )),
                 )
             })
     }

@@ -13,6 +13,7 @@ ipc = { path = "../ipc" }
 core-types = { path = "../core-types" }
 gpui = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 futures = "0.3"
 uuid = { workspace = true }

@@ -8,6 +8,8 @@ actions!(
         SubmitSearch,
         SelectNext,
         SelectPrev,
+        SelectNextPage,
+        SelectPrevPage,
         OpenSelected,
         ModeMetadata,
         ModeMixed,

@@ -18,6 +18,8 @@ struct DriveChoice {
 pub struct OnboardingView {
     step: usize,
     drives: Vec<DriveChoice>,
+    telemetry_opt_in: bool,
+    update_opt_in: bool,
     focus_handle: FocusHandle,
     model: Entity<SearchAppModel>,
 }
@@ -73,13 +75,15 @@ impl OnboardingView {
         Self {
             step: 0,
             drives,
+            telemetry_opt_in: false,
+            update_opt_in: false,
             focus_handle: cx.focus_handle(),
             model,
         }
     }
 
     fn next_step(&mut self, cx: &mut Context<Self>) {
-        if self.step < 1 {
+        if self.step < 2 {
             self.step += 1;
             cx.notify();
         } else {
@@ -125,6 +129,8 @@ impl OnboardingView {
 
             config.volumes = selected;
             config.content_index_volumes = content_enabled;
+            config.features.telemetry_opt_in = self.telemetry_opt_in;
+            let _ = core_types::config::set_current_config(config.clone());
             let target = core_types::config::default_config_path();
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -149,9 +155,12 @@ impl OnboardingView {
         })
         .detach();
 
-        // Give the user immediate feedback that indexing is starting.
+        let update_opt_in = self.update_opt_in;
+        // Give the user immediate feedback that indexing is starting and close onboarding.
         self.model.update(cx, |model, cx| {
             model.status.indexing_state = "Starting indexing…".to_string();
+            model.show_onboarding = false;
+            model.set_update_opt_in(update_opt_in, cx);
             cx.notify();
         });
 
@@ -159,7 +168,7 @@ impl OnboardingView {
     }
     fn render_progress(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::active_colors(cx);
-        let labels = ["Welcome", "Choose drives"];
+        let labels = ["Welcome", "Choose drives", "Privacy & Scan"];
         div()
             .flex()
             .items_center()
@@ -432,25 +441,141 @@ impl Render for OnboardingView {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).child("Ready to index"))
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("Privacy & Ready to Index"),
+                )
                 .child(
                     div()
                         .text_size(px(13.))
                         .text_color(colors.text_secondary)
-                        .child("Telemetry is disabled by design. Click \"Start indexing\" to save these drive choices and begin the first scan.")
+                        .child(
+                            "All indexing stays 100% local on your machine. Optional diagnostics and update checks are strictly opt-in.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.bg)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.telemetry_opt_in = !this.telemetry_opt_in;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Opt-in local PII-scrubbed crash logs"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(colors.text_secondary)
+                                        .child("Redacts user profile paths before recording crash diagnostics."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if self.telemetry_opt_in {
+                                    colors.match_highlight
+                                } else {
+                                    colors.border
+                                })
+                                .text_size(px(11.))
+                                .text_color(if self.telemetry_opt_in {
+                                    colors.bg
+                                } else {
+                                    colors.text_secondary
+                                })
+                                .child(if self.telemetry_opt_in { "Enabled" } else { "Off" }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.bg)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.update_opt_in = !this.update_opt_in;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Opt-in automatic update checks"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(colors.text_secondary)
+                                        .child("Allow checking for signed UltraSearch releases."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if self.update_opt_in {
+                                    colors.match_highlight
+                                } else {
+                                    colors.border
+                                })
+                                .text_size(px(11.))
+                                .text_color(if self.update_opt_in {
+                                    colors.bg
+                                } else {
+                                    colors.text_secondary
+                                })
+                                .child(if self.update_opt_in { "Enabled" } else { "Off" }),
+                        ),
                 ),
         };
 
         let primary_label = match self.step {
-            0 => "Next",
-            1 => {
+            0 | 1 => "Next",
+            _ => {
                 if selected_count == 0 {
                     "Skip (no drives selected)"
                 } else {
                     "Start indexing"
                 }
             }
-            _ => "Next",
         };
 
         let can_go_back = self.step > 0;
@@ -522,11 +647,6 @@ impl Render for OnboardingView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
-                                            if this.step == 2
-                                                && this.drives.iter().all(|d| !d.selected)
-                                            {
-                                                return;
-                                            }
                                             this.next_step(cx);
                                         }),
                                     ),

@@ -20,6 +20,14 @@ impl Theme {
     }
 
     pub fn detect() -> ThemeMode {
+        if let Ok(override_mode) = std::env::var("ULTRASEARCH_THEME") {
+            if override_mode.trim().eq_ignore_ascii_case("light") {
+                return ThemeMode::Light;
+            }
+            if override_mode.trim().eq_ignore_ascii_case("dark") {
+                return ThemeMode::Dark;
+            }
+        }
         #[cfg(target_os = "windows")]
         {
             use windows::core::w;
