@@ -25,7 +25,7 @@ use crate::{
     init_tracing_with_config,
     meta_ingest::ingest_with_paths,
     metrics::{init_metrics_from_config, set_global_metrics},
-    priority::apply_background_priorities,
+    priority::apply_service_priorities,
     scanner::{initialize_indexes, watch_changes},
     scheduler_runtime::SchedulerRuntime,
     search_handler::set_search_handler,
@@ -44,10 +44,12 @@ pub fn run_app_with_options(
     mut shutdown_rx: mpsc::Receiver<()>,
     opts: BootstrapOptions,
 ) -> Result<()> {
-    // Always drop to background-friendly priorities before heavy work.
-    apply_background_priorities();
-
     let _guard = init_tracing_with_config(&cfg.logging)?;
+
+    // The resident service answers interactive queries and advances journals.
+    // Only extraction workers enter idle/background scheduling. Apply before
+    // spawning runtime threads, and report OS failures instead of hiding them.
+    apply_service_priorities()?;
 
     // Initialize Tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
