@@ -67,8 +67,11 @@ pub fn run_app_with_options(
 
     let mut pending_jobs = Vec::new();
 
-    let mut cfg_owned = cfg.clone();
-    super::ensure_default_volumes(&mut cfg_owned)?;
+    // Empty scopes mean automatic discovery on every watcher turn, not a
+    // one-time snapshot of mounted drive letters. Startup must not freeze that
+    // policy or serialize this expanded (possibly custom-source) configuration
+    // over the unrelated default configuration file.
+    let cfg_owned = cfg.clone();
     ensure_data_paths_exist(&cfg_owned)?;
     core_types::config::set_current_config(cfg_owned.clone())?;
     let ingestion = initialize_indexes(&cfg_owned)?;
@@ -221,4 +224,100 @@ fn unix_timestamp_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{Context, ensure};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn startup_preserves_automatic_scope_and_the_custom_configuration_source() -> Result<()> {
+        const CHILD_ROOT: &str = "ULTRASEARCH_BOOTSTRAP_CONFIG_TEST_ROOT";
+        const PROOF: &[u8] = b"automatic-scope-and-custom-source-preserved";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let source = root.join("custom.toml");
+            let default_path = core_types::config::default_config_path();
+            let source_before = fs::read(&source)?;
+            let default_before = fs::read(&default_path)?;
+            let cfg = core_types::config::load_or_create_config(Some(&source))?;
+            ensure!(cfg.volumes.is_empty() && cfg.content_index_volumes.is_empty());
+            let (shutdown, receiver) = mpsc::channel(1);
+            shutdown.try_send(())?;
+            // Exercise real bootstrap, readers, state and (on Windows) the
+            // named pipe without mutating or scanning the host's filesystems.
+            // Native discovery belongs exclusively to watch_changes, not this
+            // explicit disabled-ingestion bootstrap.
+            run_app_with_options(
+                &cfg,
+                receiver,
+                BootstrapOptions {
+                    skip_initial_ingest: true,
+                    pipe_name: Some(format!(r"\\.\pipe\ultrasearch-bootstrap-{}", uuid::Uuid::new_v4())),
+                    ..BootstrapOptions::default()
+                },
+            )?;
+            let active = core_types::config::get_current_config();
+            ensure!(active.volumes.is_empty(), "startup froze automatic metadata scope");
+            ensure!(active.content_index_volumes.is_empty(), "startup froze automatic content scope");
+            ensure!(fs::read(&source)? == source_before, "startup rewrote its custom source");
+            ensure!(fs::read(&default_path)? == default_before, "startup overwrote the default configuration");
+            // The default file is deliberately invalid. Reload(None) must use
+            // the custom source retained by the production configuration API.
+            let mut next = cfg.clone();
+            next.extract.max_chars_per_file += 1;
+            fs::write(&source, toml::to_string_pretty(&next)?)?;
+            let reloaded = core_types::config::reload_config(None)?;
+            ensure!(reloaded.extract.max_chars_per_file == next.extract.max_chars_per_file);
+            ensure!(reloaded.volumes.is_empty() && reloaded.content_index_volumes.is_empty());
+            fs::write(root.join("proof.txt"), PROOF)?;
+            return Ok(());
+        }
+
+        // Isolate tracing, process priorities, global readers/configuration and
+        // PROGRAMDATA from the parent running the rest of the test suite.
+        let root = tempfile::tempdir()?.keep();
+        let program_data = root.join("system-data");
+        let default_path = program_data.join("UltraSearch/config/config.toml");
+        fs::create_dir_all(default_path.parent().context("default config parent missing")?)?;
+        fs::write(&default_path, b"unrelated configuration: preserve these exact bytes")?;
+        let mut cfg = AppConfig::default();
+        cfg.app.data_dir = root.join("test-data").to_str().context("fixture path is not UTF-8")?.into();
+        fs::write(root.join("custom.toml"), toml::to_string_pretty(&cfg)?)?;
+        let name = concat!(module_path!(), "::startup_preserves_automatic_scope_and_the_custom_configuration_source");
+        let name = name.split_once("::").context("test crate prefix missing")?.1;
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe()?)
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD_ROOT, &root)
+                .env("PROGRAMDATA", &program_data)
+                .spawn()?,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                ensure!(status.success(), "bootstrap regression child failed: {status}");
+                ensure!(fs::read(root.join("proof.txt"))? == PROOF, "bootstrap assertions did not execute");
+                return Ok(());
+            }
+            ensure!(Instant::now() < deadline, "bootstrap regression child timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
