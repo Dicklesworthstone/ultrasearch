@@ -108,31 +108,41 @@ pub fn select_jobs(
 
     let mut selected = Vec::new();
 
-    // Critical: Always run, small hardcoded limit or from config?
-    // Let's say critical ignores budget/policy mostly.
-    let mut take = |queue: &mut VecDeque<QueuedJob>, limit: usize| {
-        let mut taken = 0;
-        while taken < limit {
+    let mut take = |queue: &mut VecDeque<QueuedJob>, budget: Budget| {
+        let mut taken = 0usize;
+        let mut bytes_accum = 0u64;
+        while taken < budget.max_files {
+            let Some(front) = queue.front() else {
+                break;
+            };
+            if bytes_accum.saturating_add(front.est_bytes) > budget.max_bytes {
+                break;
+            }
             if let Some(qj) = queue.pop_front() {
+                bytes_accum = bytes_accum.saturating_add(qj.est_bytes);
                 selected.push(qj.job);
                 taken += 1;
-            } else {
-                break;
             }
         }
     };
 
-    take(&mut queues.critical, 16);
+    take(
+        &mut queues.critical,
+        Budget {
+            max_files: 16,
+            max_bytes: u64::MAX,
+        },
+    );
 
     let allow_meta = allow_metadata_jobs(idle, load, config);
     let allow_content = allow_content_jobs(idle, load, config);
 
     if allow_meta {
-        take(&mut queues.metadata, config.metadata_budget.max_files);
+        take(&mut queues.metadata, config.metadata_budget);
     }
 
     if allow_content {
-        take(&mut queues.content, config.content_budget.max_files);
+        take(&mut queues.content, config.content_budget);
     }
 
     selected
@@ -322,7 +332,19 @@ mod tests {
 
         let selected = select_jobs(&mut queues, IdleState::DeepIdle, load_ok(), &cfg);
         assert_eq!(selected.len(), 1);
-        assert_eq!(queues.len(), 1); // second job remains due to budget
+        assert_eq!(queues.len(), 1); // second job remains due to file budget
+
+        // Verify byte budget is also respected when max_files allows multiple jobs
+        queues.push(
+            JobCategory::Content,
+            Job::ContentIndex(DocKey::from_parts(1, 3)),
+            5,
+        );
+        cfg.content_budget.max_files = 10;
+        cfg.content_budget.max_bytes = 8;
+        let selected_by_bytes = select_jobs(&mut queues, IdleState::DeepIdle, load_ok(), &cfg);
+        assert_eq!(selected_by_bytes.len(), 1);
+        assert_eq!(queues.len(), 1); // third job (5 bytes) remains because 5 + 5 > 8
     }
 
     #[test]
