@@ -72,6 +72,13 @@ enum Commands {
         json: bool,
     },
 
+    /// Ping the service over IPC and report round-trip latency.
+    Ping {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show or edit the config on disk (ProgramData).
     Config {
         #[command(subcommand)]
@@ -214,7 +221,7 @@ enum SearchFieldArg {
     Content,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum ConfigCmd {
     /// Print the effective config path and contents.
     Show {
@@ -233,6 +240,9 @@ enum ConfigCmd {
         /// Output resulting config as JSON.
         #[arg(long)]
         json: bool,
+        /// Immediately ask the running service to reload config and rescan over IPC.
+        #[arg(long)]
+        reload: bool,
     },
 }
 
@@ -296,7 +306,22 @@ async fn main() -> Result<()> {
                 Ok(())
             })?;
         }
-        Commands::Config { sub } => match sub {
+        Commands::Ping { json } => {
+            let rtt = pipe(&cli).ping().await?;
+            let rtt_ms = rtt.as_secs_f64() * 1000.0;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "rtt_ms": rtt_ms,
+                    })
+                );
+            } else {
+                println!("{} {:.2} ms", style("Pong:").green(), rtt_ms);
+            }
+        }
+        Commands::Config { ref sub } => match sub.clone() {
             ConfigCmd::Show { json } => {
                 let path = default_config_path();
                 let cfg = load_or_create_config(None)?;
@@ -320,6 +345,7 @@ async fn main() -> Result<()> {
                 volume,
                 content_volume,
                 json,
+                reload,
             } => {
                 let mut cfg = load_or_create_config(None)?;
                 let vols = if volume.is_empty() {
@@ -353,12 +379,20 @@ async fn main() -> Result<()> {
                 }
                 let toml = toml::to_string_pretty(&cfg)?;
                 std::fs::write(&path, toml)?;
+                if reload {
+                    let client = pipe(&cli);
+                    let _ = client
+                        .reload_config(ReloadConfigRequest { id: Uuid::new_v4() })
+                        .await?;
+                    let _ = client.rescan(RescanRequest { id: Uuid::new_v4() }).await?;
+                }
                 if json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "path": path,
                             "config": cfg,
+                            "reloaded": reload,
                         })
                     );
                 } else {
@@ -497,6 +531,9 @@ impl UnsupportedClient {
         unsupported_service()
     }
     async fn rescan(&self, _: RescanRequest) -> Result<ipc::RescanResponse> {
+        unsupported_service()
+    }
+    async fn ping(&self) -> Result<std::time::Duration> {
         unsupported_service()
     }
 }
