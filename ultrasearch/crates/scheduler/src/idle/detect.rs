@@ -56,6 +56,22 @@ where
         }
     }
 
+    /// Update policy without replacing the reader or discarding its observations.
+    /// The next sample reclassifies against these thresholds. Transition time
+    /// changes only when that sample actually changes the classified state.
+    ///
+    /// # Panics
+    /// Panics before changing either threshold if `deep_idle < warm_idle`, as
+    /// does the constructor. Live service configuration is validated on load.
+    pub fn set_thresholds(&mut self, warm_idle: Duration, deep_idle: Duration) {
+        assert!(
+            deep_idle >= warm_idle,
+            "deep_idle must be greater than or equal to warm_idle",
+        );
+        self.warm_idle = warm_idle;
+        self.deep_idle = deep_idle;
+    }
+
     /// Read the current idle state and update transition bookkeeping.
     pub fn sample(&mut self) -> IdleSample {
         let observed = (self.reader)().map(Duration::from_millis);
@@ -400,6 +416,46 @@ mod tests {
 
         let deep = tracker.sample();
         assert_eq!(deep.state, IdleState::DeepIdle);
+    }
+
+    #[test]
+    fn threshold_reload_reclassifies_without_resetting_reader_or_same_state_time() {
+        let mut samples = VecDeque::from([Some(45_000), Some(45_000), Some(45_000), None]);
+        let mut tracker = IdleTracker::with_reader(
+            Duration::from_secs(15),
+            Duration::from_secs(60),
+            || samples.pop_front().expect("reload must not consume a sample"),
+        );
+        assert_eq!(tracker.sample().state, IdleState::WarmIdle);
+        let unchanged_transition = Instant::now() - Duration::from_secs(10);
+        tracker.last_transition = unchanged_transition;
+
+        tracker.set_thresholds(Duration::from_secs(10), Duration::from_secs(90));
+        assert_eq!(tracker.sample().state, IdleState::WarmIdle);
+        assert_eq!(tracker.last_transition, unchanged_transition);
+
+        tracker.set_thresholds(Duration::from_secs(10), Duration::from_secs(30));
+        assert_eq!(tracker.sample().state, IdleState::DeepIdle);
+        assert!(tracker.last_transition > unchanged_transition);
+
+        tracker.set_thresholds(Duration::ZERO, Duration::ZERO);
+        assert_eq!(tracker.sample().state, IdleState::Active);
+    }
+
+    #[test]
+    fn invalid_threshold_reload_leaves_both_thresholds_and_reader_intact() {
+        let mut tracker = IdleTracker::with_reader(
+            Duration::from_secs(15),
+            Duration::from_secs(60),
+            || Some(45_000),
+        );
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracker.set_thresholds(Duration::from_secs(90), Duration::from_secs(30));
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(tracker.warm_idle, Duration::from_secs(15));
+        assert_eq!(tracker.deep_idle, Duration::from_secs(60));
+        assert_eq!(tracker.sample().state, IdleState::WarmIdle);
     }
 
     fn observation(sessions: &[(u32, u64)]) -> SessionObservation {

@@ -35,6 +35,73 @@ static JOB_SENDER: OnceLock<Mutex<Option<ProducerChannel>>> = OnceLock::new();
 const MAX_CONTENT_QUEUE: usize = 100_000;
 const MAX_PENDING_SUBMISSIONS: usize = 256;
 const MAX_INDEX_BATCH_JOBS: usize = 4096;
+const OBSERVATION_INTERVAL: Duration = Duration::from_secs(1);
+
+fn scheduler_config(app_cfg: &AppConfig) -> SchedulerConfig {
+    SchedulerConfig {
+        warm_idle: Duration::from_secs(app_cfg.scheduler.idle_warm_seconds),
+        deep_idle: Duration::from_secs(app_cfg.scheduler.idle_deep_seconds),
+        cpu_metadata_max: app_cfg.scheduler.cpu_soft_limit_pct as f32,
+        cpu_content_max: app_cfg.scheduler.cpu_hard_limit_pct as f32,
+        disk_busy_threshold_bps: app_cfg.scheduler.disk_busy_bytes_per_s,
+        content_batch_size: app_cfg.scheduler.content_batch_size as usize,
+        power_save_mode: app_cfg.scheduler.power_save_mode,
+        ..SchedulerConfig::default()
+    }
+}
+
+/// Poll one dispatch to completion without suspending observation for its whole
+/// lifetime. Keep the same pinned future: a timer tick must never resubmit work
+/// or release a mutation lease. Dropping this wrapper drops that future; it
+/// does not detach another scheduler task or manufacture an acknowledgement.
+async fn await_with_refresh<F: std::future::Future>(
+    completion: F,
+    period: Duration,
+    mut refresh: impl FnMut(),
+) -> F::Output {
+    tokio::pin!(completion);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut completion => return result,
+            _ = interval.tick() => refresh(),
+        }
+    }
+}
+
+async fn await_dispatch<F: std::future::Future>(
+    completion: F,
+    idle: &mut IdleTracker,
+    load: &mut SystemLoadSampler,
+    allow_content: &AtomicBool,
+    force_allow_content: bool,
+    sample: &mut impl FnMut(&mut IdleTracker, &mut SystemLoadSampler) -> (IdleSample, SystemLoad),
+) -> F::Output {
+    await_with_refresh(completion, OBSERVATION_INTERVAL, || {
+        // Config publication is atomic. Use one snapshot for both sensors and
+        // the admission hint, including while the current worker is running.
+        // Do not replace readers: the native SessionClock needs observations
+        // at intervals <= 5 s to retain earned, conservative idle time.
+        let cfg = scheduler_config(&core_types::config::get_current_config());
+        idle.set_thresholds(cfg.warm_idle, cfg.deep_idle);
+        load.set_disk_threshold(cfg.disk_busy_threshold_bps);
+        // Close the opportunistic admission hint before potentially blocking
+        // native calls. An unavailable idle observation stays Active. These
+        // synchronous sensors are not forcibly interruptible by this timer.
+        allow_content.store(false, Ordering::Relaxed);
+        let (idle_sample, load_sample) = sample(idle, load);
+        let allowed =
+            force_allow_content || allow_content_jobs(idle_sample.state, load_sample, &cfg);
+        allow_content.store(allowed, Ordering::Relaxed);
+        update_status_scheduler_state(format!(
+            "idle={:?} cpu={:.1}% mem={:.1}% dispatch=pending content_admission={allowed}",
+            idle_sample.state, load_sample.cpu_percent, load_sample.mem_used_percent,
+        ));
+    })
+    .await
+}
 
 struct ProducerChannel {
     runtime_id: uuid::Uuid,
@@ -100,16 +167,7 @@ pub struct SchedulerRuntime {
 
 impl SchedulerRuntime {
     pub fn new(app_cfg: &AppConfig) -> Self {
-        let config = SchedulerConfig {
-            warm_idle: Duration::from_secs(app_cfg.scheduler.idle_warm_seconds),
-            deep_idle: Duration::from_secs(app_cfg.scheduler.idle_deep_seconds),
-            cpu_metadata_max: app_cfg.scheduler.cpu_soft_limit_pct as f32,
-            cpu_content_max: app_cfg.scheduler.cpu_hard_limit_pct as f32,
-            disk_busy_threshold_bps: app_cfg.scheduler.disk_busy_bytes_per_s,
-            content_batch_size: app_cfg.scheduler.content_batch_size as usize,
-            power_save_mode: app_cfg.scheduler.power_save_mode,
-            ..SchedulerConfig::default()
-        };
+        let config = scheduler_config(app_cfg);
 
         let live = LIVE_STATE.get_or_init(SchedulerLiveState::default);
         let (tx, rx) = mpsc::channel(MAX_PENDING_SUBMISSIONS);
@@ -148,13 +206,11 @@ impl SchedulerRuntime {
             scanner::request_rescan();
         }
 
-        self.config.warm_idle = Duration::from_secs(app_cfg.scheduler.idle_warm_seconds);
-        self.config.deep_idle = Duration::from_secs(app_cfg.scheduler.idle_deep_seconds);
-        self.config.cpu_metadata_max = app_cfg.scheduler.cpu_soft_limit_pct as f32;
-        self.config.cpu_content_max = app_cfg.scheduler.cpu_hard_limit_pct as f32;
-        self.config.disk_busy_threshold_bps = app_cfg.scheduler.disk_busy_bytes_per_s;
-        self.config.content_batch_size = app_cfg.scheduler.content_batch_size as usize;
-        self.config.power_save_mode = app_cfg.scheduler.power_save_mode;
+        self.config = scheduler_config(app_cfg);
+        self.idle
+            .set_thresholds(self.config.warm_idle, self.config.deep_idle);
+        self.load
+            .set_disk_threshold(self.config.disk_busy_threshold_bps);
     }
 
     /// Submit a content indexing job (path + doc ids).
@@ -242,7 +298,8 @@ impl SchedulerRuntime {
     }
 
     pub async fn run_loop(mut self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = tokio::time::interval(OBSERVATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             self.tick().await;
@@ -250,17 +307,28 @@ impl SchedulerRuntime {
     }
 
     pub async fn tick(&mut self) {
-        let idle_sample = self.idle.sample();
-        let load = self.load.sample();
-        self.tick_with_observation(idle_sample, load).await;
+        self.tick_with_sampler(|idle, load| (idle.sample(), load.sample()))
+            .await;
     }
 
     // Keep OS observation separate from admission and actual dispatch so policy
     // regressions can use deterministic inputs without synthesizing worker ACKs.
+    #[cfg(test)]
     async fn tick_with_observation(&mut self, idle_sample: IdleSample, load: SystemLoad) {
+        self.tick_with_sampler(|_, _| (idle_sample, load)).await;
+    }
+
+    async fn tick_with_sampler(
+        &mut self,
+        mut sample: impl FnMut(&mut IdleTracker, &mut SystemLoadSampler) -> (IdleSample, SystemLoad),
+    ) {
         // Reload config dynamically (from memory cache updated by IPC)
         let app_cfg = core_types::config::get_current_config();
         self.update_config(&app_cfg);
+        // Apply thresholds BEFORE sampling. Updating only SchedulerConfig, or
+        // updating the sensors after sampling, admits work using stale policy.
+        self.allow_content.store(false, Ordering::Relaxed);
+        let (idle_sample, load) = sample(&mut self.idle, &mut self.load);
 
         self.receive_submissions();
         self.update_live_counts();
@@ -324,7 +392,15 @@ impl SchedulerRuntime {
         if let Some(batch) = self.legacy_retry.as_ref() {
             self.live.active_workers.fetch_add(1, Ordering::Relaxed);
             self.publish_active_workers();
-            let result = self.dispatcher.spawn_index_batch(batch, None).await;
+            let result = await_dispatch(
+                self.dispatcher.spawn_index_batch(batch, None),
+                &mut self.idle,
+                &mut self.load,
+                &self.allow_content,
+                self.force_allow_content,
+                &mut sample,
+            )
+            .await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
             self.publish_active_workers();
             match result {
@@ -340,10 +416,16 @@ impl SchedulerRuntime {
         if let Some(pending) = self.pending_index.take() {
             self.live.active_workers.fetch_add(1, Ordering::Relaxed);
             self.publish_active_workers();
-            let result = self
-                .dispatcher
-                .spawn_index_batch(&pending.batch, pending.mutation_lease)
-                .await;
+            let result = await_dispatch(
+                self.dispatcher
+                    .spawn_index_batch(&pending.batch, pending.mutation_lease),
+                &mut self.idle,
+                &mut self.load,
+                &self.allow_content,
+                self.force_allow_content,
+                &mut sample,
+            )
+            .await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
             self.publish_active_workers();
             if let Err(error) = &result {
@@ -564,6 +646,221 @@ mod tests {
                 },
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn reloaded_thresholds_reach_sensors_before_admission() -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let (mut cfg, expected_error) = blocked_dispatch_config()?;
+        cfg.scheduler.idle_warm_seconds = 15;
+        cfg.scheduler.idle_deep_seconds = 120;
+        cfg.scheduler.disk_busy_bytes_per_s = 1_000;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        runtime.idle = IdleTracker::with_reader(
+            Duration::from_secs(15),
+            Duration::from_secs(120),
+            (|| Some(45_000)) as fn() -> Option<u64>,
+        );
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![JobSpec {
+                operation: JobOperation::Reconcile,
+                ..dummy_job()
+            }],
+            reset_volumes: Vec::new(),
+        };
+        let mut submission = Box::pin(submit_index_batch(batch.clone(), None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+
+        for (deep_seconds, disk_threshold, expected_state) in [
+            (180, 8_000, scheduler::IdleState::WarmIdle),
+            (30, 2_000, scheduler::IdleState::DeepIdle),
+        ] {
+            cfg.scheduler.idle_deep_seconds = deep_seconds;
+            cfg.scheduler.disk_busy_bytes_per_s = disk_threshold;
+            core_types::config::set_current_config(cfg.clone())?;
+            // Exercise the exact production ordering around observation. Load
+            // values are deterministic; the real dispatcher must still fail
+            // on its real filesystem prerequisite, never fabricate a commit.
+            runtime
+                .tick_with_sampler(|idle, load| {
+                    let idle_sample = idle.sample();
+                    assert_eq!(idle_sample.state, expected_state);
+                    assert_eq!(load.disk_threshold(), disk_threshold);
+                    (
+                        idle_sample,
+                        SystemLoad {
+                            cpu_percent: 0.0,
+                            mem_used_percent: 10.0,
+                            disk_bytes_per_sec: 0,
+                            disk_busy: false,
+                            sample_duration: Duration::from_secs(1),
+                            on_battery: false,
+                            game_mode: false,
+                        },
+                    )
+                })
+                .await;
+            if expected_state == scheduler::IdleState::WarmIdle {
+                assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
+                assert!(submission.as_mut().poll(&mut context).is_pending());
+                assert!(!content_admission_available());
+            }
+        }
+        let error = submission
+            .await
+            .expect_err("dispatch must not acknowledge its failed write");
+        assert_eq!(error.to_string(), expected_error);
+        assert!(runtime.pending_index.is_none());
+        assert!(PathBuf::from(&cfg.paths.jobs_dir).is_file());
+        assert!(!PathBuf::from(&cfg.paths.content_index).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_dispatch_is_not_restarted_while_observations_advance() {
+        use std::cell::Cell;
+
+        let starts = Cell::new(0);
+        let refreshes = Cell::new(0);
+        let (finish, finished) = oneshot::channel::<Result<uuid::Uuid, &'static str>>();
+        let mut finish = Some(finish);
+        let completion = async {
+            starts.set(starts.get() + 1);
+            finished
+                .await
+                .expect("refresh releases the single pending dispatch")
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_with_refresh(completion, Duration::from_millis(1), || {
+                refreshes.set(refreshes.get() + 1);
+                if refreshes.get() == 3 {
+                    finish
+                        .take()
+                        .unwrap()
+                        .send(Err("worker commit failed"))
+                        .unwrap();
+                }
+            }),
+        )
+        .await
+        .expect("observations must not wait for dispatch completion");
+        assert_eq!(result, Err("worker commit failed"));
+        assert_eq!(starts.get(), 1);
+        assert_eq!(refreshes.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn completed_dispatch_does_not_wait_for_or_invoke_a_refresh() {
+        let receipt = uuid::Uuid::new_v4();
+        assert_eq!(
+            await_with_refresh(
+                std::future::ready(receipt),
+                Duration::from_secs(60),
+                || panic!("a ready dispatch must not enter an unrelated native sensor"),
+            )
+            .await,
+            receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn running_dispatch_refresh_applies_reload_and_revokes_the_old_hint()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let mut cfg = core_types::config::get_current_config();
+        cfg.scheduler.idle_warm_seconds = 15;
+        cfg.scheduler.idle_deep_seconds = 120;
+        cfg.scheduler.disk_busy_bytes_per_s = 1_000;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut idle = IdleTracker::with_reader(
+            Duration::from_secs(15),
+            Duration::from_secs(120),
+            (|| Some(45_000)) as fn() -> Option<u64>,
+        );
+        let mut load = SystemLoadSampler::new(1_000);
+        let allowed = AtomicBool::new(true);
+        let (finish, finished) = oneshot::channel();
+        let mut finish = Some(finish);
+        let completion = async {
+            // This runs after dispatch starts, before its first refresh.
+            cfg.scheduler.idle_deep_seconds = 30;
+            cfg.scheduler.disk_busy_bytes_per_s = 2_000;
+            core_types::config::set_current_config(cfg)?;
+            finished.await.map_err(anyhow::Error::from)
+        };
+        let mut sample = |tracker: &mut IdleTracker, sampler: &mut SystemLoadSampler| {
+            assert!(!allowed.load(Ordering::Relaxed));
+            let observed = tracker.sample();
+            assert_eq!(observed.state, scheduler::IdleState::DeepIdle);
+            assert_eq!(sampler.disk_threshold(), 2_000);
+            finish.take().unwrap().send(()).unwrap();
+            (
+                observed,
+                SystemLoad {
+                    cpu_percent: 0.0,
+                    mem_used_percent: 10.0,
+                    disk_bytes_per_sec: 0,
+                    disk_busy: false,
+                    sample_duration: Duration::from_secs(1),
+                    on_battery: false,
+                    game_mode: false,
+                },
+            )
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            await_dispatch(completion, &mut idle, &mut load, &allowed, false, &mut sample),
+        )
+        .await
+        .expect("dispatch must keep refreshing while completion is pending")?;
+        assert!(allowed.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_observed_wait_neither_detaches_future_nor_acknowledges_commit()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let lock_path = root.path().join("observed-wait.lock");
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)?;
+        lease.try_lock()?;
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let (acknowledgement, mut response) = oneshot::channel::<()>();
+        let completion = async move {
+            std::future::pending::<()>().await;
+            drop(lease);
+            let _ = acknowledgement.send(());
+        };
+        let mut wait = Box::pin(await_with_refresh(
+            completion,
+            Duration::from_secs(60),
+            || panic!("fixture cancellation occurs before the first refresh"),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        assert!(contender.try_lock().is_err());
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(wait);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        contender.try_lock()?;
+        Ok(())
     }
 
     #[test]
