@@ -166,7 +166,12 @@ async fn handle_connection(mut conn: NamedPipeServer) -> Result<()> {
         // Reject old identity layouts before deserializing a request or
         // publishing search hits that an old UI could misinterpret.
         let (kind, payload) = framing::decode_message(&buf)?;
-        let response = dispatch(kind, payload);
+        let response = if kind == framing::MessageKind::Search {
+            let payload_owned = payload.to_vec();
+            tokio::task::spawn_blocking(move || dispatch(kind, &payload_owned)).await?
+        } else {
+            dispatch(kind, payload)
+        };
         anyhow::ensure!(!response.is_empty(), "invalid {kind:?} IPC payload");
         let framed = framing::encode_frame(&framing::encode_message(kind, &response)?)?;
         // framed includes length prefix.
