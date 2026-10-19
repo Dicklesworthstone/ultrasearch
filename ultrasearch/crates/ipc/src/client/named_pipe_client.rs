@@ -97,6 +97,47 @@ impl PipeClient {
         self.request(framing::MessageKind::Rescan, &req).await
     }
 
+    /// Measure round-trip IPC liveness using the fast-path `MessageKind::Ping` echo.
+    pub async fn ping(&self) -> Result<Duration> {
+        let id = uuid::Uuid::new_v4();
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(b"PING");
+        payload.extend_from_slice(id.as_bytes());
+        let framed = framing::encode_frame(&framing::encode_message(
+            framing::MessageKind::Ping,
+            &payload,
+        )?)?;
+
+        let started = std::time::Instant::now();
+        let fut = async move {
+            let mut conn = ClientOptions::new().open(&self.pipe_name)?;
+            conn.write_all(&framed).await?;
+            let mut len_buf = [0u8; 4];
+            conn.read_exact(&mut len_buf).await?;
+            let resp_len = u32::from_le_bytes(len_buf) as usize;
+            ensure!(
+                resp_len > 0 && resp_len <= MAX_MESSAGE_BYTES,
+                "invalid ping response length {resp_len}"
+            );
+            let mut buf = vec![0u8; resp_len];
+            conn.read_exact(&mut buf).await?;
+            let (response_kind, echoed) = framing::decode_message(&buf)?;
+            ensure!(
+                response_kind == framing::MessageKind::Ping,
+                "unexpected ping response kind {response_kind:?}"
+            );
+            ensure!(
+                echoed == id.as_bytes().as_slice(),
+                "mismatched ping echo UUID"
+            );
+            Ok::<Duration, anyhow::Error>(started.elapsed())
+        };
+
+        tokio::time::timeout(self.request_timeout, fut)
+            .await
+            .map_err(anyhow::Error::from)?
+    }
+
     async fn request<Req, Resp>(&self, kind: framing::MessageKind, req: &Req) -> Result<Resp>
     where
         Req: Serialize,
