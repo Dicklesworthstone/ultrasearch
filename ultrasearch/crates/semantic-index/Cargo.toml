@@ -9,4 +9,7 @@ description = "Semantic/vector index plumbing for UltraSearch (placeholder)"
 [dependencies]
 core-types = { path = "../core-types" }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 hnsw_rs = { version = "*", optional = true }
+
