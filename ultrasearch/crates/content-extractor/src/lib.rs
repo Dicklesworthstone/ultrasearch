@@ -133,6 +133,15 @@ impl ExtractorStack {
         Self::new(backends)
     }
 
+    /// Build a stack including a custom `PluginRegistry` before the `NoopExtractor` fallback.
+    pub fn with_plugin_registry(registry: plugins::registry::PluginRegistry) -> Self {
+        Self::new(vec![
+            Box::new(SimpleTextExtractor),
+            Box::new(registry),
+            Box::new(NoopExtractor),
+        ])
+    }
+
     pub fn new(backends: Vec<Box<dyn Extractor + Send + Sync>>) -> Self {
         Self { backends }
     }
