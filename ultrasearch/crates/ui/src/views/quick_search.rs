@@ -48,6 +48,8 @@ impl QuickBarView {
         });
         if let Some((_, Some(path))) = selected {
             crate::views::context_menu::open_path_in_os(&path);
+        } else {
+            cx.activate(true);
         }
         window.remove_window();
     }

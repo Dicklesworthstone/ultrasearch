@@ -5,6 +5,8 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+const BUNDLED_FEATURES_MD: &str = include_str!("../../../../docs/FEATURES.md");
+
 /// Full-screen overlay that provides a rich help + shortcuts experience.
 pub struct HelpPanel {
     focus_handle: FocusHandle,
@@ -17,15 +19,23 @@ pub struct HelpPanel {
 impl HelpPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let docs_path = "docs/FEATURES.md";
-        let docs = std::fs::read_to_string(docs_path).ok();
-        let docs_updated = std::fs::metadata(docs_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .map(|ts| {
-                DateTime::<Local>::from(ts)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()
-            });
+        let (docs, docs_updated) = match std::fs::read_to_string(docs_path) {
+            Ok(content) => {
+                let updated = std::fs::metadata(docs_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|ts| {
+                        DateTime::<Local>::from(ts)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    });
+                (Some(content), updated)
+            }
+            Err(_) => (
+                Some(BUNDLED_FEATURES_MD.to_string()),
+                Some("bundled".to_string()),
+            ),
+        };
 
         Self {
             focus_handle: cx.focus_handle(),

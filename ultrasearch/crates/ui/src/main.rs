@@ -36,17 +36,7 @@ struct UltraSearchWindow {
 }
 
 impl UltraSearchWindow {
-    fn new(cx: &mut Context<Self>, show_onboarding: bool, initial_query: Option<String>) -> Self {
-        let model = cx.new(SearchAppModel::new);
-
-        // Update model with onboarding state and any initial URI/CLI query
-        model.update(cx, |model, cx| {
-            model.show_onboarding = show_onboarding;
-            if let Some(q) = initial_query {
-                model.set_query(q, cx);
-            }
-        });
-
+    fn new(cx: &mut Context<Self>, model: Entity<SearchAppModel>) -> Self {
         let search_view = cx.new(|cx| SearchView::new(model.clone(), cx));
         let results_view = cx.new(|cx| ResultsView::new(model.clone(), cx));
         let preview_view = cx.new(|cx| PreviewView::new(model.clone(), cx));
@@ -626,9 +616,17 @@ fn main() {
         })
         .detach();
 
-        // Initialize Icon Cache
+        // Initialize Icon Cache and Shared SearchAppModel
         let icon_cache = cx.new(IconCache::new);
+        let app_model = cx.new(SearchAppModel::new);
+        app_model.update(cx, |model, cx| {
+            model.show_onboarding = show_onboarding;
+            if let Some(q) = initial_query.clone() {
+                model.set_query(q, cx);
+            }
+        });
         cx.set_global(GlobalAppState {
+            app_model: app_model.clone(),
             quick_bar: None,
             icon_cache,
             theme: theme_model,
@@ -687,6 +685,8 @@ fn main() {
                                             });
                                         }
 
+                                        let shared_model =
+                                            cx.global::<GlobalAppState>().app_model.clone();
                                         let handle = cx
                                             .open_window(
                                                 WindowOptions {
@@ -708,9 +708,10 @@ fn main() {
                                                     kind: WindowKind::PopUp,
                                                     ..WindowOptions::default()
                                                 },
-                                                |_, cx| {
-                                                    let model = cx.new(SearchAppModel::new);
-                                                    cx.new(|cx| QuickBarView::new(model, cx))
+                                                move |_, cx| {
+                                                    cx.new(|cx| {
+                                                        QuickBarView::new(shared_model.clone(), cx)
+                                                    })
                                                 },
                                             )
                                             .expect("failed to open quick bar");
@@ -789,7 +790,7 @@ fn main() {
         ]);
 
         // Open the main window
-        let init_q = initial_query.clone();
+        let main_model = app_model;
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -815,7 +816,7 @@ fn main() {
                 app_id: Some("com.ultrasearch.desktop".to_string()),
                 ..WindowOptions::default()
             },
-            move |_, cx| cx.new(|cx| UltraSearchWindow::new(cx, show_onboarding, init_q.clone())),
+            move |_, cx| cx.new(|cx| UltraSearchWindow::new(cx, main_model.clone())),
         )
         .expect("Failed to open window");
 
