@@ -628,6 +628,13 @@ pub fn reload_config(path: Option<&Path>) -> Result<AppConfig> {
 impl AppConfig {
     /// Validate configuration constraints.
     pub fn validate(&self) -> Result<()> {
+        // IdleTracker requires an ordered pair at construction and on live
+        // threshold updates. Reject disk reloads and startup bindings before
+        // publication, rather than panicking the scheduler after a success ACK.
+        ensure!(
+            self.scheduler.idle_deep_seconds >= self.scheduler.idle_warm_seconds,
+            "scheduler.idle_deep_seconds must be greater than or equal to scheduler.idle_warm_seconds"
+        );
         if self.features.delta_index && !self.features.multi_tier_index {
             return Err(anyhow::anyhow!(
                 "Feature 'delta_index' requires 'multi_tier_index' to be enabled"
@@ -1102,6 +1109,84 @@ mod tests {
         base.volumes = override_cfg.volumes;
         base.content_index_volumes = override_cfg.content_index_volumes;
         base
+    }
+
+    #[test]
+    fn invalid_idle_thresholds_never_publish_on_startup_or_reload() {
+        let root = config_fixture();
+        let source = root.join("active.toml");
+        let alternate = root.join("invalid-idle.toml");
+        let cfg = fixture_config(&root);
+        let mut invalid = cfg.clone();
+        invalid.scheduler.idle_warm_seconds = 61;
+        invalid.scheduler.idle_deep_seconds = 60;
+        invalid.extract.max_bytes_per_file = 123;
+        save_fixture(&alternate, &invalid);
+
+        let mut state = ConfigState::default();
+        let initial = config_json(&state.value);
+        for from_disk in [true, false] {
+            let error = if from_disk {
+                state.reload(Some(&alternate)).unwrap_err()
+            } else {
+                state.bind_runtime(invalid.clone()).unwrap_err()
+            };
+            assert!(error.to_string().contains("scheduler.idle_deep_seconds"));
+            assert_eq!(config_json(&state.value), initial);
+            assert!(state.source.is_none());
+            assert!(!state.runtime_bound);
+            assert_eq!(state.revision, 0);
+        }
+
+        save_fixture(&source, &cfg);
+        let active = state.reload(Some(&source)).unwrap();
+        state.bind_runtime(active.clone()).unwrap();
+        let revision = state.revision;
+        // Keep destinations identical: these attempts must fail on the idle
+        // invariant itself, not merely on the live-path relocation guard.
+        invalid = active.clone();
+        invalid.scheduler.idle_warm_seconds = 61;
+        invalid.scheduler.idle_deep_seconds = 60;
+        invalid.extract.max_bytes_per_file = 123;
+        save_fixture(&alternate, &invalid);
+        for from_disk in [true, false] {
+            let error = if from_disk {
+                state.reload(Some(&alternate)).unwrap_err()
+            } else {
+                state.bind_runtime(invalid.clone()).unwrap_err()
+            };
+            assert!(error.to_string().contains("scheduler.idle_warm_seconds"));
+            assert_eq!(config_json(&state.value), config_json(&active));
+            assert_eq!(state.source.as_deref(), Some(source.as_path()));
+            assert!(state.runtime_bound);
+            assert_eq!(state.revision, revision);
+        }
+        assert_eq!(config_json(&state.reload(None).unwrap()), config_json(&active));
+
+        // A corrected file is accepted without restarting or reinitializing
+        // the state, and all of its settings are published together.
+        invalid.scheduler.idle_warm_seconds = 15;
+        invalid.scheduler.idle_deep_seconds = 30;
+        save_fixture(&alternate, &invalid);
+        let corrected = state.reload(Some(&alternate)).unwrap();
+        assert_eq!(corrected.scheduler.idle_deep_seconds, 30);
+        assert_eq!(corrected.extract.max_bytes_per_file, 123);
+        assert_eq!(state.source.as_deref(), Some(alternate.as_path()));
+    }
+
+    #[test]
+    fn ordered_idle_threshold_boundaries_remain_valid() {
+        let mut cfg = AppConfig::default();
+        for (warm, deep) in [(0, 0), (0, 60), (60, 60), (u64::MAX, u64::MAX)] {
+            cfg.scheduler.idle_warm_seconds = warm;
+            cfg.scheduler.idle_deep_seconds = deep;
+            cfg.validate().unwrap();
+        }
+        for (warm, deep) in [(1, 0), (61, 60), (u64::MAX, u64::MAX - 1)] {
+            cfg.scheduler.idle_warm_seconds = warm;
+            cfg.scheduler.idle_deep_seconds = deep;
+            assert!(cfg.validate().is_err());
+        }
     }
 
     #[test]
