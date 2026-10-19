@@ -77,9 +77,8 @@ cpu_soft_limit_pct = 50
 cpu_hard_limit_pct = 80
 ```
 
-- `idle_warm_seconds` / `idle_deep_seconds` define the active->warm->deep transitions from GetLastInputInfo.
-- `max_records_per_tick` caps how many USN records are processed in one scheduler loop.
-- `usn_chunk_bytes` sets the read buffer size when tailing the USN journal.
+- `idle_warm_seconds` / `idle_deep_seconds` classify conservative observations of interactive Windows sessions, including from service Session 0. Missing observations are Active. Reloads require `idle_deep_seconds >= idle_warm_seconds` and update the actual sensors before the next observation.
+- `max_records_per_tick` and `usn_chunk_bytes` are declared reader tuning values. The production service currently uses fixed 128-record / 256-KiB reads; wiring these settings remains outstanding. They do not control worker batching.
 - `cpu_*_pct` provide soft/hard cutoffs for deferring content indexing.
 
 ## Configuration reload (c00.8.1)
@@ -120,13 +119,50 @@ auto_tuning      = false
 [scheduler]
 idle_warm_seconds = 15
 idle_deep_seconds = 60
-cpu_low_pct  = 20
-cpu_mid_pct  = 50
+cpu_soft_limit_pct = 50
+cpu_hard_limit_pct = 80
 disk_busy_bytes_per_s = 10485760  # 10 MB/s threshold
 content_batch_size = 1000
+power_save_mode = true
 ```
 
-- Values are defaults; adaptive scheduler (when enabled) can adjust batch size and thresholds within safe bounds.
+`content_batch_size` bounds newly assembled legacy worker batches, clamped to
+1..=4096 before integer conversion. Each batch also stops before exceeding the
+worker receipt's 1024 distinct deferrable full-document identities; repeated
+observations of one identity count once. The remaining jobs retain FIFO order.
+Already-admitted durable batches are never split or resized. Oversized durable
+envelopes are rejected before scheduler admission, not partially acknowledged.
+
+### Adaptive content scheduling
+
+Set `features.adaptive_scheduler = true` to enable load feedback. The production
+scheduler updates it on normal observation ticks and while a worker is pending.
+It tunes fresh legacy batch sizes and the CPU admission ceiling for subsequent
+content work, including durable journal work, without changing the worker lane,
+in-flight transaction, journal cursor, or commit acknowledgement rules.
+
+The configured content batch size and `cpu_hard_limit_pct` are ceilings, not
+starting points that adaptation may exceed. The adaptive batch ceiling is also
+limited to 2000 jobs; the 1024 distinct-deferral limit still applies when a new
+legacy batch is assembled. Feedback uses a time-weighted CPU average and adjusts
+at most once every five seconds of continuous usable observations. High CPU,
+disk, memory, or configured power-saving pressure reduces limits. Quiet samples
+recover them gradually. Counter failures cannot become quiet disk observations;
+invalid CPU/memory values or stale/zero-duration load samples revoke adaptive
+content admission. Memory use at or above 90% also pauses new content admission.
+Existing idle, disk, and power gates still apply, including when adaptive limits
+recover. Cleanup remains eligible under pressure, subject to older FIFO work.
+
+Live reloads preserve learned limits, apply lower operator ceilings immediately,
+and require new quiet observations to grow toward raised ceilings. Turning the
+feature off discards its learned state and immediately restores the configured
+policy on the next observation; turning it on starts fresh. The status text
+reports `adaptive`, `cpu_cap`, and the effective fresh `batch` limit. These are
+admission diagnostics, not ingestion-health or completed-work claims.
+
+No adaptation forcibly cancels a running worker or a blocking native sensor.
+Sampling and worker timeouts retain their existing limitations. This feature
+does not provide parallel index writers or measured throughput guarantees.
 
 ## Index paths
 

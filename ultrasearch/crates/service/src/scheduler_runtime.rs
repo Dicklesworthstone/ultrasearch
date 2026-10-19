@@ -5,18 +5,18 @@ use crate::status_provider::{
     update_status_queue_state, update_status_scheduler_state,
 };
 use core_types::config::{AppConfig, ExtractSection};
-use core_types::{FileFlags, FileMeta};
+use core_types::{DocKey, FileFlags, FileMeta};
 use parking_lot::Mutex;
 use scheduler::{
-    SchedulerConfig, allow_content_jobs,
+    AdaptivePolicy, SchedulerConfig, allow_content_jobs,
     idle::{IdleSample, IdleTracker},
     metrics::{SystemLoad, SystemLoadSampler},
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Default)]
@@ -44,10 +44,44 @@ fn scheduler_config(app_cfg: &AppConfig) -> SchedulerConfig {
         cpu_metadata_max: app_cfg.scheduler.cpu_soft_limit_pct as f32,
         cpu_content_max: app_cfg.scheduler.cpu_hard_limit_pct as f32,
         disk_busy_threshold_bps: app_cfg.scheduler.disk_busy_bytes_per_s,
-        content_batch_size: app_cfg.scheduler.content_batch_size as usize,
+        // Bound in u64 before converting: a large setting must not truncate on
+        // 32-bit hosts or create a legacy retry too large for bounded dispatch.
+        content_batch_size: app_cfg
+            .scheduler
+            .content_batch_size
+            .clamp(1, MAX_INDEX_BATCH_JOBS as u64) as usize,
         power_save_mode: app_cfg.scheduler.power_save_mode,
         ..SchedulerConfig::default()
     }
+}
+
+fn adaptive_config_at(
+    adaptive: &mut Option<AdaptivePolicy>,
+    enabled: bool,
+    base: &SchedulerConfig,
+    load: &SystemLoad,
+    now: Instant,
+) -> SchedulerConfig {
+    if !enabled {
+        // Turning the feature off restores the operator policy immediately;
+        // a later enable starts a new feedback window, not stale learned load.
+        *adaptive = None;
+        return base.clone();
+    }
+    let policy = adaptive.get_or_insert_with(|| AdaptivePolicy::new(base.clone()));
+    policy.reconfigure(base.clone());
+    policy.update_at(load, now);
+    policy.config().clone()
+}
+
+fn content_allowed(
+    idle: scheduler::IdleState,
+    load: SystemLoad,
+    effective: &SchedulerConfig,
+    adaptive: Option<&AdaptivePolicy>,
+) -> bool {
+    adaptive.is_none_or(AdaptivePolicy::can_admit_content)
+        && allow_content_jobs(idle, load, effective)
 }
 
 /// Poll one dispatch to completion without suspending observation for its whole
@@ -78,13 +112,15 @@ async fn await_dispatch<F: std::future::Future>(
     allow_content: &AtomicBool,
     force_allow_content: bool,
     sample: &mut impl FnMut(&mut IdleTracker, &mut SystemLoadSampler) -> (IdleSample, SystemLoad),
+    adaptive: &mut Option<AdaptivePolicy>,
 ) -> F::Output {
     await_with_refresh(completion, OBSERVATION_INTERVAL, || {
         // Config publication is atomic. Use one snapshot for both sensors and
         // the admission hint, including while the current worker is running.
         // Do not replace readers: the native SessionClock needs observations
         // at intervals <= 5 s to retain earned, conservative idle time.
-        let cfg = scheduler_config(&core_types::config::get_current_config());
+        let app_cfg = core_types::config::get_current_config();
+        let cfg = scheduler_config(&app_cfg);
         idle.set_thresholds(cfg.warm_idle, cfg.deep_idle);
         load.set_disk_threshold(cfg.disk_busy_threshold_bps);
         // Close the opportunistic admission hint before potentially blocking
@@ -92,12 +128,20 @@ async fn await_dispatch<F: std::future::Future>(
         // synchronous sensors are not forcibly interruptible by this timer.
         allow_content.store(false, Ordering::Relaxed);
         let (idle_sample, load_sample) = sample(idle, load);
-        let allowed =
-            force_allow_content || allow_content_jobs(idle_sample.state, load_sample, &cfg);
+        let effective = adaptive_config_at(
+            adaptive,
+            app_cfg.features.adaptive_scheduler,
+            &cfg,
+            &load_sample,
+            Instant::now(),
+        );
+        let allowed = force_allow_content
+            || content_allowed(idle_sample.state, load_sample, &effective, adaptive.as_ref());
         allow_content.store(allowed, Ordering::Relaxed);
         update_status_scheduler_state(format!(
-            "idle={:?} cpu={:.1}% mem={:.1}% dispatch=pending content_admission={allowed}",
+            "idle={:?} cpu={:.1}% mem={:.1}% dispatch=pending content_admission={allowed} adaptive={} cpu_cap={:.1}% batch={}",
             idle_sample.state, load_sample.cpu_percent, load_sample.mem_used_percent,
+            adaptive.is_some(), effective.cpu_content_max, effective.content_batch_size,
         ));
     })
     .await
@@ -148,9 +192,52 @@ fn requires_content(batch: &IndexBatch) -> bool {
         .any(|job| job.operation != JobOperation::Delete)
 }
 
+fn check_index_batch_bounds(batch: &IndexBatch) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        batch.jobs.len() <= MAX_INDEX_BATCH_JOBS,
+        "index batch exceeds the {MAX_INDEX_BATCH_JOBS}-job bound"
+    );
+    let mut deferred = BTreeSet::new();
+    for job in &batch.jobs {
+        if job.operation == JobOperation::Reconcile {
+            deferred.insert(DocKey::from_parts(job.volume_id, job.file_id));
+            anyhow::ensure!(
+                deferred.len() <= content_index::MAX_DEFERRED_KEYS,
+                "index batch exceeds the {}-deferrable-identity bound",
+                content_index::MAX_DEFERRED_KEYS,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn take_legacy_batch(queue: &mut VecDeque<JobSpec>, limit: usize) -> Vec<JobSpec> {
+    let limit = limit.clamp(1, MAX_INDEX_BATCH_JOBS).min(queue.len());
+    let mut batch = Vec::with_capacity(limit);
+    let mut deferred = BTreeSet::new();
+    while batch.len() < limit {
+        let Some(next) = queue.front() else {
+            break;
+        };
+        if next.operation == JobOperation::Reconcile {
+            let key = DocKey::from_parts(next.volume_id, next.file_id);
+            if !deferred.contains(&key) && deferred.len() == content_index::MAX_DEFERRED_KEYS {
+                break;
+            }
+            deferred.insert(key);
+        }
+        if let Some(job) = queue.pop_front() {
+            batch.push(job);
+        }
+    }
+    // Never skip a blocked head: even a deletion behind it must preserve FIFO.
+    batch
+}
+
 /// Runtime wrapper that drives a simple scheduling loop and dispatches content batches.
 pub struct SchedulerRuntime {
     config: SchedulerConfig,
+    adaptive: Option<AdaptivePolicy>,
     idle: IdleTracker,
     load: SystemLoadSampler,
     content_jobs: VecDeque<JobSpec>,
@@ -191,6 +278,7 @@ impl SchedulerRuntime {
             runtime_id,
             dispatcher: JobDispatcher::new(app_cfg),
             config,
+            adaptive: None,
             live,
             current_volumes: app_cfg.volumes.clone(),
             force_allow_content: false,
@@ -329,6 +417,13 @@ impl SchedulerRuntime {
         // updating the sensors after sampling, admits work using stale policy.
         self.allow_content.store(false, Ordering::Relaxed);
         let (idle_sample, load) = sample(&mut self.idle, &mut self.load);
+        let effective = adaptive_config_at(
+            &mut self.adaptive,
+            app_cfg.features.adaptive_scheduler,
+            &self.config,
+            &load,
+            Instant::now(),
+        );
 
         self.receive_submissions();
         self.update_live_counts();
@@ -339,8 +434,9 @@ impl SchedulerRuntime {
         let dropped = self.live.dropped_content.load(Ordering::Relaxed);
         let enqueued = self.live.enqueued_content.load(Ordering::Relaxed);
         update_status_scheduler_state(format!(
-            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={} enqueued={}",
-            idle_sample.state, load.cpu_percent, load.mem_used_percent, ct, dropped, enqueued
+            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={} enqueued={} adaptive={} cpu_cap={:.1}% batch={}",
+            idle_sample.state, load.cpu_percent, load.mem_used_percent, ct, dropped, enqueued,
+            self.adaptive.is_some(), effective.cpu_content_max, effective.content_batch_size,
         ));
         update_status_queue_state(
             Some(ct as u64),
@@ -354,8 +450,8 @@ impl SchedulerRuntime {
         // Extraction follows idle/load policy. Bounded deletion, reset, and
         // metadata-only batches do not extract content and must remain usable
         // while the user is active. Preserve older legacy work as a FIFO barrier.
-        let allow_content =
-            self.force_allow_content || allow_content_jobs(idle_sample.state, load, &self.config);
+        let allow_content = self.force_allow_content
+            || content_allowed(idle_sample.state, load, &effective, self.adaptive.as_ref());
         self.allow_content.store(allow_content, Ordering::Relaxed);
         if !allow_content
             && (self.legacy_retry.is_some()
@@ -369,18 +465,7 @@ impl SchedulerRuntime {
         }
 
         if self.legacy_retry.is_none() && !self.content_jobs.is_empty() {
-            let batch_size = self
-                .config
-                .content_batch_size
-                .min(self.content_jobs.len())
-                .max(1);
-
-            let mut batch = Vec::with_capacity(batch_size);
-            for _ in 0..batch_size {
-                if let Some(job) = self.content_jobs.pop_front() {
-                    batch.push(job);
-                }
-            }
+            let batch = take_legacy_batch(&mut self.content_jobs, effective.content_batch_size);
 
             self.legacy_retry = Some(IndexBatch {
                 id: uuid::Uuid::new_v4(),
@@ -399,6 +484,7 @@ impl SchedulerRuntime {
                 &self.allow_content,
                 self.force_allow_content,
                 &mut sample,
+                &mut self.adaptive,
             )
             .await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
@@ -424,6 +510,7 @@ impl SchedulerRuntime {
                 &self.allow_content,
                 self.force_allow_content,
                 &mut sample,
+                &mut self.adaptive,
             )
             .await;
             self.live.active_workers.fetch_sub(1, Ordering::Relaxed);
@@ -484,10 +571,9 @@ pub async fn submit_index_batch(
     batch: IndexBatch,
     mutation_lease: Option<Arc<std::fs::File>>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        batch.jobs.len() <= MAX_INDEX_BATCH_JOBS,
-        "index batch exceeds the {MAX_INDEX_BATCH_JOBS}-job bound"
-    );
+    // An admitted durable transaction is indivisible. Reject an envelope the
+    // worker cannot receipt BEFORE queueing; never truncate it to fit a budget.
+    check_index_batch_bounds(&batch)?;
     let sender = submission_sender()
         .ok_or_else(|| anyhow::anyhow!("scheduler is not running; index batch remains pending"))?;
     let (acknowledgement, response) = oneshot::channel();
@@ -719,6 +805,257 @@ mod tests {
         Ok(())
     }
 
+    fn observed_load(cpu: f32, memory: f32) -> SystemLoad {
+        SystemLoad {
+            cpu_percent: cpu,
+            mem_used_percent: memory,
+            disk_bytes_per_sec: 0,
+            disk_busy: false,
+            sample_duration: Duration::from_secs(1),
+            on_battery: false,
+            game_mode: false,
+        }
+    }
+
+    #[test]
+    fn adaptive_feedback_survives_ticks_and_toggle_restores_operator_policy() {
+        let mut cfg = AppConfig::default();
+        cfg.scheduler.cpu_hard_limit_pct = 40;
+        cfg.scheduler.content_batch_size = 500;
+        let base = scheduler_config(&cfg);
+        let start = Instant::now();
+        let mut adaptive = None;
+        let mut effective = base.clone();
+        for second in 0..=5 {
+            effective = adaptive_config_at(
+                &mut adaptive,
+                true,
+                &base,
+                &observed_load(60.0, 50.0),
+                start + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(effective.content_batch_size, 400);
+        assert_eq!(effective.cpu_content_max, 35.0);
+        let load = observed_load(37.0, 50.0);
+        assert!(allow_content_jobs(scheduler::IdleState::DeepIdle, load, &base));
+        assert!(!content_allowed(
+            scheduler::IdleState::DeepIdle,
+            load,
+            &effective,
+            adaptive.as_ref(),
+        ));
+        effective = adaptive_config_at(
+            &mut adaptive,
+            false,
+            &base,
+            &load,
+            start + Duration::from_secs(6),
+        );
+        assert!(adaptive.is_none());
+        assert_eq!(effective.content_batch_size, 500);
+        assert_eq!(effective.cpu_content_max, 40.0);
+        assert!(content_allowed(
+            scheduler::IdleState::DeepIdle, load, &effective, None,
+        ));
+        effective = adaptive_config_at(
+            &mut adaptive,
+            true,
+            &base,
+            &load,
+            start + Duration::from_secs(7),
+        );
+        assert_eq!(effective.content_batch_size, 500);
+        assert_eq!(effective.cpu_content_max, 40.0);
+        assert_eq!(base.content_batch_size, 500);
+        assert_eq!(cfg.scheduler.cpu_hard_limit_pct, 40);
+    }
+
+    #[test]
+    fn legacy_batches_obey_deferral_and_count_bounds_without_skipping_a_head() {
+        let mut queue = VecDeque::new();
+        queue.push_back(JobSpec {
+            operation: JobOperation::Delete,
+            ..dummy_job()
+        });
+        for id in 1..=content_index::MAX_DEFERRED_KEYS + 1 {
+            queue.push_back(JobSpec {
+                operation: JobOperation::Reconcile,
+                file_id: id as u64,
+                ..dummy_job()
+            });
+        }
+        queue.push_back(JobSpec {
+            operation: JobOperation::Delete,
+            ..dummy_job()
+        });
+        let original = serde_json::to_value(&queue).unwrap();
+        let mut first = take_legacy_batch(&mut queue, usize::MAX);
+        assert_eq!(first.len(), content_index::MAX_DEFERRED_KEYS + 1);
+        assert_eq!(queue.front().unwrap().operation, JobOperation::Reconcile);
+        assert_eq!(queue.len(), 2, "later deletion must not overtake the blocked head");
+        first.extend(take_legacy_batch(&mut queue, usize::MAX));
+        assert!(queue.is_empty());
+        assert_eq!(serde_json::to_value(first).unwrap(), original);
+
+        for setting in [0, 1, 1000, u64::MAX] {
+            let mut cfg = AppConfig::default();
+            cfg.scheduler.content_batch_size = setting;
+            let limit = scheduler_config(&cfg).content_batch_size;
+            assert_eq!(limit, setting.clamp(1, MAX_INDEX_BATCH_JOBS as u64) as usize);
+            let mut queue = VecDeque::from(vec![dummy_job(); MAX_INDEX_BATCH_JOBS + 1]);
+            let selected = take_legacy_batch(&mut queue, limit);
+            assert_eq!(selected.len(), limit);
+            assert_eq!(queue.len(), MAX_INDEX_BATCH_JOBS + 1 - limit);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferral_capacity_is_checked_before_admission_using_full_identity() {
+        let _guard = TEST_LOCK.lock().await;
+        let runtime = SchedulerRuntime::new(&AppConfig::default());
+        let mut batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: (1..=content_index::MAX_DEFERRED_KEYS)
+                .map(|id| JobSpec {
+                    operation: JobOperation::Reconcile,
+                    file_id: id as u64,
+                    ..dummy_job()
+                })
+                .collect(),
+            reset_volumes: Vec::new(),
+        };
+        batch.jobs.push(batch.jobs[0].clone());
+        check_index_batch_bounds(&batch).unwrap();
+        for (volume_id, file_id) in [(2, 1), (1, (1u64 << 48) | 1)] {
+            let last = batch.jobs.last_mut().unwrap();
+            last.volume_id = volume_id;
+            last.file_id = file_id;
+            let error = submit_index_batch(batch.clone(), None).await.unwrap_err();
+            assert!(error.to_string().contains("deferrable-identity bound"));
+            assert!(runtime.job_rx.is_empty());
+        }
+        // Deletes and strict upserts do not consume a deferral slot.
+        batch.jobs.last_mut().unwrap().operation = JobOperation::Delete;
+        check_index_batch_bounds(&batch).unwrap();
+        batch.jobs.last_mut().unwrap().operation = JobOperation::Upsert;
+        check_index_batch_bounds(&batch).unwrap();
+    }
+
+    #[tokio::test]
+    async fn adaptive_pause_preserves_durable_work_and_does_not_block_cleanup()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let (mut cfg, expected_error) = blocked_dispatch_config()?;
+        cfg.features.adaptive_scheduler = true;
+        cfg.scheduler.content_batch_size = 1;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        let batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: (1..=4)
+                .map(|id| JobSpec {
+                    operation: JobOperation::Reconcile,
+                    file_id: id,
+                    ..dummy_job()
+                })
+                .collect(),
+            reset_volumes: vec![1],
+        };
+        let mut submission = Box::pin(submit_index_batch(batch.clone(), None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        let idle = IdleSample {
+            state: scheduler::IdleState::DeepIdle,
+            idle_for: Duration::from_secs(3600),
+            since_state_change: Duration::from_secs(3600),
+        };
+        for _ in 0..2 {
+            runtime.tick_with_observation(idle, observed_load(0.0, 95.0)).await;
+            assert!(!content_admission_available());
+            let pending = &runtime.pending_index.as_ref().unwrap().batch;
+            assert_eq!(serde_json::to_value(pending)?, serde_json::to_value(&batch)?);
+            assert!(submission.as_mut().poll(&mut context).is_pending());
+        }
+        // Disabling the optional policy restores baseline behavior on the
+        // next tick, without splitting the already-admitted four-job batch.
+        cfg.features.adaptive_scheduler = false;
+        core_types::config::set_current_config(cfg.clone())?;
+        runtime.tick_with_observation(idle, observed_load(0.0, 95.0)).await;
+        assert!(runtime.adaptive.is_none());
+        assert!(runtime.pending_index.is_none());
+        assert_eq!(submission.await.unwrap_err().to_string(), expected_error);
+
+        cfg.features.adaptive_scheduler = true;
+        core_types::config::set_current_config(cfg)?;
+        let cleanup = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: Vec::new(),
+            reset_volumes: vec![1],
+        };
+        let mut submission = Box::pin(submit_index_batch(cleanup, None));
+        assert!(submission.as_mut().poll(&mut context).is_pending());
+        runtime.tick_with_observation(idle, observed_load(0.0, 95.0)).await;
+        assert!(!content_admission_available());
+        assert!(runtime.pending_index.is_none(), "cleanup must still reach dispatch");
+        assert_eq!(submission.await.unwrap_err().to_string(), expected_error);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_dispatch_observes_adaptive_enable_and_disable() -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let mut cfg = core_types::config::get_current_config();
+        cfg.features.adaptive_scheduler = false;
+        cfg.scheduler.idle_warm_seconds = 15;
+        cfg.scheduler.idle_deep_seconds = 60;
+        cfg.scheduler.cpu_hard_limit_pct = 40;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut idle = IdleTracker::with_reader(
+            Duration::from_secs(cfg.scheduler.idle_warm_seconds),
+            Duration::from_secs(cfg.scheduler.idle_deep_seconds),
+            (|| Some(3_600_000)) as fn() -> Option<u64>,
+        );
+        let mut load = SystemLoadSampler::new(cfg.scheduler.disk_busy_bytes_per_s);
+        let allowed = AtomicBool::new(true);
+        let mut adaptive = None;
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        let mut releases = VecDeque::from([first_tx, second_tx]);
+        let completion = async {
+            cfg.features.adaptive_scheduler = true;
+            core_types::config::set_current_config(cfg.clone())?;
+            first_rx.await?;
+            anyhow::ensure!(!allowed.load(Ordering::Relaxed), "adaptive pressure was ignored");
+            cfg.features.adaptive_scheduler = false;
+            core_types::config::set_current_config(cfg)?;
+            second_rx.await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let mut sample = |tracker: &mut IdleTracker, _: &mut SystemLoadSampler| {
+            releases.pop_front().unwrap().send(()).unwrap();
+            (tracker.sample(), observed_load(0.0, 95.0))
+        };
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            await_dispatch(
+                completion,
+                &mut idle,
+                &mut load,
+                &allowed,
+                false,
+                &mut sample,
+                &mut adaptive,
+            ),
+        )
+        .await
+        .expect("both policy reloads must be observed while dispatch is pending")?;
+        assert!(allowed.load(Ordering::Relaxed));
+        assert!(adaptive.is_none());
+        assert!(releases.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pending_dispatch_is_not_restarted_while_observations_advance() {
         use std::cell::Cell;
@@ -782,6 +1119,7 @@ mod tests {
             (|| Some(45_000)) as fn() -> Option<u64>,
         );
         let mut load = SystemLoadSampler::new(1_000);
+        let mut adaptive = None;
         let allowed = AtomicBool::new(true);
         let (finish, finished) = oneshot::channel();
         let mut finish = Some(finish);
@@ -813,7 +1151,15 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(5),
-            await_dispatch(completion, &mut idle, &mut load, &allowed, false, &mut sample),
+            await_dispatch(
+                completion,
+                &mut idle,
+                &mut load,
+                &allowed,
+                false,
+                &mut sample,
+                &mut adaptive,
+            ),
         )
         .await
         .expect("dispatch must keep refreshing while completion is pending")?;
