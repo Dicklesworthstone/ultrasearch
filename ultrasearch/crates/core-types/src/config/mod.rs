@@ -35,6 +35,7 @@ pub struct AppConfig {
 
 /// Load config, creating a default config file if none exists at the target path.
 pub fn load_or_create_config(path: Option<&Path>) -> Result<AppConfig> {
+    let _ = dotenvy::dotenv();
     let target: PathBuf = path
         .map(Path::to_path_buf)
         .unwrap_or_else(default_config_path);

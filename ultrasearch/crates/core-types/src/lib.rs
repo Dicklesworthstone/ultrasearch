@@ -168,6 +168,7 @@ impl FileMeta {
     ) -> Self {
         let ext = name
             .rsplit_once('.')
+            .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
             .map(|(_, ext)| ext.to_ascii_lowercase());
         Self {
             key,
@@ -420,6 +421,45 @@ mod tests {
             FileFlags::empty(),
         );
         assert_eq!(fm.ext.as_deref(), Some("pdf"));
+
+        let dotfile = FileMeta::new(
+            key,
+            1,
+            None,
+            ".gitignore".to_string(),
+            None,
+            10,
+            0,
+            0,
+            FileFlags::empty(),
+        );
+        assert_eq!(dotfile.ext, None);
+
+        let multi_dot_dotfile = FileMeta::new(
+            key,
+            1,
+            None,
+            ".eslintrc.JSON".to_string(),
+            None,
+            10,
+            0,
+            0,
+            FileFlags::empty(),
+        );
+        assert_eq!(multi_dot_dotfile.ext.as_deref(), Some("json"));
+
+        let trailing_dot = FileMeta::new(
+            key,
+            1,
+            None,
+            "README.".to_string(),
+            None,
+            10,
+            0,
+            0,
+            FileFlags::empty(),
+        );
+        assert_eq!(trailing_dot.ext, None);
     }
 
     #[test]
