@@ -28,11 +28,11 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
     let args = Args::parse();
 
     #[cfg(windows)]
     if let Some(cmd) = args.command {
+        dotenvy::dotenv().ok();
         match cmd {
             ServiceCommand::Install => return service::windows::management::install_service(),
             ServiceCommand::Uninstall => return service::windows::management::uninstall_service(),
@@ -41,24 +41,21 @@ fn main() -> Result<()> {
         }
     }
 
-    // Load config early to ensure it exists, though bootstrap will reload or use passed cfg.
+    // Register with SCM before .env/config IO, ACL setup, or index work. A slow
+    // or invalid configuration must be reported through the registered host,
+    // not prevent the process from connecting to SCM in the first place.
+    #[cfg(windows)]
+    if !args.console {
+        return service::windows::service_main::launch();
+    }
+
+    dotenvy::dotenv().ok();
     let cfg = load_or_create_config(None)?;
     // Ensure config file is writable by standard users for CLI/UI updates.
     let cfg_path = core_types::config::default_config_path();
     service::ensure_config_acl_writable(&cfg_path);
 
     tracing::info!("Starting service (console: {})", args.console);
-
-    #[cfg(windows)]
-    {
-        if !args.console {
-            // Attempt to start as a Windows Service.
-            // This will block until the service stops.
-            // We pass a dummy closure because our current skeleton hardcodes the bootstrap call inside service_main
-            // to avoid static/global complexity for now.
-            return service::windows::service_main::launch(|_| Ok(()));
-        }
-    }
 
     // Fallback (Linux or --console): run directly.
     tracing::info!("Running in console mode. Press Ctrl+C to stop.");

@@ -1,4 +1,5 @@
 use std::{
+    ops::ControlFlow,
     path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -22,6 +23,17 @@ pub struct BootstrapOptions {
     pub force_content_jobs: bool,
 }
 
+/// Completed initialization steps, not journal coverage or ingestion health.
+/// The host may report Running only after EndpointReady. MFT reconciliation
+/// and live journal catch-up remain background work with their own status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupStage {
+    RuntimeReady,
+    ConfigurationBound,
+    IndexesReady,
+    EndpointReady,
+}
+
 use crate::{
     init_tracing_with_config,
     meta_ingest::ingest_with_paths,
@@ -42,9 +54,22 @@ pub fn run_app(cfg: &AppConfig, shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
 
 pub fn run_app_with_options(
     cfg: &AppConfig,
-    mut shutdown_rx: mpsc::Receiver<()>,
+    shutdown_rx: mpsc::Receiver<()>,
     opts: BootstrapOptions,
 ) -> Result<()> {
+    run_app_with_startup(cfg, shutdown_rx, opts, |_| Ok(ControlFlow::Continue(())))
+}
+
+/// Report actual initialization progress and allow the host to stop between
+/// steps. Break means an explicit host shutdown, not successful readiness.
+/// Reporting errors abort startup and retain the existing ownership cleanup.
+pub fn run_app_with_startup(
+    cfg: &AppConfig,
+    mut shutdown_rx: mpsc::Receiver<()>,
+    opts: BootstrapOptions,
+    mut notify: impl FnMut(StartupStage) -> Result<ControlFlow<()>>,
+) -> Result<()> {
+    cfg.validate()?;
     let _guard = init_tracing_with_config(&cfg.logging)?;
 
     // The resident service answers interactive queries and advances journals.
@@ -57,6 +82,9 @@ pub fn run_app_with_options(
         .enable_all()
         .build()?;
     let _rt_guard = rt.enter();
+    if notify(StartupStage::RuntimeReady)?.is_break() {
+        return Ok(());
+    }
 
     // Install status provider so IPC/status can respond.
     init_basic_status_provider();
@@ -75,7 +103,13 @@ pub fn run_app_with_options(
     let cfg_owned = cfg.clone();
     ensure_data_paths_exist(&cfg_owned)?;
     core_types::config::set_current_config(cfg_owned.clone())?;
+    if notify(StartupStage::ConfigurationBound)?.is_break() {
+        return Ok(());
+    }
     let ingestion = initialize_indexes(&cfg_owned)?;
+    if notify(StartupStage::IndexesReady)?.is_break() {
+        return Ok(());
+    }
 
     let use_journal = opts.initial_metas.is_none() && !opts.skip_initial_ingest;
     match opts.initial_metas {
@@ -123,6 +157,13 @@ pub fn run_app_with_options(
     #[cfg(target_os = "windows")]
     {
         tasks.listener = Some(rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref()))?);
+    }
+
+    // The endpoint is owned and index readers are installed. Signal this
+    // before launching writers so a stop latched during initialization cannot
+    // start a new ingestion lane. ServiceTasks owns the listener on error/break.
+    if notify(StartupStage::EndpointReady)?.is_break() {
+        return Ok(());
     }
 
     // Readers and the endpoint are ready before writers can run. A failed pipe
@@ -690,6 +731,139 @@ mod tests {
     }
 
     struct ChildGuard(Child);
+
+    #[test]
+    fn startup_readiness_requires_real_readers_and_endpoint_and_allows_cancellation() -> Result<()> {
+        const ROOT: &str = "ULTRASEARCH_STARTUP_READY_TEST_ROOT";
+        const MODE: &str = "ULTRASEARCH_STARTUP_READY_TEST_MODE";
+        const PROOF: &[u8] = b"startup-readiness-assertions-executed";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let mode = std::env::var(MODE)?;
+            let cfg = core_types::config::load_or_create_config(Some(&root.join("config.toml")))?;
+            let pipe_name = format!(r"\\.\pipe\ultrasearch-ready-{}", uuid::Uuid::new_v4());
+            let (shutdown, receiver) = mpsc::channel(1);
+            shutdown.try_send(())?;
+            let mut stages = Vec::new();
+            let result = run_app_with_startup(
+                &cfg,
+                receiver,
+                BootstrapOptions {
+                    skip_initial_ingest: true,
+                    pipe_name: Some(pipe_name.clone()),
+                    ..BootstrapOptions::default()
+                },
+                |stage| {
+                    stages.push(stage);
+                    if stage == StartupStage::RuntimeReady {
+                        if mode == "cancel" {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        if mode == "report-error" {
+                            anyhow::bail!("fixture startup reporter failed");
+                        }
+                    }
+                    if stage == StartupStage::EndpointReady {
+                        // Check actual committed resources, not just the order
+                        // of callbacks. A unique native pipe cannot be an older
+                        // service instance answering on the default endpoint.
+                        tantivy::Index::open_in_dir(&cfg.paths.meta_index)?;
+                        tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+                        #[cfg(windows)]
+                        {
+                            use tokio::net::windows::named_pipe::ClientOptions;
+                            let _client = ClientOptions::new().open(&pipe_name)?;
+                        }
+                        if mode == "endpoint-error" {
+                            anyhow::bail!("fixture endpoint acknowledgement failed");
+                        }
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            );
+            match mode.as_str() {
+                "success" | "endpoint-error" => {
+                    ensure!(
+                        stages == [
+                            StartupStage::RuntimeReady,
+                            StartupStage::ConfigurationBound,
+                            StartupStage::IndexesReady,
+                            StartupStage::EndpointReady,
+                        ]
+                    );
+                    if mode == "success" {
+                        result?;
+                    } else {
+                        ensure!(
+                            format!("{:#}", result.unwrap_err())
+                                .contains("endpoint acknowledgement failed")
+                        );
+                    }
+                }
+                "cancel" | "report-error" | "path-error" => {
+                    ensure!(stages == [StartupStage::RuntimeReady]);
+                    if mode == "cancel" {
+                        result?;
+                    } else {
+                        let error = result.expect_err("startup failure must not report success");
+                        if mode == "report-error" {
+                            ensure!(format!("{error:#}").contains("startup reporter failed"));
+                        }
+                    }
+                    if mode != "path-error" {
+                        ensure!(!Path::new(&cfg.paths.meta_index).exists());
+                    }
+                }
+                _ => anyhow::bail!("unknown readiness fixture mode"),
+            }
+            ensure!(!crate::scheduler_runtime::content_admission_available());
+            fs::write(root.join("proof"), PROOF)?;
+            return Ok(());
+        }
+
+        // Each child owns its tracing/configuration/runtime/native-priority
+        // state. A proof file prevents an empty --exact selection from passing.
+        for mode in [
+            "success", "path-error", "cancel", "report-error", "endpoint-error",
+        ] {
+            let root = tempfile::tempdir()?.keep();
+            let mut cfg = AppConfig::default();
+            cfg.app.data_dir = root
+                .join("data")
+                .to_str()
+                .context("non-UTF-8 fixture")?
+                .into();
+            if mode == "path-error" {
+                let path = root.join("not-an-index-directory");
+                fs::write(&path, b"retain this failing startup fixture")?;
+                cfg.paths.meta_index = path.to_str().context("non-UTF-8 fixture")?.into();
+            }
+            fs::write(root.join("config.toml"), toml::to_string_pretty(&cfg)?)?;
+            let name = concat!(module_path!(), "::startup_readiness_requires_real_readers_and_endpoint_and_allows_cancellation");
+            let name = name.split_once("::").context("test crate prefix missing")?.1;
+            let mut child = ChildGuard(
+                Command::new(std::env::current_exe()?)
+                    .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                    .env(ROOT, &root)
+                    .env(MODE, mode)
+                    .spawn()?,
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.0.try_wait()? {
+                    ensure!(status.success(), "readiness case {mode} failed: {status}");
+                    ensure!(
+                        fs::read(root.join("proof"))? == PROOF,
+                        "readiness assertions did not execute"
+                    );
+                    break;
+                }
+                ensure!(Instant::now() < deadline, "readiness case {mode} timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Ok(())
+    }
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
