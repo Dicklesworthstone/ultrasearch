@@ -153,10 +153,26 @@ content admission. Memory use at or above 90% also pauses new content admission.
 Existing idle, disk, and power gates still apply, including when adaptive limits
 recover. Cleanup remains eligible under pressure, subject to older FIFO work.
 
+CPU admission also recovers when pressure has cleared but a learned ceiling
+still blocks the observed load. For example, a ceiling reduced to 15% must not
+strand content indefinitely on a machine with steady 20% background CPU and a
+configured 40% ceiling. At the existing five-second adjustment cadence, the
+controller raises only the learned CPU ceiling by at most five percentage
+points, stopping once it exceeds the observed CPU or reaches the configured
+ceiling. It does not increase the batch size on this recovery path. Current CPU
+must remain below the operator ceiling, the smoothed CPU must not exceed its
+existing 80% pressure boundary, and disk, memory, and configured power-saving
+pressure must be absent. Active/WarmIdle sessions remain ineligible. Missing,
+invalid, duplicate, or interrupted observations cannot accelerate recovery;
+the existing freshness and admission checks still apply. Persistent pressure
+can still defer work; this is not a deadline or throughput guarantee.
+
 Live reloads preserve learned limits, apply lower operator ceilings immediately,
-and require new quiet observations to grow toward raised ceilings. Turning the
-feature off discards its learned state and immediately restores the configured
-policy on the next observation; turning it on starts fresh. The status text
+and require fresh usable observations before recovery toward raised ceilings.
+Batch growth still requires quiet load; CPU admission also uses the bounded
+recovery path above. Turning the feature off discards its learned state and
+immediately restores the configured policy on the next observation; turning it
+on starts fresh. The status text
 reports `adaptive`, `cpu_cap`, and the effective fresh `batch` limit. These are
 admission diagnostics, not ingestion-health or completed-work claims.
 

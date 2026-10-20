@@ -62,9 +62,11 @@ impl AdaptivePolicy {
     }
 
     /// Apply a live base policy without erasing learned limits on every tick.
-    /// Lower ceilings apply immediately. Raising them requires fresh quiet
-    /// observations before the learned values grow. Non-adaptive fields are
-    /// copied verbatim; no configuration is written back to the shared cache.
+    /// Lower ceilings apply immediately. Raising them requires fresh usable
+    /// observations before the learned values grow. Batch growth requires quiet
+    /// load; CPU admission can also recover from a self-imposed stall once
+    /// pressure has cleared. Non-adaptive fields are copied verbatim; no
+    /// configuration is written back to the shared cache.
     pub fn reconfigure(&mut self, base: SchedulerConfig) {
         let changed = batch_ceiling(&base) != batch_ceiling(&self.base)
             || cpu_ceiling(&base) != cpu_ceiling(&self.base)
@@ -165,6 +167,16 @@ impl AdaptivePolicy {
                 .saturating_add(50)
                 .min(batch_ceiling(&self.base));
             self.config.cpu_content_max = (self.config.cpu_content_max + 5.0).min(ceiling);
+        } else if load.cpu_percent >= self.config.cpu_content_max {
+            // Pressure has cleared, but the learned CPU ceiling itself may
+            // still prevent every content job from running. Requiring <10%
+            // absolute CPU to recover would strand a machine with a steady
+            // 20% background load forever after a disk/CPU pressure episode.
+            // Probe admission gradually using the existing adjustment cadence,
+            // never above the operator ceiling. Do not grow the batch: spare
+            // capacity to start a small batch is not evidence for larger ones.
+            // Equality must recover too: allow_content_jobs uses strict `<`.
+            self.config.cpu_content_max = (self.config.cpu_content_max + 5.0).min(ceiling);
         }
         self.last_adjustment = Some(now);
     }
@@ -205,6 +217,181 @@ mod tests {
         observe_seconds(&mut policy, &cpu_load(60.0), Instant::now(), 5);
         assert!(policy.config().content_batch_size < initial_batch);
         assert!(policy.config().cpu_content_max < initial_cpu);
+    }
+
+    #[test]
+    fn moderate_load_recovers_queued_content_after_pressure_without_growing_batches() {
+        use crate::{IdleState, Job, JobCategory, JobQueues};
+        use core_types::DocKey;
+
+        for (ceiling, ambient) in [(40.0, 20.0), (80.0, 35.0), (80.0, 60.0)] {
+            let mut policy = AdaptivePolicy::new(SchedulerConfig {
+                cpu_content_max: ceiling,
+                ..Default::default()
+            });
+            let start = Instant::now();
+            observe_seconds(&mut policy, &cpu_load(100.0), start, 100);
+            assert_eq!(policy.config().cpu_content_max, CPU_THRESHOLD_MIN);
+            assert_eq!(policy.config().content_batch_size, BATCH_SIZE_MIN);
+
+            let key = DocKey::from_parts(7, 0xabcd_0000_0000_1234);
+            let mut queue = JobQueues::default();
+            queue.push(JobCategory::Content, Job::ContentIndex(key), 1024);
+            let load = cpu_load(ambient);
+            assert!(
+                crate::select_jobs(&mut queue, IdleState::DeepIdle, load, policy.config()).is_empty()
+            );
+            let mut admitted = false;
+            for second in 101..=220 {
+                policy.update_at(&load, start + Duration::from_secs(second));
+                assert!(policy.config().cpu_content_max <= ceiling);
+                assert_eq!(policy.config().content_batch_size, BATCH_SIZE_MIN);
+                assert!(!crate::allow_content_jobs(
+                    IdleState::Active,
+                    load,
+                    policy.config()
+                ));
+                assert!(!crate::allow_content_jobs(
+                    IdleState::WarmIdle,
+                    load,
+                    policy.config()
+                ));
+                if policy.can_admit_content() {
+                    let selected =
+                        crate::select_jobs(&mut queue, IdleState::DeepIdle, load, policy.config());
+                    if !selected.is_empty() {
+                        assert_eq!(selected.len(), 1);
+                        assert!(matches!(&selected[0], Job::ContentIndex(doc) if *doc == key));
+                        admitted = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                admitted,
+                "content stranded at ambient CPU {ambient}, ceiling {ceiling}"
+            );
+            assert!(queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_probe_preserves_pressure_gates_and_does_not_grow_under_them() {
+        for load in [
+            cpu_load(100.0),
+            cpu_load(35.0), // Still above the existing smoothed pressure boundary.
+            SystemLoad {
+                disk_busy: true,
+                ..cpu_load(20.0)
+            },
+            SystemLoad {
+                mem_used_percent: 95.0,
+                ..cpu_load(20.0)
+            },
+            SystemLoad {
+                on_battery: true,
+                ..cpu_load(20.0)
+            },
+            SystemLoad {
+                game_mode: true,
+                ..cpu_load(20.0)
+            },
+        ] {
+            let mut policy = AdaptivePolicy::new(SchedulerConfig::default());
+            let start = Instant::now();
+            observe_seconds(&mut policy, &cpu_load(100.0), start, 100);
+            let reduced_cpu = policy.config().cpu_content_max;
+            let reduced_batch = policy.config().content_batch_size;
+            for second in 101..=160 {
+                policy.update_at(&load, start + Duration::from_secs(second));
+                assert!(policy.config().cpu_content_max <= reduced_cpu);
+                assert_eq!(policy.config().content_batch_size, reduced_batch);
+                assert!(!(policy.can_admit_content()
+                    && crate::allow_content_jobs(crate::IdleState::DeepIdle, load, policy.config())));
+            }
+        }
+    }
+
+    #[test]
+    fn moderate_recovery_requires_elapsed_observations_and_crosses_equal_cpu_limit() {
+        let mut policy = AdaptivePolicy::new(SchedulerConfig {
+            content_batch_size: 3,
+            cpu_content_max: 5.0,
+            ..Default::default()
+        });
+        policy.reconfigure(SchedulerConfig::default());
+        let start = Instant::now();
+        let load = cpu_load(20.0);
+        observe_seconds(&mut policy, &load, start, 4);
+        assert_eq!(policy.config().cpu_content_max, 5.0);
+        policy.update_at(&load, start + Duration::from_secs(5));
+        assert_eq!(policy.config().cpu_content_max, 10.0);
+        for _ in 0..100 {
+            policy.update_at(&load, start + Duration::from_secs(5));
+        }
+        assert_eq!(policy.config().cpu_content_max, 10.0);
+
+        policy.update_at(&cpu_load(f32::NAN), start + Duration::from_secs(6));
+        assert!(!policy.can_admit_content());
+        observe_seconds(&mut policy, &load, start + Duration::from_secs(7), 4);
+        assert_eq!(policy.config().cpu_content_max, 10.0);
+        policy.update_at(&load, start + Duration::from_secs(12));
+        assert_eq!(policy.config().cpu_content_max, 15.0);
+
+        observe_seconds(&mut policy, &load, start + Duration::from_secs(60), 4);
+        assert_eq!(policy.config().cpu_content_max, 15.0);
+        policy.update_at(&load, start + Duration::from_secs(65));
+        assert_eq!(policy.config().cpu_content_max, 20.0);
+        assert!(!crate::allow_content_jobs(
+            crate::IdleState::DeepIdle,
+            load,
+            policy.config()
+        ));
+        observe_seconds(&mut policy, &load, start + Duration::from_secs(66), 4);
+        assert_eq!(policy.config().cpu_content_max, 25.0);
+        assert!(
+            policy.can_admit_content()
+                && crate::allow_content_jobs(crate::IdleState::DeepIdle, load, policy.config())
+        );
+        observe_seconds(&mut policy, &load, start + Duration::from_secs(71), 10);
+        assert_eq!(
+            policy.config().cpu_content_max,
+            25.0,
+            "stop probing once admission recovers"
+        );
+        assert_eq!(
+            policy.config().content_batch_size,
+            3,
+            "moderate load is not quiet growth"
+        );
+    }
+
+    #[test]
+    fn recovery_cannot_override_a_lowered_or_zero_operator_cpu_ceiling() {
+        let mut policy = AdaptivePolicy::new(SchedulerConfig {
+            cpu_content_max: 5.0,
+            ..Default::default()
+        });
+        policy.reconfigure(SchedulerConfig::default());
+        let start = Instant::now();
+        let load = cpu_load(20.0);
+        observe_seconds(&mut policy, &load, start, 10);
+        assert_eq!(policy.config().cpu_content_max, 15.0);
+        for (offset, ceiling) in [(11, 12.0), (22, 0.0)] {
+            policy.reconfigure(SchedulerConfig {
+                cpu_content_max: ceiling,
+                ..Default::default()
+            });
+            for second in offset..=offset + 10 {
+                policy.update_at(&load, start + Duration::from_secs(second));
+                assert!(policy.config().cpu_content_max <= ceiling);
+                assert!(!crate::allow_content_jobs(
+                    crate::IdleState::DeepIdle,
+                    load,
+                    policy.config()
+                ));
+            }
+        }
     }
 
     #[test]
