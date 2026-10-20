@@ -8,6 +8,7 @@ use anyhow::Result;
 use core_types::config::AppConfig;
 use ipc::VolumeStatus;
 use tokio::sync::mpsc;
+use tokio::task::{JoinError, JoinHandle};
 
 #[derive(Debug, Clone, Default)]
 pub struct BootstrapOptions {
@@ -118,39 +119,159 @@ pub fn run_app_with_options(
     let handler = crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path)?;
     set_search_handler(Box::new(handler));
 
+    let mut tasks = ServiceTasks::default();
     #[cfg(target_os = "windows")]
-    let _pipe_listener = rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref()))?;
+    {
+        tasks.listener = Some(rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref()))?);
+    }
 
     // Readers and the endpoint are ready before writers can run. A failed pipe
     // bind returns an error, drops this ingestion session, and never leaves a
     // second invisible scanner/worker running behind another service's pipe.
-    rt.spawn(scheduler.run_loop());
+    tasks.scheduler = Some(rt.spawn(scheduler.run_loop()));
     // Test seeds explicitly opt out of native discovery; production never
     // substitutes a successful no-op watcher.
     if use_journal {
         let cfg_clone = cfg_owned.clone();
-        rt.spawn(async move {
-            if let Err(e) = watch_changes(cfg_clone, ingestion).await {
-                update_status_ingestion_state(format!("stopped: {e:#}"));
-                tracing::error!("change watcher stopped: {e:#}");
-            }
-        });
+        tasks.watcher = Some(rt.spawn(watch_changes(cfg_clone, ingestion)));
     } else {
         update_status_ingestion_state("native ingestion disabled by test bootstrap options");
     }
 
-    tracing::info!("UltraSearch service started. Waiting for shutdown signal...");
+    tracing::info!("UltraSearch service started; supervising scheduler, journal and IPC tasks");
+    // A returned error reaches the console caller or the SCM host's existing
+    // nonzero exit reporting. Never keep a query endpoint alive indefinitely
+    // after its ingestion/scheduling lane has vanished.
+    rt.block_on(tasks.supervise(&mut shutdown_rx, update_status_ingestion_state))
+}
 
-    // Block until shutdown signal
-    // In a real async app, we would await; here we blocking_recv since we are not in an async fn (yet).
-    // But `run_app` is called from `main` (sync) or `service_main` (sync).
-    // However, `shutdown_rx` is async. We need a runtime if we want to await, or use blocking_recv.
-    // Since the channel is mpsc, we can use `blocking_recv`.
+/// Retain ownership of every essential loop. Dropping a bare JoinHandle would
+/// detach it, including on a bootstrap error or supervisor cancellation.
+#[derive(Default)]
+struct ServiceTasks {
+    scheduler: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<Result<()>>>,
+    listener: Option<JoinHandle<()>>,
+}
 
-    let _ = shutdown_rx.blocking_recv();
+impl ServiceTasks {
+    fn abort_all(&self) {
+        if let Some(task) = &self.scheduler {
+            task.abort();
+        }
+        if let Some(task) = &self.watcher {
+            task.abort();
+        }
+        if let Some(task) = &self.listener {
+            task.abort();
+        }
+    }
 
-    tracing::info!("Shutdown signal received. Exiting.");
-    Ok(())
+    async fn supervise(
+        mut self,
+        shutdown: &mut mpsc::Receiver<()>,
+        mut report: impl FnMut(String),
+    ) -> Result<()> {
+        // Optional loops stay pending rather than producing a false exit in
+        // non-Windows/test bootstrap. The scheduler is never optional.
+        anyhow::ensure!(self.scheduler.is_some(), "service scheduler was not started");
+        let mut outcome = tokio::select! {
+            // A known failure must not be hidden by a simultaneously queued
+            // stop signal. Unexpected success is also a failure for these loops.
+            biased;
+            result = wait_task(&mut self.scheduler) => {
+                let _ = self.scheduler.take();
+                Err(unexpected_exit("scheduler", result.map(Ok)))
+            }
+            result = wait_task(&mut self.watcher) => {
+                let _ = self.watcher.take();
+                Err(unexpected_exit("journal watcher", result))
+            }
+            result = wait_task(&mut self.listener) => {
+                let _ = self.listener.take();
+                Err(unexpected_exit("IPC listener", result.map(Ok)))
+            }
+            signal = shutdown.recv() => {
+                tracing::info!(explicit = signal.is_some(), "service shutdown requested");
+                Ok(())
+            }
+        };
+        if let Err(error) = &outcome {
+            report(format!("stopped: {error:#}"));
+            tracing::error!(%error, "essential service task stopped; stopping sibling tasks");
+        } else {
+            report("stopping: shutdown requested".into());
+        }
+
+        // Stop every sibling before joining any one of them. Joining observes
+        // destruction of the watcher/session (hiding its volumes) and scheduler
+        // queues (closing unacknowledged submissions), not a fabricated commit.
+        self.abort_all();
+        let stopped = [
+            reap_task("scheduler", &mut self.scheduler, Ok).await,
+            reap_task("journal watcher", &mut self.watcher, std::convert::identity).await,
+            reap_task("IPC listener", &mut self.listener, Ok).await,
+        ];
+        for result in stopped {
+            if let Err(error) = result {
+                tracing::error!(%error, "essential task also failed during shutdown");
+                if outcome.is_ok() {
+                    report(format!("stopped: {error:#}"));
+                    outcome = Err(error);
+                }
+            }
+        }
+        if outcome.is_ok() {
+            report("stopped: shutdown requested".into());
+        }
+        // Abort cannot preempt synchronous native calls or spawn_blocking.
+        // Existing blocking writers retain their own worker permit and file
+        // lease, and runtime destruction still waits for them. Do not detach
+        // that ownership or weaken the SCM's existing stop-grace policy here.
+        outcome
+    }
+}
+
+impl Drop for ServiceTasks {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+async fn wait_task<T>(task: &mut Option<JoinHandle<T>>) -> std::result::Result<T, JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
+fn unexpected_exit(
+    name: &str,
+    outcome: std::result::Result<Result<()>, JoinError>,
+) -> anyhow::Error {
+    match outcome {
+        Ok(Ok(())) => anyhow::anyhow!("essential {name} task returned unexpectedly"),
+        Ok(Err(error)) => error.context(format!("essential {name} task failed")),
+        Err(error) => anyhow::Error::new(error).context(format!("essential {name} task terminated")),
+    }
+}
+
+async fn reap_task<T>(
+    name: &str,
+    task: &mut Option<JoinHandle<T>>,
+    result: impl FnOnce(T) -> Result<()>,
+) -> Result<()> {
+    let Some(handle) = task.as_mut() else {
+        return Ok(());
+    };
+    let outcome = handle.await;
+    // Keep the handle in its abort-on-drop owner until the await completes,
+    // but never poll an already-completed handle twice.
+    let _ = task.take();
+    match outcome {
+        Err(error) if error.is_cancelled() => Ok(()),
+        outcome => Err(unexpected_exit(name, outcome.map(result))),
+    }
 }
 
 /// Make sure all configured data paths exist so worker processes don’t fail with ENOENT.
@@ -233,7 +354,340 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    struct TaskDrop(Arc<AtomicBool>);
+
+    impl Drop for TaskDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn guarded_task<T: Send + 'static>(finish: bool, outcome: T) -> (JoinHandle<T>, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        // Capture the guard before spawn: cancellation before the first poll
+        // must also destroy the owned state rather than detach it.
+        let guard = TaskDrop(Arc::clone(&dropped));
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            if !finish {
+                std::future::pending::<()>().await;
+            }
+            outcome
+        });
+        (task, dropped)
+    }
+
+    #[tokio::test]
+    async fn each_unexpected_success_stops_and_joins_the_other_essential_loops() {
+        for name in ["scheduler", "journal watcher", "IPC listener"] {
+            let (scheduler, scheduler_dropped) = guarded_task(name == "scheduler", ());
+            let (watcher, watcher_dropped) = guarded_task(name == "journal watcher", Ok(()));
+            let (listener, listener_dropped) = guarded_task(name == "IPC listener", ());
+            let tasks = ServiceTasks {
+                scheduler: Some(scheduler),
+                watcher: Some(watcher),
+                listener: Some(listener),
+            };
+            let (_shutdown, mut receiver) = mpsc::channel(1);
+            let mut states = Vec::new();
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                tasks.supervise(&mut receiver, |state| states.push(state)),
+            )
+            .await
+            .expect("a terminated essential task must not wait for a stop command")
+            .expect_err("an infinite service loop cannot successfully finish on its own");
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("returned unexpectedly"));
+            assert_eq!(states.len(), 1);
+            assert!(states[0].starts_with("stopped:"));
+            for dropped in [scheduler_dropped, watcher_dropped, listener_dropped] {
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "sibling state was not destroyed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_error_preserves_its_cause_and_cancels_scheduler_and_listener() {
+        let (scheduler, scheduler_dropped) = guarded_task(false, ());
+        let (listener, listener_dropped) = guarded_task(false, ());
+        let tasks = ServiceTasks {
+            scheduler: Some(scheduler),
+            watcher: Some(tokio::spawn(async {
+                Err(anyhow::anyhow!("fixture disk full").context("save journal checkpoint"))
+            })),
+            listener: Some(listener),
+        };
+        let (_shutdown, mut receiver) = mpsc::channel(1);
+        let mut states = Vec::new();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            tasks.supervise(&mut receiver, |state| states.push(state)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let message = format!("{error:#}");
+        for expected in [
+            "journal watcher",
+            "save journal checkpoint",
+            "fixture disk full",
+        ] {
+            assert!(message.contains(expected), "{message}");
+            assert!(states[0].contains(expected));
+        }
+        assert!(scheduler_dropped.load(Ordering::SeqCst));
+        assert!(listener_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unexpected_panic_and_external_cancellation_are_service_errors() {
+        for cancel in [false, true] {
+            let (watcher, watcher_dropped) = guarded_task(false, Ok(()));
+            let scheduler = if cancel {
+                let (task, _) = guarded_task(false, ());
+                task.abort();
+                task
+            } else {
+                tokio::spawn(async { panic!("fixture scheduler panic") })
+            };
+            let tasks = ServiceTasks {
+                scheduler: Some(scheduler),
+                watcher: Some(watcher),
+                listener: None,
+            };
+            let (_shutdown, mut receiver) = mpsc::channel(1);
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                tasks.supervise(&mut receiver, |_| {}),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("scheduler"));
+            assert!(message.contains(if cancel {
+                "cancel"
+            } else {
+                "fixture scheduler panic"
+            }));
+            assert!(watcher_dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_and_sender_loss_reap_tasks_with_optional_loops_absent() {
+        for explicit in [false, true] {
+            for native_loops in [false, true] {
+                let (scheduler, scheduler_dropped) = guarded_task(false, ());
+                let (watcher, watcher_dropped) = if native_loops {
+                    let (task, dropped) = guarded_task(false, Ok(()));
+                    (Some(task), Some(dropped))
+                } else {
+                    (None, None)
+                };
+                let (listener, listener_dropped) = if native_loops {
+                    let (task, dropped) = guarded_task(false, ());
+                    (Some(task), Some(dropped))
+                } else {
+                    (None, None)
+                };
+                let tasks = ServiceTasks {
+                    scheduler: Some(scheduler),
+                    watcher,
+                    listener,
+                };
+                let (shutdown, mut receiver) = mpsc::channel(1);
+                if explicit {
+                    shutdown.try_send(()).unwrap();
+                }
+                drop(shutdown);
+                let mut states = Vec::new();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tasks.supervise(&mut receiver, |state| states.push(state)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    states,
+                    ["stopping: shutdown requested", "stopped: shutdown requested"]
+                );
+                assert!(scheduler_dropped.load(Ordering::SeqCst));
+                for dropped in [watcher_dropped, listener_dropped].into_iter().flatten() {
+                    assert!(dropped.load(Ordering::SeqCst));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_failure_is_not_overwritten_by_simultaneous_shutdown() {
+        let (scheduler, scheduler_dropped) = guarded_task(false, ());
+        let watcher = tokio::spawn(async { anyhow::bail!("fixture fatal journal error") });
+        // Arrange readiness without consuming the JoinHandle result. The stop
+        // signal and the fatal result must both be ready in the production select.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !watcher.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let tasks = ServiceTasks {
+            scheduler: Some(scheduler),
+            watcher: Some(watcher),
+            listener: None,
+        };
+        let (shutdown, mut receiver) = mpsc::channel(1);
+        shutdown.try_send(()).unwrap();
+        let mut states = Vec::new();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            tasks.supervise(&mut receiver, |state| states.push(state)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture fatal journal error"));
+        assert_eq!(states.len(), 1);
+        assert!(states[0].contains("journal watcher"));
+        assert!(scheduler_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_supervisor_aborts_owned_tasks_without_acknowledging_work() -> Result<()> {
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Waker};
+        use tokio::sync::oneshot;
+
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("supervisor.lock");
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        lease.try_lock()?;
+        let contender = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let (acknowledgement, mut response) = oneshot::channel::<()>();
+        let scheduler = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            let _ = acknowledgement.send(());
+        });
+        let watcher = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(lease);
+            Ok(())
+        });
+        let tasks = ServiceTasks {
+            scheduler: Some(scheduler),
+            watcher: Some(watcher),
+            listener: None,
+        };
+        let (_shutdown, mut receiver) = mpsc::channel(1);
+        let mut supervisor = Box::pin(tasks.supervise(&mut receiver, |_| {}));
+        let mut context = TaskContext::from_waker(Waker::noop());
+        assert!(supervisor.as_mut().poll(&mut context).is_pending());
+        assert!(contender.try_lock().is_err());
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(supervisor);
+        // Dropping the supervisor requests cancellation even without a normal
+        // shutdown path. Await actual destruction, not a timer-based guess.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut response)
+                .await?
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if contender.try_lock().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_service_keeps_detached_blocking_writer_lease_until_writer_finishes() -> Result<()>
+    {
+        use tokio::sync::oneshot;
+
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("blocking-writer.lock");
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        lease.try_lock()?;
+        let contender = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let (release, released) = std::sync::mpsc::channel();
+        let (started, running) = oneshot::channel();
+        let (finished, completion) = oneshot::channel();
+        let writer = tokio::task::spawn_blocking(move || {
+            let owned_lease = lease;
+            let _ = started.send(());
+            // A failed assertion drops release, so the reader cannot strand a
+            // blocking thread. This is a real lock owner, not a worker ACK mock.
+            let result = released.recv_timeout(Duration::from_secs(5));
+            drop(owned_lease);
+            let _ = finished.send(result.is_ok());
+        });
+        tokio::time::timeout(Duration::from_secs(5), running).await??;
+        let (acknowledgement, response) = oneshot::channel();
+        let scheduler = tokio::spawn(async move {
+            let _ = writer.await;
+            let _ = acknowledgement.send(());
+        });
+        let tasks = ServiceTasks {
+            scheduler: Some(scheduler),
+            watcher: Some(tokio::spawn(async {
+                anyhow::bail!("fixture watcher stopped")
+            })),
+            listener: None,
+        };
+        let (_shutdown, mut receiver) = mpsc::channel(1);
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            tasks.supervise(&mut receiver, |_| {}),
+        )
+        .await?;
+        let still_locked = contender.try_lock().is_err();
+        let unacknowledged = tokio::time::timeout(Duration::from_secs(5), response)
+            .await?
+            .is_err();
+        release.send(())?;
+        let writer_released = tokio::time::timeout(Duration::from_secs(5), completion).await??;
+        assert!(format!("{:#}", failure.unwrap_err()).contains("fixture watcher stopped"));
+        assert!(
+            still_locked,
+            "aborting the async owner released a still-running writer's lease"
+        );
+        assert!(
+            unacknowledged,
+            "scheduler cancellation manufactured a commit ACK"
+        );
+        assert!(
+            writer_released,
+            "fixture writer timed out instead of receiving its release"
+        );
+        contender.try_lock()?;
+        Ok(())
+    }
 
     struct ChildGuard(Child);
 
