@@ -160,10 +160,11 @@ impl PipeClient {
                 response_kind == kind,
                 "unexpected IPC response kind {response_kind:?}; expected {kind:?}"
             );
+            let payload_len = payload.len();
             let mut cursor = std::io::Cursor::new(payload);
             let response = bincode::deserialize_from(&mut cursor)?;
             ensure!(
-                cursor.position() as usize == payload.len(),
+                cursor.position() as usize == payload_len,
                 "IPC response has trailing bytes"
             );
             Ok(response)

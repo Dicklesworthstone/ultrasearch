@@ -16,10 +16,10 @@ pub fn trim_working_set() {
 
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+        use windows::Win32::System::Memory::{HEAP_FLAGS, GetProcessHeap, HeapCompact};
         unsafe {
             if let Ok(heap) = GetProcessHeap() {
-                let _ = HeapCompact(heap, 0);
+                let _ = HeapCompact(heap, HEAP_FLAGS(0));
             }
         }
     }
