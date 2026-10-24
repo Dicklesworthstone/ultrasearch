@@ -1,57 +1,138 @@
-#![cfg(target_os = "windows")]
+#![cfg(any(target_os = "windows", test))]
 
+#[cfg(windows)]
 use std::env;
-use std::time::Instant;
+use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use crate::metrics::{global_metrics_snapshot, record_ipc_request};
+#[cfg(windows)]
 use crate::search_handler::search;
+#[cfg(windows)]
 use crate::status::make_status_response;
+#[cfg(windows)]
 use crate::status_provider::status_snapshot;
-use anyhow::Result;
+use anyhow::{Context, Result};
+#[cfg(windows)]
 use ipc::{
     MetricsSnapshot, ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse,
-    SearchRequest, StatusRequest, framing,
+    SearchRequest, StatusRequest,
 };
-#[cfg(test)]
-use ipc::{SearchResponse, StatusResponse};
+#[cfg(all(windows, test))]
+use ipc::StatusResponse;
+use ipc::{SearchResponse, framing};
+#[cfg(windows)]
 use std::io::Cursor;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeServer;
+use tokio::sync::Semaphore;
+#[cfg(windows)]
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[cfg(windows)]
 const DEFAULT_PIPE_NAME: &str = r#"\\.\pipe\ultrasearch"#;
-const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_MESSAGE_BYTES: usize = framing::MAX_FRAME;
+#[cfg(windows)]
+const MAX_CONNECTIONS: usize = 32;
+#[cfg(windows)]
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DISPATCH_TIME: Duration = Duration::from_secs(30);
 
-/// Start a Tokio named-pipe server that spawns a task per connection.
+// A cancelled connection or listener must not reset the computation budget
+// while detached blocking queries still run. Control requests have a separate
+// lane, so a saturated search executor cannot consume their dispatch permits.
+struct DispatchLanes {
+    search: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+
+impl Default for DispatchLanes {
+    fn default() -> Self {
+        Self {
+            search: Arc::new(Semaphore::new(4)),
+            control: Arc::new(Semaphore::new(2)),
+        }
+    }
+}
+
+impl DispatchLanes {
+    fn for_kind(&self, kind: framing::MessageKind) -> Arc<Semaphore> {
+        Arc::clone(if kind == framing::MessageKind::Search {
+            &self.search
+        } else {
+            &self.control
+        })
+    }
+}
+
+#[cfg(windows)]
+static DISPATCH_LANES: OnceLock<DispatchLanes> = OnceLock::new();
+#[cfg(windows)]
+static CONNECTION_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Bind the first pipe instance before reporting successful startup. Keep a
+/// replacement listener alive before handing a connected instance to a task.
+#[cfg(windows)]
 pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>> {
+    let slots =
+        Arc::clone(CONNECTION_SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONNECTIONS))));
+    start_pipe_server_with_slots(pipe_name, slots).await
+}
+
+#[cfg(windows)]
+async fn start_pipe_server_with_slots(
+    pipe_name: Option<&str>,
+    slots: Arc<Semaphore>,
+) -> Result<JoinHandle<()>> {
     let name = pipe_name.unwrap_or(DEFAULT_PIPE_NAME).to_string();
+    anyhow::ensure!(
+        !name.contains('\0'),
+        "named pipe name must not contain an embedded NUL"
+    );
+    // Binding inside the spawned task used to return Ok even when another
+    // service owned this name or the security descriptor could not be applied.
+    // The caller must see that failure before starting ingestion workers.
+    let mut server = unsafe { create_secure_pipe(&name, true) }
+        .with_context(|| format!("cannot bind UltraSearch named pipe {name}"))?;
 
     let handle = tokio::spawn(async move {
-        let mut first = true;
         loop {
-            // Use raw Win32 API to create pipe with Security Descriptor
-            // SDDL: D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)
-            // SY=System, BA=Admins, AU=Authenticated Users (Read/Write)
-            let server = match unsafe { create_secure_pipe(&name, first) } {
-                Ok(s) => s,
-                Err(e) => {
-                    // Likely another instance owns the pipe. Back off and retry, but escalate to warning after a few tries.
-                    tracing::warn!("named pipe create failed ({}); retrying in 1s", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
+            // One listener stays alive while saturated, but no extra handler,
+            // request allocation or blocking query is admitted without a slot.
+            let permit = match Arc::clone(&slots).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let connected = server.connect().await;
+            // Retain the current instance until its successor exists. Otherwise
+            // a short-lived client can close the last handle before the next
+            // listener is created, losing both availability and name ownership.
+            // https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/struct.NamedPipeServer.html
+            let next = loop {
+                match unsafe { create_secure_pipe(&name, false) } {
+                    Ok(next) => break next,
+                    Err(error) => {
+                        tracing::warn!(%error, "named pipe replacement failed; retaining current instance and retrying in 1s");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             };
-
-            first = false;
-
-            if let Err(e) = server.connect().await {
+            let accepted = std::mem::replace(&mut server, next);
+            if let Err(e) = connected {
                 tracing::error!("named pipe connect failed: {}", e);
+                drop(accepted);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(server).await {
+                let _connection_permit = permit;
+                if let Err(e) = handle_connection(accepted).await {
                     tracing::warn!("pipe connection error: {e:?}");
                 }
             });
@@ -61,6 +142,7 @@ pub async fn start_pipe_server(pipe_name: Option<&str>) -> Result<JoinHandle<()>
     Ok(handle)
 }
 
+#[cfg(windows)]
 unsafe fn create_secure_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -147,48 +229,157 @@ unsafe fn create_secure_pipe(name: &str, first: bool) -> Result<NamedPipeServer>
     Ok(server)
 }
 
+#[cfg(windows)]
 async fn handle_connection(mut conn: NamedPipeServer) -> Result<()> {
-    loop {
-        // decode frame
-        let mut len_prefix = [0u8; 4];
-        // If read returns 0, client disconnected (or EOF).
-        if conn.read_exact(&mut len_prefix).await.is_err() {
-            break;
-        }
-        let frame_len = u32::from_le_bytes(len_prefix) as usize;
-        if frame_len == 0 || frame_len > MAX_MESSAGE_BYTES {
-            tracing::warn!("invalid frame size {frame_len}");
-            break;
-        }
-        let mut buf = vec![0u8; frame_len];
-        conn.read_exact(&mut buf).await?;
-
+    while let Some(message) = read_request_frame(&mut conn, IO_TIMEOUT).await? {
         // Reject old identity layouts before deserializing a request or
         // publishing search hits that an old UI could misinterpret.
-        let (kind, payload) = framing::decode_message(&buf)?;
-        let response = if kind == framing::MessageKind::Search {
-            let payload_owned = payload.to_vec();
-            tokio::task::spawn_blocking(move || dispatch(kind, &payload_owned)).await?
+        let (kind, payload) = framing::decode_message(&message)?;
+        let search_request = if kind == framing::MessageKind::Search {
+            let request =
+                deserialize_exact::<SearchRequest>(payload).context("invalid search request")?;
+            Some((request.id, request.timeout))
         } else {
-            dispatch(kind, payload)
+            None
         };
-        anyhow::ensure!(!response.is_empty(), "invalid {kind:?} IPC payload");
-        let framed = framing::encode_frame(&framing::encode_message(kind, &response)?)?;
-        // framed includes length prefix.
-        conn.write_all(&framed).await?;
+        let budget = search_request
+            .and_then(|(_, timeout)| timeout)
+            .unwrap_or(MAX_DISPATCH_TIME)
+            .min(MAX_DISPATCH_TIME);
+        let started = Instant::now();
+        let lane = DISPATCH_LANES
+            .get_or_init(DispatchLanes::default)
+            .for_kind(kind);
+        // Search (and every other kind) runs on the blocking pool inside
+        // `run_bounded_dispatch`, so a slow query cannot stall the pipe task.
+        let result = run_bounded_dispatch(lane, budget, move || {
+            let (_, payload) = framing::decode_message(&message)?;
+            let response = dispatch(kind, payload);
+            anyhow::ensure!(!response.is_empty(), "invalid {kind:?} IPC payload");
+            Ok(response)
+        })
+        .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%error, ?kind, "IPC request could not complete");
+                let Some((id, _)) = search_request else {
+                    // Never manufacture a successful control acknowledgement.
+                    return Err(error);
+                };
+                unavailable_search(id, started.elapsed())?
+            }
+        };
+        write_response_frame(&mut conn, kind, &response, IO_TIMEOUT).await?;
     }
     Ok(())
 }
 
-fn dispatch(kind: framing::MessageKind, payload: &[u8]) -> Vec<u8> {
-    fn deserialize_exact<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Option<T> {
-        let mut cursor = Cursor::new(payload);
-        match bincode::deserialize_from::<_, T>(&mut cursor) {
-            Ok(v) if cursor.position() as usize == payload.len() => Some(v),
-            _ => None,
+/// Use one deadline for the entire header and body, not one per short read.
+/// Only EOF before any header byte is a clean disconnect. A partial frame is
+/// an error and must never be reused as the prefix of the next request.
+async fn read_request_frame<R: AsyncRead + Unpin>(
+    conn: &mut R,
+    budget: Duration,
+) -> Result<Option<Vec<u8>>> {
+    anyhow::ensure!(!budget.is_zero(), "IPC request frame deadline exceeded");
+    tokio::time::timeout(budget, async {
+        let mut prefix = [0; 4];
+        if conn.read(&mut prefix[..1]).await? == 0 {
+            return Ok(None);
         }
-    }
+        conn.read_exact(&mut prefix[1..])
+            .await
+            .context("incomplete IPC frame header")?;
+        let length = u32::from_le_bytes(prefix) as usize;
+        anyhow::ensure!(
+            length > 0 && length <= MAX_MESSAGE_BYTES,
+            "invalid IPC frame size {length}"
+        );
+        let mut message = vec![0; length];
+        conn.read_exact(&mut message)
+            .await
+            .context("incomplete IPC frame body")?;
+        Ok(Some(message))
+    })
+    .await
+    .context("IPC request frame deadline exceeded")?
+}
 
+async fn write_response_frame<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    kind: framing::MessageKind,
+    payload: &[u8],
+    budget: Duration,
+) -> Result<()> {
+    anyhow::ensure!(!budget.is_zero(), "IPC response write deadline exceeded");
+    let frame = framing::encode_frame(&framing::encode_message(kind, payload)?)?;
+    tokio::time::timeout(budget, conn.write_all(&frame))
+        .await
+        .context("IPC response write deadline exceeded")?
+        .context("cannot write IPC response")
+}
+
+/// Bound admission AND the response wait. A started blocking query cannot be
+/// killed by cancelling its JoinHandle. Its owned permit therefore lives in
+/// the closure, not in this async waiter, until the query actually finishes.
+/// https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html
+async fn run_bounded_dispatch<T, F>(lane: Arc<Semaphore>, budget: Duration, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    anyhow::ensure!(!budget.is_zero(), "IPC request processing deadline exceeded");
+    let started = Instant::now();
+    tokio::time::timeout(budget, async move {
+        let permit = lane
+            .acquire_owned()
+            .await
+            .context("IPC dispatch lane closed")?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            // The blocking pool may itself have been saturated. Do not start
+            // a queued computation whose response deadline has already passed.
+            anyhow::ensure!(
+                started.elapsed() < budget,
+                "IPC dispatch expired before execution"
+            );
+            let result = work();
+            anyhow::ensure!(
+                started.elapsed() < budget,
+                "IPC dispatch completed after its deadline"
+            );
+            result
+        })
+        .await
+        .context("IPC blocking dispatch failed")?
+    })
+    .await
+    .context("IPC request processing deadline exceeded")?
+}
+
+fn unavailable_search(id: Uuid, elapsed: Duration) -> Result<Vec<u8>> {
+    framing::serialize_search_response(&mut SearchResponse {
+        id,
+        hits: Vec::new(),
+        total: 0,
+        truncated: true,
+        took_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        served_by: Some("service-unavailable".into()),
+    })
+}
+
+#[cfg(windows)]
+fn deserialize_exact<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    let mut cursor = Cursor::new(payload);
+    match bincode::deserialize_from::<_, T>(&mut cursor) {
+        Ok(v) if cursor.position() as usize == payload.len() => Some(v),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn dispatch(kind: framing::MessageKind, payload: &[u8]) -> Vec<u8> {
     // Fast-path: ping echo when payload is prefixed with "PING" + UUID.
     if kind == framing::MessageKind::Ping
         && payload.len() == 20
@@ -311,15 +502,149 @@ fn dispatch(kind: framing::MessageKind, payload: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
+#[cfg(windows)]
 fn host_label() -> String {
     env::var("COMPUTERNAME")
         .or_else(|_| env::var("HOSTNAME"))
         .unwrap_or_else(|_| "service".into())
 }
 
-#[cfg(test)]
+#[cfg(all(windows, test))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_pipe_connection_backpressure_releases_after_disconnect() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = format!(r"\\.\pipe\ultrasearch-capacity-{}", Uuid::new_v4());
+        let listener = start_pipe_server_with_slots(Some(&name), Arc::new(Semaphore::new(1)))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let id = Uuid::new_v4();
+            let mut payload = b"PING".to_vec();
+            payload.extend_from_slice(id.as_bytes());
+            let kind = framing::MessageKind::Ping;
+            let mut first = ClientOptions::new().open(&name).unwrap();
+            write_response_frame(&mut first, kind, &payload, IO_TIMEOUT)
+                .await
+                .unwrap();
+            let first_reply = read_request_frame(&mut first, IO_TIMEOUT)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                framing::decode_message(&first_reply).unwrap().1,
+                id.as_bytes()
+            );
+
+            // The first connection retains its only slot while waiting for its
+            // next frame. A second kernel connection must not create a handler.
+            let mut second = ClientOptions::new().open(&name).unwrap();
+            write_response_frame(&mut second, kind, &payload, IO_TIMEOUT)
+                .await
+                .unwrap();
+            let blocked = read_request_frame(&mut second, Duration::from_millis(25)).await;
+            assert!(blocked.unwrap_err().to_string().contains("deadline"));
+            drop(first);
+            let response = read_request_frame(&mut second, IO_TIMEOUT)
+                .await
+                .unwrap()
+                .unwrap();
+            let (response_kind, response_payload) = framing::decode_message(&response).unwrap();
+            assert_eq!(response_kind, kind);
+            assert_eq!(response_payload, id.as_bytes());
+        })
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        result.expect("native connection capacity did not recover after disconnect");
+    }
+
+    #[tokio::test]
+    async fn native_pipe_zero_budget_search_is_explicitly_unavailable() {
+        let name = format!(r"\\.\pipe\ultrasearch-deadline-{}", Uuid::new_v4());
+        let listener = start_pipe_server(Some(&name)).await.unwrap();
+        let client = ipc::client::PipeClient::new(name)
+            .with_retries(0)
+            .with_request_timeout(Duration::from_secs(2));
+        let result = client
+            .search(SearchRequest {
+                id: Uuid::new_v4(),
+                timeout: Some(Duration::ZERO),
+                ..SearchRequest::default()
+            })
+            .await;
+        listener.abort();
+        let _ = listener.await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not complete this search")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_pipe_startup_rejects_duplicate_and_invalid_names() {
+        let name = format!(r"\\.\pipe\ultrasearch-bind-{}", Uuid::new_v4());
+        let listener = start_pipe_server(Some(&name)).await.unwrap();
+        let duplicate = start_pipe_server(Some(&name)).await;
+        assert!(
+            duplicate.is_err(),
+            "startup must not acknowledge a failed bind"
+        );
+        assert!(start_pipe_server(Some("not-a-pipe-name")).await.is_err());
+        assert!(
+            start_pipe_server(Some(&format!("{name}\0suffix")))
+                .await
+                .is_err()
+        );
+        listener.abort();
+        assert!(listener.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn native_pipe_keeps_name_ownership_across_short_lived_clients() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = format!(r"\\.\pipe\ultrasearch-churn-{}", Uuid::new_v4());
+        let listener = start_pipe_server(Some(&name)).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..32 {
+                let mut client = ClientOptions::new().open(&name).unwrap();
+                let id = Uuid::new_v4();
+                let mut payload = b"PING".to_vec();
+                payload.extend_from_slice(id.as_bytes());
+                let message =
+                    framing::encode_message(framing::MessageKind::Ping, &payload).unwrap();
+                client
+                    .write_all(&framing::encode_frame(&message).unwrap())
+                    .await
+                    .unwrap();
+                let mut prefix = [0; 4];
+                client.read_exact(&mut prefix).await.unwrap();
+                let length = u32::from_le_bytes(prefix) as usize;
+                assert!(length > 0 && length <= MAX_MESSAGE_BYTES);
+                let mut response = vec![0; length];
+                client.read_exact(&mut response).await.unwrap();
+                let (kind, payload) = framing::decode_message(&response).unwrap();
+                assert_eq!(kind, framing::MessageKind::Ping);
+                assert_eq!(payload, id.as_bytes());
+                drop(client);
+                tokio::task::yield_now().await;
+                assert!(
+                    unsafe { create_secure_pipe(&name, true) }.is_err(),
+                    "a replacement listener must retain exclusive name ownership"
+                );
+            }
+        })
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        result.expect("native named-pipe churn exceeded its deadline");
+    }
 
     #[tokio::test]
     async fn echoes_uuid_prefix() {
@@ -387,5 +712,265 @@ mod tests {
                 .unwrap()
                 .contains("Reconciliation requested")
         );
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn bounded_transport_roundtrips_short_reads_and_clean_eof() {
+        let (mut writer, mut reader) = tokio::io::duplex(3);
+        let payload = b"PING0123456789abcdef";
+        let (sent, received) = tokio::join!(
+            write_response_frame(
+                &mut writer,
+                framing::MessageKind::Ping,
+                payload,
+                MAX_DISPATCH_TIME,
+            ),
+            read_request_frame(&mut reader, MAX_DISPATCH_TIME),
+        );
+        sent.unwrap();
+        let message = received.unwrap().unwrap();
+        let (kind, decoded) = framing::decode_message(&message).unwrap();
+        assert_eq!(kind, framing::MessageKind::Ping);
+        assert_eq!(decoded, payload);
+        writer.shutdown().await.unwrap();
+        assert!(
+            read_request_frame(&mut reader, MAX_DISPATCH_TIME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_lengths_and_partial_eof_are_not_clean_disconnects() {
+        for length in [0, (MAX_MESSAGE_BYTES + 1) as u32, u32::MAX] {
+            let prefix = length.to_le_bytes();
+            let mut reader = prefix.as_slice();
+            let error = read_request_frame(&mut reader, MAX_DISPATCH_TIME)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid IPC frame size"));
+        }
+        for bytes in [vec![1], vec![1, 0, 0], vec![3, 0, 0, 0, 1, 2]] {
+            let mut reader = bytes.as_slice();
+            let error = read_request_frame(&mut reader, MAX_DISPATCH_TIME)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("incomplete IPC frame"));
+        }
+        let bytes = [1, 0, 0, 0, 7];
+        let mut reader = bytes.as_slice();
+        assert!(read_request_frame(&mut reader, Duration::ZERO).await.is_err());
+        assert_eq!(reader, bytes.as_slice(), "zero budget must not consume a partial frame");
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_bodies_and_response_consumers_hit_the_deadline() {
+        for prefix in [vec![1], vec![4, 0, 0, 0, 1]] {
+            let (mut peer, mut reader) = tokio::io::duplex(8);
+            peer.write_all(&prefix).await.unwrap();
+            // Keep the peer open: these reads can finish only by timing out,
+            // not by turning a partial request into a clean disconnection.
+            let error = read_request_frame(&mut reader, Duration::from_millis(10))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("deadline"));
+            drop(peer);
+        }
+        let (mut writer, peer) = tokio::io::duplex(1);
+        let error = write_response_frame(
+            &mut writer,
+            framing::MessageKind::Ping,
+            b"reply",
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_never_starts_work_or_leaks_a_waiter() {
+        for (capacity, budget) in [(0, Duration::from_millis(10)), (1, Duration::ZERO)] {
+            let lane = Arc::new(Semaphore::new(capacity));
+            let called = Arc::new(AtomicBool::new(false));
+            let marker = Arc::clone(&called);
+            let result = run_bounded_dispatch(Arc::clone(&lane), budget, move || {
+                marker.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+            assert!(result.is_err());
+            assert!(!called.load(Ordering::SeqCst));
+            lane.add_permits(1);
+            assert_eq!(lane.available_permits(), capacity + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_retains_capacity_until_the_blocking_owner_finishes() {
+        let lane = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn(run_bounded_dispatch(
+            Arc::clone(&lane),
+            MAX_DISPATCH_TIME,
+            move || {
+                let _ = started_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5))?;
+                Ok(())
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // This also proves blocking work did not occupy the current-thread
+        // async reactor: it must run here before release_rx is signalled.
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(Arc::clone(&lane).try_acquire_owned().is_err());
+        let called = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&called);
+        let second = tokio::spawn(run_bounded_dispatch(
+            Arc::clone(&lane),
+            MAX_DISPATCH_TIME,
+            move || {
+                marker.store(true, Ordering::SeqCst);
+                Ok(42)
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!called.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            42
+        );
+        assert_eq!(lane.available_permits(), 1);
+    }
+
+    #[test]
+    fn expired_work_queued_in_the_blocking_pool_is_not_executed_late() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            tokio::time::timeout(Duration::from_secs(2), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let lane = Arc::new(Semaphore::new(1));
+            let called = Arc::new(AtomicBool::new(false));
+            let marker = Arc::clone(&called);
+            let result = run_bounded_dispatch(
+                Arc::clone(&lane),
+                Duration::from_millis(10),
+                move || {
+                    marker.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(!called.load(Ordering::SeqCst));
+            assert!(Arc::clone(&lane).try_acquire_owned().is_err());
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let permit = tokio::time::timeout(
+                Duration::from_secs(2),
+                Arc::clone(&lane).acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "an expired queued query ran after its caller left"
+            );
+            drop(permit);
+        });
+    }
+
+    #[tokio::test]
+    async fn saturated_search_lane_does_not_consume_control_capacity() {
+        let lanes = DispatchLanes::default();
+        let search_lane = lanes.for_kind(framing::MessageKind::Search);
+        let held = Arc::clone(&search_lane)
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        for kind in [
+            framing::MessageKind::Ping,
+            framing::MessageKind::Status,
+            framing::MessageKind::Rescan,
+            framing::MessageKind::ReloadConfig,
+        ] {
+            let result = run_bounded_dispatch(lanes.for_kind(kind), MAX_DISPATCH_TIME, || Ok(7))
+                .await
+                .unwrap();
+            assert_eq!(result, 7);
+            assert_eq!(search_lane.available_permits(), 0);
+        }
+        drop(held);
+        let failed = run_bounded_dispatch::<(), _>(
+            Arc::clone(&search_lane),
+            MAX_DISPATCH_TIME,
+            || anyhow::bail!("simulated query failure"),
+        )
+        .await;
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .contains("simulated query failure")
+        );
+        assert_eq!(search_lane.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn timed_out_search_response_is_a_bounded_explicit_failure_on_the_wire() {
+        let id = Uuid::new_v4();
+        let payload = unavailable_search(id, Duration::from_millis(23)).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let (sent, received) = tokio::join!(
+            write_response_frame(
+                &mut writer,
+                framing::MessageKind::Search,
+                &payload,
+                MAX_DISPATCH_TIME,
+            ),
+            read_request_frame(&mut reader, MAX_DISPATCH_TIME),
+        );
+        sent.unwrap();
+        let message = received.unwrap().unwrap();
+        assert!(message.len() <= MAX_MESSAGE_BYTES);
+        let (kind, payload) = framing::decode_message(&message).unwrap();
+        assert_eq!(kind, framing::MessageKind::Search);
+        let response: SearchResponse = bincode::deserialize(payload).unwrap();
+        assert_eq!(response.id, id);
+        assert_eq!(response.took_ms, 23);
+        assert!(response.hits.is_empty());
+        assert!(response.truncated);
+        assert!(response.validate_for(id).is_err());
     }
 }

@@ -1194,6 +1194,7 @@ dependencies = [
  "dotenvy",
  "indicatif",
  "ipc",
+ "ntfs-watcher",
  "serde",
  "serde_json",
  "tokio",
@@ -6502,6 +6503,8 @@ dependencies = [
  "anyhow",
  "core-types",
  "hnsw_rs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8010,6 +8013,7 @@ dependencies = [
  "once_cell",
  "pulldown-cmark",
  "serde",
+ "serde_json",
  "sysinfo 0.37.2",
  "tokio",
  "toml 0.9.8",

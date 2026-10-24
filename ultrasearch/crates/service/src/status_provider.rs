@@ -77,6 +77,13 @@ pub fn update_status_ingestion_state(state: impl Into<String>) {
     }
 }
 
+/// Historical diagnostic context, separate from authoritative ingestion health.
+pub(crate) fn update_status_worker_problem(summary: &str) {
+    if let Some(provider) = BASIC_PROVIDER.get() {
+        provider.update_worker_problem(summary);
+    }
+}
+
 pub fn update_status_metrics(metrics: Option<MetricsSnapshot>) {
     if let Some(p) = BASIC_PROVIDER.get() {
         p.update_metrics(metrics);
@@ -129,6 +136,7 @@ pub struct BasicStatusProvider {
     state: RwLock<StatusSnapshot>,
     avg_content_job_bytes: RwLock<Option<u64>>,
     ingestion_state: RwLock<String>,
+    worker_problem: RwLock<Option<String>>,
 }
 
 impl BasicStatusProvider {
@@ -146,12 +154,19 @@ impl BasicStatusProvider {
             }),
             avg_content_job_bytes: RwLock::new(None),
             ingestion_state: RwLock::new("initializing".into()),
+            worker_problem: RwLock::new(None),
         }
     }
 
     pub fn update_volumes(&self, volumes: Vec<VolumeStatus>) {
         if let Ok(mut guard) = self.state.write() {
             guard.volumes = volumes;
+        }
+    }
+
+    fn update_worker_problem(&self, summary: &str) {
+        if let Ok(mut guard) = self.worker_problem.write() {
+            *guard = Some(summary.chars().take(512).collect());
         }
     }
 
@@ -284,6 +299,12 @@ impl StatusProvider for BasicStatusProvider {
             .map(|value| value.clone())
             .unwrap_or_else(|_| "unavailable: ingestion status lock poisoned".into());
         snapshot.scheduler_state = format!("{}; ingestion={ingestion}", snapshot.scheduler_state);
+        if let Ok(guard) = self.worker_problem.read()
+            && let Some(summary) = guard.as_ref()
+        {
+            snapshot.scheduler_state.push_str("; last_worker_problem(historical)=");
+            snapshot.scheduler_state.push_str(summary);
+        }
         snapshot
     }
 }
@@ -291,6 +312,33 @@ impl StatusProvider for BasicStatusProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_evidence_survives_heartbeats_without_replacing_current_health() {
+        let provider = BasicStatusProvider::new();
+        provider.update_worker_problem("batch=123 key=7:42 report_saved=true");
+        provider.update_scheduler_state("idle");
+        *provider.ingestion_state.write().unwrap() = "degraded: 1 files deferred".into();
+        let pending = provider.snapshot();
+        assert!(pending.scheduler_state.contains("ingestion=degraded: 1 files deferred"));
+        assert!(pending.scheduler_state.contains("key=7:42"));
+        *provider.ingestion_state.write().unwrap() =
+            "watching; last bounded journal read succeeded".into();
+        for _ in 0..2 {
+            let recovered = provider.snapshot();
+            assert!(recovered.scheduler_state.contains("ingestion=watching"));
+            assert!(!recovered.scheduler_state.contains("degraded"));
+            assert_eq!(
+                recovered.scheduler_state.matches("last_worker_problem(historical)").count(),
+                1
+            );
+        }
+        provider.update_worker_problem(&"📄".repeat(4096));
+        assert_eq!(
+            provider.worker_problem.read().unwrap().as_ref().unwrap().chars().count(),
+            512
+        );
+    }
 
     #[test]
     fn queue_state_updates_metrics_fields() {
