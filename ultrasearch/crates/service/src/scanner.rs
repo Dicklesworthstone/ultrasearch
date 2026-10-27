@@ -3,7 +3,10 @@
 mod state;
 mod stats;
 
-use crate::scheduler_runtime::{content_admission_available, submit_index_batch};
+use crate::scheduler_runtime::{
+    ContentAdmissionDeferred, content_admission_available, content_job_from_meta,
+    submit_index_batch, submit_optional_index_batch,
+};
 use crate::status_provider::{
     update_status_ingestion_state, update_status_last_commit, update_status_volumes,
 };
@@ -17,8 +20,8 @@ use ntfs_watcher::{
 };
 use state::{
     BATCH_LIMIT, ContentPolicy, DeferredFile, DirectoryRepairCheckpoint, MAX_DEFERRED_FILES,
-    MetadataChange, PendingBatch, StateStore, event_changes, pending_for_volume,
-    validate_deferred_outcome,
+    MetadataChange, PendingBatch, StateStore, event_changes, pending_for_metadata,
+    pending_for_volume, validate_deferred_outcome,
 };
 use stats::IndexStatistics;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -34,6 +37,25 @@ const MUTATION_BATCH_LIMIT: usize = 128;
 type MftPages = Box<dyn Iterator<Item = std::result::Result<Vec<FileMeta>, NtfsError>> + Send>;
 type MftScans = BTreeMap<VolumeId, MftProgress<MftPages>>;
 type DirectoryRepairs = BTreeMap<VolumeId, DirectoryProgress>;
+type EnrichmentScans = BTreeMap<VolumeId, EnrichmentProgress>;
+
+/// A frozen, bounded metadata reader. Missing eligible content is the durable
+/// obligation; losing this volatile cursor only repeats reads, never loses work.
+struct EnrichmentProgress {
+    scan: Option<meta_index::PathScan>,
+    page: Option<Vec<FileMeta>>,
+    next_scan: Instant,
+}
+
+impl Default for EnrichmentProgress {
+    fn default() -> Self {
+        Self {
+            scan: None,
+            page: None,
+            next_scan: Instant::now(),
+        }
+    }
+}
 
 /// A frozen metadata snapshot and at most one unadmitted mutation page. Old
 /// prefixes are durable; the readers are recreated after restart without ever
@@ -206,6 +228,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
     let mut statistics = IndexStatistics::new(Path::new(&cfg.paths.meta_index))?;
     let mut scans = MftScans::new();
     let mut repairs = DirectoryRepairs::new();
+    let mut enrichment = EnrichmentScans::new();
     let mut work_remaining = true;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -224,6 +247,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         if requested != generation {
             scans.clear();
             repairs.clear();
+            enrichment.clear();
             for volume in &mut store.state.volumes {
                 volume.needs_scan = true;
                 volume.catching_up = true;
@@ -241,6 +265,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             Err(error) => {
                 scans.clear();
                 repairs.clear();
+                enrichment.clear();
                 for volume in &store.state.volumes {
                     hide_volume(volume.id);
                 }
@@ -257,11 +282,13 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             if refresh_content_policy(store, volume, &cfg)? {
                 scans.remove(&volume.id);
                 repairs.remove(&volume.id);
+                enrichment.remove(&volume.id);
             }
         }
         let selected: BTreeSet<_> = volumes.iter().map(|v| v.id).collect();
         scans.retain(|id, _| selected.contains(id));
         repairs.retain(|id, _| selected.contains(id));
+        enrichment.retain(|id, _| selected.contains(id));
         for volume in &store.state.volumes {
             if !selected.contains(&volume.id) {
                 hide_volume(volume.id);
@@ -332,28 +359,19 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             .collect();
         let mut retry_volumes = Vec::new();
         for volume in &volumes {
-            if store.volume(volume.id)?.needs_scan
-                && !scans.contains_key(&volume.id)
-                && store
-                    .state
-                    .deferred
-                    .len()
-                    .saturating_add(MUTATION_BATCH_LIMIT)
-                    > MAX_DEFERRED_FILES
-                && ContentPolicy::for_volume(volume, &cfg).enabled
-            {
-                // Preserve incomplete-baseline obligations while capacity is
-                // exhausted; restarting/resetting the MFT here would discard
-                // their backoff and repeat the same failed baseline forever.
-                failures.push(format!(
-                    "volume {} reconciliation waiting for deferred extraction capacity",
-                    volume.id
-                ));
-                continue;
-            }
+            let before = store.state.completed_batch;
             match process_volume(store, volume, &cfg, &mut scans, &mut repairs).await {
                 Ok(progress) => {
                     work_remaining |= progress.work_remaining;
+                    if before != store.state.completed_batch
+                        && let Some(progress) = enrichment.get_mut(&volume.id)
+                        && progress.scan.is_none()
+                    {
+                        // New metadata should not wait for a completed sweep's
+                        // idle cooldown. An active frozen scan remains bounded;
+                        // candidates are revalidated against current metadata.
+                        progress.next_scan = Instant::now();
+                    }
                     if progress.journal_read {
                         retry_volumes.push(volume.clone());
                     }
@@ -397,6 +415,62 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
                 tracing::error!(%error, "retry batch remains durable; no journal cursor consumed");
             }
         }
+        // Finish filename baselines and journal backlogs before optional text.
+        // Each volume receives at most one bounded enrichment page per turn.
+        if failures.is_empty()
+            && !work_remaining
+            && store.state.pending.is_none()
+            && content_admission_available()
+        {
+            for volume in &retry_volumes {
+                let checkpoint = store.volume(volume.id)?;
+                if checkpoint.needs_scan
+                    || checkpoint.catching_up
+                    || !ContentPolicy::for_volume(volume, &cfg).enabled
+                {
+                    continue;
+                }
+                if store
+                    .state
+                    .deferred
+                    .len()
+                    .saturating_add(MUTATION_BATCH_LIMIT)
+                    > MAX_DEFERRED_FILES
+                {
+                    break;
+                }
+                let progress = enrichment.entry(volume.id).or_default();
+                let result = match reader_config(&cfg, &store.state.retired_indices) {
+                    Ok(reader) => {
+                        enrich_content_turn(
+                            store,
+                            volume,
+                            &cfg,
+                            &reader.exclude_paths,
+                            progress,
+                            commit_pending,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(more) => work_remaining |= more,
+                    Err(error) => {
+                        failures.push(format!(
+                            "optional content enrichment for volume {}: {error:#}",
+                            volume.id
+                        ));
+                        // Pending keys remain masked until a real commit. A
+                        // content problem does not invalidate unrelated names.
+                        break;
+                    }
+                }
+                if !content_admission_available() {
+                    break;
+                }
+            }
+        }
         let deferred = store
             .state
             .deferred
@@ -404,6 +478,12 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             .filter(|retry| selected.contains(&retry.meta.key.volume()))
             .count();
         if failures.is_empty() {
+            let baselines = store
+                .state
+                .volumes
+                .iter()
+                .filter(|v| selected.contains(&v.id) && v.needs_scan)
+                .count();
             let pending = store
                 .state
                 .volumes
@@ -418,10 +498,14 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
                         "reads continuing"
                     }
                 )
+            } else if baselines > 0 {
+                format!(
+                    "initial indexing: {baselines} filename baselines incomplete; scanning and journal catch-up continue independently of content extraction"
+                )
             } else if pending {
                 "catching up with journal".into()
             } else {
-                "watching; last bounded journal read succeeded".into()
+                "watching; filenames current after bounded journal read; optional content enrichment follows scheduler policy".into()
             });
         } else {
             update_status_ingestion_state(format!("degraded: {}", failures.join("; ")));
@@ -1116,7 +1200,7 @@ where
         repair.page = None;
         return Ok(false);
     }
-    store.begin(pending_for_volume(
+    store.begin(pending_for_metadata(
         volume,
         page.clone(),
         repair.final_page.then_some(repair.checkpoint.through),
@@ -1163,7 +1247,7 @@ where
         let count = changes.chunks(MUTATION_BATCH_LIMIT).len();
         for (number, chunk) in changes.chunks(MUTATION_BATCH_LIMIT).enumerate() {
             let checkpoint = (number + 1 == count).then_some(next);
-            let pending = pending_for_volume(volume, chunk.to_vec(), checkpoint, false, cfg);
+            let pending = pending_for_metadata(volume, chunk.to_vec(), checkpoint, false, cfg);
             let reconciles = pending.worker.jobs.iter().any(|job| {
                 job.operation == crate::dispatcher::job_dispatch::JobOperation::Reconcile
             });
@@ -1265,7 +1349,7 @@ where
     // Reset through the worker lane as well, so old extraction jobs cannot
     // resurrect files after deletion. A crash restarts this complete scan.
     if !scan.reset_admitted {
-        store.begin(pending_for_volume(volume, Vec::new(), None, true, cfg))?;
+        store.begin(pending_for_metadata(volume, Vec::new(), None, true, cfg))?;
         scan.reset_admitted = true;
         commit(store, cfg).await?;
         return Ok(false);
@@ -1313,7 +1397,7 @@ where
         return Ok(false);
     }
     let changes = metas.iter().cloned().map(MetadataChange::Upsert).collect();
-    store.begin(pending_for_volume(volume, changes, None, false, cfg))?;
+    store.begin(pending_for_metadata(volume, changes, None, false, cfg))?;
     // From here the global intent owns these records, including on cancellation.
     // A later volume turn is forbidden until that intent has been completed.
     scan.page = None;
@@ -1335,8 +1419,9 @@ fn resolve_events(
     let meta_reader = meta_index::open_reader(&meta)?;
     let content = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
     let content_reader = content_index::open_reader(&content)?;
-    // A deferred file has already been removed from both indices. Its delete
-    // or exclusion event must still cancel the durable retry; searching only
+    // Deferred files retain filename metadata (older checkpoints may lack it).
+    // Their identities still participate in deletion and exclusion events,
+    // which must cancel the durable retry; searching only
     // the live indices would incorrectly discard that event as an unknown key.
     let mut known: std::collections::BTreeMap<_, _> = deferred
         .iter()
@@ -1498,32 +1583,200 @@ fn adopt_runtime_config(active: &AppConfig, mut candidate: AppConfig) -> AppConf
     candidate
 }
 
-async fn commit_pending(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
-    // A previous save may have failed after changing the in-memory intent.
-    // Re-establish durability on every attempt before any index mutation.
-    store.save()?;
-    let batch = store
+fn enrichment_candidates(
+    store: &StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    excluded: &[String],
+    observed: &[FileMeta],
+) -> Result<Vec<MetadataChange>> {
+    if !ContentPolicy::for_volume(volume, cfg).enabled {
+        return Ok(Vec::new());
+    }
+    let metadata = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+    let content = content_index::open_or_create(Path::new(&cfg.paths.content_index))?;
+    let reader = content_index::open_reader(&content)?;
+    let deferred: BTreeSet<_> = store
         .state
-        .pending
-        .clone()
-        .context("no pending ingestion batch")?;
-    hide_pending(&batch);
-    update_status_ingestion_state(format!(
-        "volume {} waiting for admitted worker commit",
-        batch.volume
-    ));
-    // Awaiting admission supplies backpressure. It does not advance any cursor.
-    submit_index_batch(batch.worker.clone(), Some(store.mutation_lease())).await?;
-    let apply_cfg = cfg.clone();
-    let apply_batch = batch.clone();
-    run_index_mutation(store.mutation_lease(), move || {
-        apply_metadata(&apply_cfg, &apply_batch)
-    })
-    .await?;
-    store.finish()?;
-    show_pending(&batch);
-    update_status_last_commit(Some(unix_timestamp_secs()));
-    Ok(())
+        .deferred
+        .iter()
+        .map(|retry| retry.meta.key)
+        .collect();
+    let mut changes = Vec::new();
+    for old in observed {
+        if deferred.contains(&old.key)
+            || content_job_from_meta(old, &cfg.extract).is_none()
+            || old
+                .path
+                .as_ref()
+                .is_some_and(|path| path_selected(path, excluded))
+        {
+            continue;
+        }
+        let Some(current) = meta_index::file_meta(&metadata, old.key)? else {
+            continue;
+        };
+        // A frozen reader can outlive a rename/deletion or newer journal edit.
+        // Never let its old pathname tombstone a newer committed observation.
+        if same_snapshot(old, &current)
+            && content_index::read_file_meta(&content, &reader, old.key)?.is_none()
+        {
+            changes.push(MetadataChange::Upsert(current));
+        }
+    }
+    Ok(changes)
+}
+
+async fn enrich_content_turn<C>(
+    store: &mut StateStore,
+    volume: &VolumeInfo,
+    cfg: &AppConfig,
+    excluded: &[String],
+    progress: &mut EnrichmentProgress,
+    mut commit: C,
+) -> Result<bool>
+where
+    C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()>,
+{
+    ensure!(
+        store.state.pending.is_none(),
+        "pending work precedes content enrichment"
+    );
+    if progress.scan.is_none() {
+        if Instant::now() < progress.next_scan {
+            return Ok(false);
+        }
+        let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+        progress.scan = Some(meta_index::PathScan::new(
+            &index,
+            volume.id,
+            std::slice::from_ref(&volume.guid_path),
+        )?);
+    }
+    if progress.page.is_none() {
+        let mut scan = progress.scan.take().context("content scan was cancelled")?;
+        let (returned, page) = tokio::task::spawn_blocking(move || {
+            let page = scan.next_batch(MUTATION_BATCH_LIMIT);
+            (scan, page)
+        })
+        .await?;
+        progress.scan = Some(returned);
+        match page {
+            Ok(Some(page)) => progress.page = Some(page),
+            Ok(None) => {
+                progress.scan = None;
+                // EOF describes only this snapshot. New records and skipped
+                // stale candidates remain durable in metadata for the next pass.
+                progress.next_scan = Instant::now() + Duration::from_secs(30);
+                return Ok(false);
+            }
+            Err(error) => {
+                // PathScan permanently invalidates its cursor after a failed
+                // read. Keep the durable missing-content debt, but retry from
+                // a fresh snapshot after a bounded cooldown instead of trapping
+                // this volume on the same failed volatile reader forever.
+                progress.scan = None;
+                progress.page = None;
+                progress.next_scan = Instant::now() + Duration::from_secs(30);
+                return Err(error);
+            }
+        }
+    }
+    let changes = enrichment_candidates(
+        store,
+        volume,
+        cfg,
+        excluded,
+        progress.page.as_ref().unwrap(),
+    )?;
+    if changes.is_empty() {
+        progress.page = None;
+        return Ok(true);
+    }
+    store.begin(pending_for_volume(volume, changes, None, false, cfg))?;
+    // A capacity rejection retains the page. Once admitted, durable pending
+    // intent owns it even if this volatile reader is lost.
+    progress.page = None;
+    commit(store, cfg).await?;
+    Ok(true)
+}
+
+async fn dispatch_pending_batch(
+    _cfg: &AppConfig,
+    batch: &PendingBatch,
+    lease: std::sync::Arc<std::fs::File>,
+) -> Result<()> {
+    if batch.content_optional {
+        submit_optional_index_batch(batch.worker.clone(), Some(lease)).await
+    } else {
+        submit_index_batch(batch.worker.clone(), Some(lease)).await
+    }
+}
+
+async fn commit_pending(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
+    commit_pending_with_dispatch(store, cfg, dispatch_pending_batch).await
+}
+
+async fn commit_pending_with_dispatch<D>(
+    store: &mut StateStore,
+    cfg: &AppConfig,
+    mut dispatch: D,
+) -> Result<()>
+where
+    D: AsyncFnMut(&AppConfig, &PendingBatch, std::sync::Arc<std::fs::File>) -> Result<()>,
+{
+    loop {
+        store.save()?;
+        let batch = store
+            .state
+            .pending
+            .clone()
+            .context("no pending ingestion batch")?;
+        hide_pending(&batch);
+        let initial = store.volume(batch.volume)?.needs_scan;
+        update_status_ingestion_state(format!(
+            "{}volume {} waiting for {} commit ({} files)",
+            if initial { "initial indexing: " } else { "" },
+            batch.volume,
+            if batch.content_optional {
+                "optional content"
+            } else {
+                "filename metadata"
+            },
+            batch.metadata.len(),
+        ));
+        let content = tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+        let before =
+            content_index::batch_outcome(&content)?.map(|outcome| outcome.receipt.commit_id);
+        match dispatch(cfg, &batch, store.mutation_lease()).await {
+            Err(error) if error.is::<ContentAdmissionDeferred>() && batch.content_optional => {
+                // Explicitly NOT a commit ACK. The scheduler started no worker.
+                // Persist tombstones, then obtain both actual index receipts.
+                store.defer_pending_content(batch.worker.id)?;
+                continue;
+            }
+            result => result?,
+        }
+        let outcome =
+            content_index::batch_outcome(&tantivy::Index::open_in_dir(&cfg.paths.content_index)?)?
+                .context("worker returned without a content receipt")?;
+        ensure!(
+            outcome.receipt.complete
+                && outcome.receipt.batch_id == batch.worker.id
+                && Some(outcome.receipt.commit_id) != before,
+            "worker returned without a fresh complete receipt for the pending transaction"
+        );
+        let apply_cfg = cfg.clone();
+        let apply_batch = batch.clone();
+        run_index_mutation(store.mutation_lease(), move || {
+            apply_metadata(&apply_cfg, &apply_batch)
+        })
+        .await?;
+        store.finish()?;
+        show_pending(&batch);
+        update_status_last_commit(Some(unix_timestamp_secs()));
+        return Ok(());
+    }
 }
 
 async fn run_index_mutation<T, F>(lease: std::sync::Arc<std::fs::File>, mutation: F) -> Result<T>
@@ -1552,6 +1805,15 @@ fn apply_metadata(cfg: &AppConfig, batch: &PendingBatch) -> Result<()> {
     );
     validate_deferred_outcome(batch, &outcome.deferred)?;
     let content_reader = content_index::open_reader(&content)?;
+    for job in &batch.worker.jobs {
+        if job.operation == crate::dispatcher::job_dispatch::JobOperation::Delete {
+            let key = DocKey::from_parts(job.volume_id, job.file_id);
+            ensure!(
+                content_index::read_file_meta(&content, &content_reader, key)?.is_none(),
+                "metadata-only worker retained stale content for {key}"
+            );
+        }
+    }
     let mut writer = meta_index::create_writer(
         &index,
         &meta_index::WriterConfig {
@@ -1572,7 +1834,10 @@ fn apply_metadata(cfg: &AppConfig, batch: &PendingBatch) -> Result<()> {
                         "deferred content outcome retained a stale document: {}",
                         meta.key
                     );
-                    meta_index::delete_doc(&mut writer, &index.fields, meta.key);
+                    // Extraction is optional. Native metadata plus journal
+                    // validation still establish filename coverage even when
+                    // content is inaccessible; retain the actual retry debt.
+                    meta_index::add_file_meta_batch(&mut writer, &index.fields, [meta.clone()])?;
                     continue;
                 }
                 let operation = batch
@@ -2070,9 +2335,13 @@ mod tests {
             let hits = search_directory_path(&handler, "newroot", mode).hits;
             let keys: BTreeSet<_> = hits.iter().map(|hit| hit.key).collect();
             assert_eq!(keys.len(), hits.len());
-            assert!(keys.contains(&retry_key));
-            assert!(!keys.contains(&DocKey::from_parts(volume.id, 103)));
-            assert!(keys.contains(&DocKey::from_parts(volume.id, 100)));
+            if mode == SearchMode::Content {
+                assert!(keys.is_empty(), "repair must remove obsolete content");
+            } else {
+                assert!(keys.contains(&retry_key));
+                assert!(!keys.contains(&DocKey::from_parts(volume.id, 103)));
+                assert!(keys.contains(&DocKey::from_parts(volume.id, 100)));
+            }
             assert_eq!(
                 search(&handler, "unrelated", mode).hits[0].key,
                 unrelated.key
@@ -2082,7 +2351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_move_after_admission_recovers_children_tombstoned_at_obsolete_paths()
+    async fn directory_move_after_metadata_admission_preserves_names_and_repairs_latest_path()
     -> Result<()> {
         let root = tempfile::tempdir()?;
         let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60034)?;
@@ -2181,12 +2450,17 @@ mod tests {
                                 job.volume_id == child.volume() && job.file_id == child.file_id()
                             })
                             .unwrap();
-                        assert_eq!(job.operation, JobOperation::Reconcile);
-                        assert_eq!(job.path, Path::new(r"C:\middle\racechild.txt"));
+                        assert_eq!(job.operation, JobOperation::Delete);
+                        assert!(job.path.as_os_str().is_empty());
+                        assert!(pending.metadata.iter().any(|change| {
+                            matches!(change, MetadataChange::Upsert(file)
+                                if file.key == child && file.path == middle_child.path)
+                        }));
                         assert!(!moved_again.swap(true, Ordering::SeqCst));
                         // The second move occurs after durable admission and
-                        // before the worker opens the obsolete middle pathname.
-                        // Its successful tombstone has no deferred-file debt.
+                        // before the content tombstone commits. The observed
+                        // name remains available for the next journal repair;
+                        // optional extraction has not opened the old pathname.
                         hide_pending(&pending);
                         worker_outcome(cfg, &pending, &[], &[])?;
                         finish(store, cfg, &pending)
@@ -2208,7 +2482,10 @@ mod tests {
         assert!(store.state.deferred.is_empty());
         assert_eq!(store.volume(volume.id)?.cursor, Some(batch.cursor));
         let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
-        assert!(meta_index::file_meta(&index, child)?.is_none());
+        assert_eq!(
+            meta_index::file_meta(&index, child)?.unwrap().path,
+            middle_child.path
+        );
         assert_eq!(
             meta_index::file_meta(&index, folder)?.unwrap().path,
             final_root.path
@@ -2229,8 +2506,8 @@ mod tests {
                 .contains(&folder)
         );
 
-        // Only the directory has another journal event. The unchanged child is
-        // absent from the index, so a second prefix-only scan cannot recover it.
+        // Only the directory has another journal event. Its unsettled roots
+        // must retain discovery coverage while the latest child path is repaired.
         let later = JournalBatch {
             events: vec![FileEvent::DirectoryRenamed {
                 doc: folder,
@@ -2259,8 +2536,12 @@ mod tests {
                     Ok(keys
                         .into_iter()
                         .map(|key| {
-                            assert_eq!(key, folder);
-                            Some(final_root.clone())
+                            Some(if key == folder {
+                                final_root.clone()
+                            } else {
+                                assert_eq!(key, child);
+                                final_child.clone()
+                            })
                         })
                         .collect())
                 },
@@ -2296,12 +2577,16 @@ mod tests {
             SearchMode::Hybrid,
         ] {
             let found = search(&handler, "racechild", mode);
-            assert_eq!(found.total, 1);
-            assert_eq!(found.hits[0].key, child);
-            assert_eq!(
-                found.hits[0].path.as_deref(),
-                Some(r"C:\final\racechild.txt")
-            );
+            if mode == SearchMode::Content {
+                assert_eq!(found.total, 0);
+            } else {
+                assert_eq!(found.total, 1);
+                assert_eq!(found.hits[0].key, child);
+                assert_eq!(
+                    found.hits[0].path.as_deref(),
+                    Some(r"C:\final\racechild.txt")
+                );
+            }
             assert_eq!(search_directory_path(&handler, "first", mode).total, 0);
             assert_eq!(search_directory_path(&handler, "middle", mode).total, 0);
         }
@@ -2309,7 +2594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_directory_rename_recovers_child_lost_during_baseline_or_ordinary_edit()
+    async fn first_directory_rename_recovers_child_lost_during_legacy_or_optional_extraction()
     -> Result<()> {
         async fn obsolete_path(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
             let pending = store.state.pending.clone().unwrap();
@@ -2353,36 +2638,26 @@ mod tests {
             }
             seed_directory_fixture(&mut store, &volume, &cfg, &seeded).await?;
             if baseline {
-                // Prior baseline pages already committed the root and sentinel.
-                // This later MFT page loses the child before validated EOF.
+                // A pre-v5 baseline may have durably admitted a content job.
+                // Its replay must retain the old obsolete-path recovery rule.
+                // Current baselines use metadata-only jobs (covered separately).
                 store.volume_mut(volume.id)?.needs_scan = true;
                 store.save()?;
-                let mut scan = MftProgress::new(before, vec![Ok(vec![original_child])].into_iter());
-                scan.reset_admitted = true;
-                assert!(
-                    !apply_mft_scan(&mut store, &volume, &cfg, &mut scan, obsolete_path).await?
-                );
-                assert!(apply_mft_scan(&mut store, &volume, &cfg, &mut scan, obsolete_path).await?);
-            } else {
-                let progress = apply_journal_batch(
-                    &mut store,
-                    &volume,
-                    &cfg,
-                    JournalBatch {
-                        events: vec![FileEvent::Modified(original_child)],
-                        cursor: JournalCursor {
-                            last_usn: before.last_usn + 50,
-                            ..before
-                        },
-                        caught_up: true,
-                    },
-                    obsolete_path,
-                )
-                .await?;
-                assert!(
-                    progress.work_remaining,
-                    "pre-worker head incorrectly certified coverage"
-                );
+            }
+            // Once admission permits extraction, a parent can move between the
+            // current metadata snapshot and opening the file. Reconcile then
+            // tombstones the obsolete identity; a later parent-only event must
+            // still rediscover the child, including across coordinator restart.
+            store.begin(pending_for_volume(
+                &volume,
+                vec![MetadataChange::Upsert(original_child)],
+                None,
+                false,
+                &cfg,
+            ))?;
+            obsolete_path(&mut store, &cfg).await?;
+            if baseline {
+                store.complete_scan(volume.id, before)?;
             }
             assert!(!store.volume(volume.id)?.needs_scan);
             assert!(store.volume(volume.id)?.catching_up);
@@ -2474,12 +2749,16 @@ mod tests {
                 SearchMode::Hybrid,
             ] {
                 let found = search(&handler, "lostchild", mode);
-                assert_eq!(found.total, 1);
-                assert_eq!(found.hits[0].key, child);
-                assert_eq!(
-                    found.hits[0].path.as_deref(),
-                    Some(r"C:\destination\lostchild.txt")
-                );
+                if mode == SearchMode::Content {
+                    assert_eq!(found.total, 0);
+                } else {
+                    assert_eq!(found.total, 1);
+                    assert_eq!(found.hits[0].key, child);
+                    assert_eq!(
+                        found.hits[0].path.as_deref(),
+                        Some(r"C:\destination\lostchild.txt")
+                    );
+                }
                 assert_eq!(search_directory_path(&handler, "source", mode).total, 0);
             }
         }
@@ -2764,19 +3043,27 @@ mod tests {
             Path::new(&cfg.paths.content_index),
         )?;
         assert_eq!(
-            search(&handler, "latearrival", SearchMode::Content).hits[0].key,
+            search(&handler, "latearrival", SearchMode::NameOnly).hits[0].key,
             first_leaf
         );
         assert_eq!(
-            search(&handler, "escapedarrival", SearchMode::Content).hits[0].key,
+            search(&handler, "escapedarrival", SearchMode::NameOnly).hits[0].key,
             escaped_leaf
+        );
+        assert_eq!(
+            search(&handler, "latearrival", SearchMode::Content).total,
+            0
+        );
+        assert_eq!(
+            search(&handler, "escapedarrival", SearchMode::Content).total,
+            0
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn directory_page_restarts_after_probe_failure_and_waits_for_retry_capacity() -> Result<()>
-    {
+    async fn directory_page_restarts_after_probe_failure_despite_full_content_retry_capacity()
+    -> Result<()> {
         let root = tempfile::tempdir()?;
         let (mut cfg, mut store, volume, before) = baseline_store(root.path(), 60033)?;
         cfg.content_index_volumes = vec!["X:\\".into()];
@@ -2847,69 +3134,8 @@ mod tests {
         repair.discovery = Some(Box::new(
             vec![Ok(current.values().cloned().collect())].into_iter(),
         ));
-        let mut rejected = false;
-        for _ in 0..50 {
-            let result = apply_directory_turn(
-                &mut store,
-                &volume,
-                &cfg,
-                &mut repair,
-                async |keys| {
-                    Ok(keys
-                        .into_iter()
-                        .map(|key| current.get(&key).cloned())
-                        .collect())
-                },
-                commit_directory_fixture,
-            )
-            .await;
-            if let Err(error) = result {
-                assert!(error.is::<state::DeferredCapacity>());
-                rejected = true;
-                break;
-            }
-        }
-        assert!(rejected);
-        assert_eq!(
-            repair.page.as_ref().unwrap(),
-            &vec![MetadataChange::Upsert(child.clone())]
-        );
-        assert!(store.state.pending.is_none());
-        assert_eq!(store.volume(volume.id)?.cursor, Some(before));
-        let error = apply_directory_turn(
-            &mut store,
-            &volume,
-            &cfg,
-            &mut repair,
-            async |_| panic!("retained page must not read or resolve ahead of admission"),
-            commit_directory_fixture,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.is::<state::DeferredCapacity>());
-
-        // A normal deletion cancels one old retry and releases exactly one
-        // reserved slot. The retained child page can now commit unchanged.
-        let removed = store.state.deferred[0].meta.key;
-        store.begin(pending_for_volume(
-            &volume,
-            vec![MetadataChange::Delete(removed)],
-            None,
-            false,
-            &cfg,
-        ))?;
-        commit_directory_fixture(&mut store, &cfg).await?;
-        assert!(
-            !apply_directory_turn(
-                &mut store,
-                &volume,
-                &cfg,
-                &mut repair,
-                async |_| panic!("admitting retained page must not repeat its native read"),
-                commit_directory_fixture,
-            )
-            .await?
-        );
+        // Metadata repair creates no extraction obligation. Existing deferred
+        // content can occupy every retry slot without blocking current names.
         let mut done = false;
         for _ in 0..50 {
             done = apply_directory_turn(
@@ -2938,6 +3164,13 @@ mod tests {
             child.path
         );
         assert_eq!(store.volume(volume.id)?.cursor, Some(batch.cursor));
+        assert_eq!(store.state.deferred.len(), MAX_DEFERRED_FILES);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(search(&handler, "bounded", SearchMode::NameOnly).total, 1);
+        assert_eq!(search(&handler, "bounded", SearchMode::Content).total, 0);
         Ok(())
     }
 
@@ -3030,7 +3263,11 @@ mod tests {
             SearchMode::Content,
             SearchMode::Hybrid,
         ] {
-            assert_eq!(search(&handler, "blockedreport", mode).total, 0);
+            assert_eq!(
+                search(&handler, "blockedreport", mode).total,
+                if mode == SearchMode::Content { 0 } else { 1 },
+                "optional extraction failure must retain the current filename"
+            );
             assert_eq!(search(&handler, "staleheldtoken", mode).total, 0);
             let result = search(&handler, "independentreport", mode);
             assert_eq!(result.total, 1);
@@ -3187,6 +3424,490 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn metadata_first_baseline_exceeds_retry_capacity_then_enriches_without_reset()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, mut volume, start) = baseline_store(root.path(), 60_500)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        volume.guid_path = "X:\\".into();
+        store.volume_mut(volume.id)?.guid = volume.guid_path.clone();
+        store.save()?;
+        let count = MAX_DEFERRED_FILES + MUTATION_BATCH_LIMIT + 1;
+        let files: Vec<_> = (0..count)
+            .map(|n| {
+                meta(
+                    DocKey::from_parts(volume.id, n as u64 + 10),
+                    &format!("batterybaseline{n}.txt"),
+                    10,
+                )
+            })
+            .collect();
+        let pages: Vec<_> = files
+            .chunks(MUTATION_BATCH_LIMIT)
+            .map(|page| Ok::<_, NtfsError>(page.to_vec()))
+            .collect();
+        let mut scan = MftProgress::new(start, pages.into_iter());
+        let mut turns = 0;
+        while !apply_mft_scan(&mut store, &volume, &cfg, &mut scan, commit_metadata_batch).await? {
+            turns += 1;
+            ensure!(turns < 100, "baseline did not finish bounded pages");
+            assert!(
+                store.state.deferred.is_empty(),
+                "unextracted files must not consume retry slots"
+            );
+            assert!(read_visibility().volumes.contains(&volume.id));
+        }
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "batterybaseline0", SearchMode::NameOnly).total,
+            0
+        );
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor: start,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        for n in [0, count - 1] {
+            assert_eq!(
+                search(
+                    &handler,
+                    &format!("batterybaseline{n}"),
+                    SearchMode::NameOnly
+                )
+                .total,
+                1
+            );
+        }
+        assert_eq!(
+            tantivy::Index::open_in_dir(&cfg.paths.meta_index)?
+                .reader()?
+                .searcher()
+                .num_docs(),
+            count as u64
+        );
+        assert_eq!(
+            tantivy::Index::open_in_dir(&cfg.paths.content_index)?
+                .reader()?
+                .searcher()
+                .num_docs(),
+            0
+        );
+        assert!(store.state.deferred.is_empty());
+
+        let mut enrichment = EnrichmentProgress::default();
+        turns = 0;
+        while enrich_content_turn(
+            &mut store,
+            &volume,
+            &cfg,
+            &[],
+            &mut enrichment,
+            commit_enrichment_fixture,
+        )
+        .await?
+        {
+            turns += 1;
+            ensure!(turns < 100, "enrichment did not finish bounded pages");
+            assert!(
+                !read_visibility().volumes.contains(&volume.id),
+                "optional text reset the filename baseline"
+            );
+            apply_journal_batch(
+                &mut store,
+                &volume,
+                &cfg,
+                JournalBatch {
+                    events: Vec::new(),
+                    cursor: start,
+                    caught_up: true,
+                },
+                commit_metadata_batch,
+            )
+            .await?;
+        }
+        assert_eq!(
+            search(&handler, "enrichmentproof", SearchMode::Content).total,
+            count as u64
+        );
+        assert_eq!(
+            search(&handler, "batterybaseline0", SearchMode::NameOnly).total,
+            1
+        );
+        assert!(store.state.pending.is_none());
+        assert!(store.state.deferred.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn optional_enrichment_restarts_on_battery_with_real_cleanup_and_rejects_stale_ack()
+    -> Result<()> {
+        for (persisted_fallback, legacy_v4, id) in [
+            (false, false, 60_501),
+            (true, false, 60_502),
+            (false, true, 60_504),
+        ] {
+            let root = tempfile::tempdir()?;
+            let (mut cfg, mut store, volume, cursor) = baseline_store(root.path(), id)?;
+            cfg.content_index_volumes = vec!["X:\\".into()];
+            store.volume_mut(id)?.needs_scan = false;
+            store.volume_mut(id)?.catching_up = false;
+            let file = meta(DocKey::from_parts(id, 10), "restartfilename.txt", 10);
+            store.begin(pending_for_metadata(
+                &volume,
+                vec![MetadataChange::Upsert(file.clone())],
+                None,
+                false,
+                &cfg,
+            ))?;
+            commit_metadata_batch(&mut store, &cfg).await?;
+            let pending = pending_for_volume(
+                &volume,
+                vec![MetadataChange::Upsert(file.clone())],
+                None,
+                false,
+                &cfg,
+            );
+            store.begin(pending.clone())?;
+            // Crash after content commit but before metadata/checkpoint. Replay
+            // on battery must replace this text through a new physical commit.
+            worker_commit(&cfg, &pending, Some((&file, "oldcontentreceipt")))?;
+            if persisted_fallback {
+                store.defer_pending_content(pending.worker.id)?;
+            }
+            drop(store);
+            let checkpoint = Path::new(&cfg.paths.state_dir).join("ingestion-v2.json");
+            if legacy_v4 {
+                // A real pre-upgrade crash can leave the old mandatory
+                // Reconcile envelope and its content half committed. Preserve
+                // both physical indices while reproducing the v4 JSON shape.
+                let mut old: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
+                old["version"] = 4.into();
+                old["pending"]
+                    .as_object_mut()
+                    .context("legacy fixture lost its pending envelope")?
+                    .remove("content_optional");
+                state::atomic_write(&checkpoint, &serde_json::to_vec(&old)?)?;
+            }
+            let mut store = StateStore::open(&cfg)?;
+            assert_eq!(
+                store.state.pending.as_ref().unwrap().worker.id,
+                pending.worker.id
+            );
+            assert_eq!(
+                store.state.pending.as_ref().unwrap().content_optional,
+                !persisted_fallback,
+                "v4 extraction must become optional before scheduler replay"
+            );
+            if legacy_v4 {
+                let upgraded: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&checkpoint)?)?;
+                assert_eq!(upgraded["version"], 5);
+                assert_eq!(upgraded["pending"]["content_optional"], true);
+                assert!(store.state.retired_indices.is_empty());
+            }
+            let error = commit_pending_with_dispatch(&mut store, &cfg, async |_, _, _| Ok(()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("fresh complete receipt"));
+            assert!(store.state.pending.is_some());
+            assert_eq!(store.volume(id)?.cursor, Some(cursor));
+            let mut denied = 0;
+            let mut committed = 0;
+            commit_pending_with_dispatch(&mut store, &cfg, async |cfg, batch, _| {
+                if batch.content_optional {
+                    denied += 1;
+                    return Err(ContentAdmissionDeferred.into());
+                }
+                ensure!(
+                    batch
+                        .worker
+                        .jobs
+                        .iter()
+                        .all(|job| job.operation == JobOperation::Delete)
+                );
+                committed += 1;
+                worker_commit(cfg, batch, None)
+            })
+            .await?;
+            assert_eq!(denied, usize::from(!persisted_fallback));
+            assert_eq!(
+                committed, 1,
+                "deferral is not a substitute for a worker commit"
+            );
+            assert!(store.state.pending.is_none());
+            assert_eq!(store.volume(id)?.cursor, Some(cursor));
+            apply_journal_batch(
+                &mut store,
+                &volume,
+                &cfg,
+                JournalBatch {
+                    events: Vec::new(),
+                    cursor,
+                    caught_up: true,
+                },
+                commit_metadata_batch,
+            )
+            .await?;
+            let handler = UnifiedSearchHandler::try_new(
+                Path::new(&cfg.paths.meta_index),
+                Path::new(&cfg.paths.content_index),
+            )?;
+            assert_eq!(
+                search(&handler, "restartfilename", SearchMode::NameOnly).total,
+                1
+            );
+            assert_eq!(
+                search(&handler, "oldcontentreceipt", SearchMode::Content).total,
+                0
+            );
+            assert_eq!(
+                enrichment_candidates(&store, &volume, &cfg, &[], &[file])?.len(),
+                1,
+                "missing content must remain durable enrichment debt after cleanup"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frozen_enrichment_snapshot_cannot_resurrect_deleted_or_renamed_metadata() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, mut volume, cursor) = baseline_store(root.path(), 60_503)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        volume.guid_path = "X:\\".into();
+        store.volume_mut(volume.id)?.guid = volume.guid_path.clone();
+        store.volume_mut(volume.id)?.needs_scan = false;
+        store.volume_mut(volume.id)?.catching_up = false;
+        let old = meta(DocKey::from_parts(volume.id, 10), "oldname.txt", 10);
+        let deleted = meta(DocKey::from_parts(volume.id, 11), "deletedname.txt", 10);
+        let stable = meta(DocKey::from_parts(volume.id, 12), "stablefile.txt", 10);
+        store.begin(pending_for_metadata(
+            &volume,
+            vec![old.clone(), deleted.clone(), stable.clone()]
+                .into_iter()
+                .map(MetadataChange::Upsert)
+                .collect(),
+            None,
+            false,
+            &cfg,
+        ))?;
+        commit_metadata_batch(&mut store, &cfg).await?;
+        let index = meta_index::open_or_create_index(Path::new(&cfg.paths.meta_index))?;
+        let mut progress = EnrichmentProgress {
+            scan: Some(meta_index::PathScan::new(
+                &index,
+                volume.id,
+                std::slice::from_ref(&volume.guid_path),
+            )?),
+            ..EnrichmentProgress::default()
+        };
+        let renamed = meta(old.key, "newname.txt", 20);
+        store.begin(pending_for_metadata(
+            &volume,
+            vec![
+                MetadataChange::Upsert(renamed.clone()),
+                MetadataChange::Delete(deleted.key),
+            ],
+            None,
+            false,
+            &cfg,
+        ))?;
+        commit_metadata_batch(&mut store, &cfg).await?;
+        while enrich_content_turn(
+            &mut store,
+            &volume,
+            &cfg,
+            &[],
+            &mut progress,
+            commit_enrichment_fixture,
+        )
+        .await?
+        {}
+        assert_eq!(meta_index::file_meta(&index, old.key)?.unwrap(), renamed);
+        assert!(meta_index::file_meta(&index, deleted.key)?.is_none());
+        assert_eq!(
+            enrichment_candidates(&store, &volume, &cfg, &[], std::slice::from_ref(&renamed))?
+                .len(),
+            1
+        );
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(search(&handler, "newname", SearchMode::NameOnly).total, 1);
+        assert_eq!(search(&handler, "oldname", SearchMode::Hybrid).total, 0);
+        assert_eq!(search(&handler, "deletedname", SearchMode::Hybrid).total, 0);
+        assert_eq!(
+            search(&handler, "enrichmentproof", SearchMode::Content).total,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_enrichment_reader_reopens_after_cooldown_without_losing_metadata() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let (mut cfg, mut store, mut volume, cursor) = baseline_store(root.path(), 60_505)?;
+        cfg.content_index_volumes = vec!["X:\\".into()];
+        volume.guid_path = "X:\\".into();
+        let checkpoint = store.volume_mut(volume.id)?;
+        checkpoint.guid = volume.guid_path.clone();
+        checkpoint.needs_scan = false;
+        checkpoint.catching_up = false;
+        let file = meta(DocKey::from_parts(volume.id, 10), "readerrecovery.txt", 10);
+        store.begin(pending_for_metadata(
+            &volume,
+            vec![MetadataChange::Upsert(file.clone())],
+            None,
+            false,
+            &cfg,
+        ))?;
+        commit_metadata_batch(&mut store, &cfg).await?;
+        show_volume(volume.id);
+
+        // Freeze a real reader over a malformed snapshot, while the durable
+        // current metadata is healthy. Missing required stored identity fields
+        // make PathScan invalidate itself; no mock success/error ACK is used.
+        let broken = meta_index::open_or_create_index(&root.path().join("broken-reader"))?;
+        let mut writer = meta_index::create_writer(
+            &broken,
+            &meta_index::WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        writer.add_document(tantivy::doc!(
+            broken.fields.volume => u64::from(volume.id),
+            broken.fields.path => "X:\\readerrecovery.txt"
+        ))?;
+        content_index::commit_batch(&mut writer, Uuid::new_v4())?;
+        drop(writer);
+        let mut progress = EnrichmentProgress {
+            scan: Some(meta_index::PathScan::new(
+                &broken,
+                volume.id,
+                std::slice::from_ref(&volume.guid_path),
+            )?),
+            ..EnrichmentProgress::default()
+        };
+        let error = enrich_content_turn(
+            &mut store,
+            &volume,
+            &cfg,
+            &[],
+            &mut progress,
+            commit_enrichment_fixture,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("metadata identity missing"));
+        assert!(progress.scan.is_none() && progress.page.is_none());
+        assert!(progress.next_scan > Instant::now());
+        assert!(store.state.pending.is_none());
+        assert_eq!(
+            enrichment_candidates(&store, &volume, &cfg, &[], &[file])?.len(),
+            1
+        );
+        assert!(
+            !enrich_content_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &[],
+                &mut progress,
+                commit_enrichment_fixture,
+            )
+            .await?
+        );
+        // Advance only this volatile retry clock; reopening uses the actual
+        // current index and the normal paired commit coordinator.
+        progress.next_scan = Instant::now();
+        assert!(
+            enrich_content_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &[],
+                &mut progress,
+                commit_enrichment_fixture,
+            )
+            .await?
+        );
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "readerrecovery", SearchMode::NameOnly).total,
+            1
+        );
+        assert_eq!(
+            search(&handler, "enrichmentproof", SearchMode::Content).total,
+            1
+        );
+        Ok(())
+    }
+
+    async fn commit_enrichment_fixture(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
+        commit_pending_with_dispatch(store, cfg, async |cfg, batch, _| {
+            ensure!(
+                batch.worker.reset_volumes.is_empty(),
+                "enrichment reset a filename baseline"
+            );
+            let snapshots: Vec<_> = batch
+                .metadata
+                .iter()
+                .filter_map(|change| {
+                    if let MetadataChange::Upsert(meta) = change {
+                        Some((meta, "enrichmentproof"))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            worker_outcome(cfg, batch, &snapshots, &[])
+        })
+        .await
+    }
+
     fn baseline_store(
         root: &Path,
         id: VolumeId,
@@ -3215,22 +3936,18 @@ mod tests {
     }
 
     async fn commit_metadata_batch(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {
-        let batch = store
-            .state
-            .pending
-            .clone()
-            .context("missing metadata intent")?;
-        ensure!(
-            batch
-                .worker
-                .jobs
-                .iter()
-                .all(|job| job.operation == JobOperation::Delete),
-            "metadata fixture unexpectedly requires native extraction"
-        );
-        hide_pending(&batch);
-        worker_commit(cfg, &batch, None)?;
-        finish(store, cfg, &batch)
+        commit_pending_with_dispatch(store, cfg, async |cfg, batch, _| {
+            ensure!(
+                batch
+                    .worker
+                    .jobs
+                    .iter()
+                    .all(|job| job.operation == JobOperation::Delete),
+                "metadata fixture unexpectedly requires native extraction"
+            );
+            worker_commit(cfg, batch, None)
+        })
+        .await
     }
 
     async fn metadata_turn<I>(
@@ -3684,10 +4401,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_mft_page_stays_bounded_until_cleanup_frees_retry_capacity() -> Result<()> {
+    async fn metadata_baseline_ignores_full_retry_ledger_but_enrichment_retains_its_page()
+    -> Result<()> {
         let root = tempfile::tempdir()?;
-        let (mut cfg, mut store, volume, previous) = baseline_store(root.path(), 60_022)?;
+        let (mut cfg, mut store, mut volume, previous) = baseline_store(root.path(), 60_022)?;
         cfg.content_index_volumes = vec!["X:\\".into()];
+        volume.guid_path = "X:\\".into();
+        store.volume_mut(volume.id)?.guid = volume.guid_path.clone();
         let mut other = VolumeInfo {
             id: 0,
             guid_path: "other-volume-reserved-capacity".into(),
@@ -3723,19 +4443,67 @@ mod tests {
             }),
         );
         assert!(!metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        assert!(!metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert!(scan.page.is_none());
+        assert!(store.state.pending.is_none());
+        assert_eq!(store.state.deferred.len(), MAX_DEFERRED_FILES);
+        assert!(metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(store.volume(volume.id)?.cursor, Some(scan.start));
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor: scan.start,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "retainedpage", SearchMode::NameOnly).total,
+            1
+        );
+        assert_eq!(
+            search(&handler, "retainedpage", SearchMode::Content).total,
+            0
+        );
+
+        // Optional extraction still reserves bounded retry space. It retains
+        // exactly this unadmitted page while metadata remains searchable.
+        let mut enrichment = EnrichmentProgress::default();
         for _ in 0..2 {
-            let error = metadata_turn(&mut store, &volume, &cfg, &mut scan)
-                .await
-                .unwrap_err();
+            let error = enrich_content_turn(
+                &mut store,
+                &volume,
+                &cfg,
+                &[],
+                &mut enrichment,
+                commit_enrichment_fixture,
+            )
+            .await
+            .unwrap_err();
             assert!(error.is::<state::DeferredCapacity>());
-            assert_eq!(reads.load(Ordering::SeqCst), 1);
-            assert_eq!(scan.page.as_deref(), Some(std::slice::from_ref(&file)));
+            assert_eq!(
+                enrichment.page.as_deref(),
+                Some(std::slice::from_ref(&file))
+            );
             assert!(store.state.pending.is_none());
-            assert_eq!(store.volume(volume.id)?.cursor, Some(previous));
+            assert_eq!(
+                search(&handler, "retainedpage", SearchMode::NameOnly).total,
+                1
+            );
         }
 
-        // An actual durable deletion, rather than a manual ledger edit, frees
-        // one slot while the original scan keeps its single unadmitted page.
+        // Release one slot through a real paired deletion, then admit the
+        // retained enrichment candidate without reopening its frozen scan.
         let released_key = store.state.deferred[0].meta.key;
         store.begin(pending_for_volume(
             &other,
@@ -3747,44 +4515,31 @@ mod tests {
         commit_metadata_batch(&mut store, &cfg).await?;
         assert_eq!(store.state.deferred.len(), MAX_DEFERRED_FILES - 1);
         assert!(
-            !apply_mft_scan(
+            enrich_content_turn(
                 &mut store,
                 &volume,
                 &cfg,
-                &mut scan,
-                async |store: &mut StateStore, cfg: &AppConfig| {
-                    let pending = store
-                        .state
-                        .pending
-                        .clone()
-                        .context("retained page was not admitted")?;
-                    hide_pending(&pending);
-                    worker_commit(cfg, &pending, Some((&file, "retainedpagetoken")))?;
-                    finish(store, cfg, &pending)
-                },
+                &[],
+                &mut enrichment,
+                commit_enrichment_fixture,
             )
             .await?
         );
+        assert!(enrichment.page.is_none());
+        apply_journal_batch(
+            &mut store,
+            &volume,
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor: scan.start,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
         assert_eq!(
-            reads.load(Ordering::SeqCst),
-            1,
-            "admission retry cannot skip to the next page"
-        );
-        assert!(scan.page.is_none());
-        assert!(metadata_turn(&mut store, &volume, &cfg, &mut scan).await?);
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-        assert_eq!(store.volume(volume.id)?.cursor, Some(scan.start));
-        show_volume(volume.id);
-        let handler = UnifiedSearchHandler::try_new(
-            Path::new(&cfg.paths.meta_index),
-            Path::new(&cfg.paths.content_index),
-        )?;
-        assert_eq!(
-            search(&handler, "retainedpage", SearchMode::NameOnly).total,
-            1
-        );
-        assert_eq!(
-            search(&handler, "retainedpagetoken", SearchMode::Content).total,
+            search(&handler, "enrichmentproof", SearchMode::Content).total,
             1
         );
         Ok(())
@@ -4026,7 +4781,10 @@ mod tests {
                 SearchMode::Content,
                 SearchMode::Hybrid,
             ] {
-                assert_eq!(search(&handler, "availablevolume", mode).total, 1);
+                assert_eq!(
+                    search(&handler, "availablevolume", mode).total,
+                    u64::from(mode != SearchMode::Content)
+                );
             }
             let due_at = store.state.deferred[0].retry_at;
             assert!(
@@ -4187,20 +4945,12 @@ mod tests {
             },
             caught_up: true,
         };
-        let error = apply_journal_batch(
-            &mut store,
-            &active,
-            &cfg,
-            changes.clone(),
-            async |_: &mut StateStore, _: &AppConfig| {
-                anyhow::bail!("full retry capacity unexpectedly admitted new work")
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(error.is::<state::DeferredCapacity>());
+        // Filename mutations must proceed even before unavailable retries are
+        // reclaimed. They reserve no new content-extraction obligations.
+        apply_journal_batch(&mut store, &active, &cfg, changes, commit_metadata_batch).await?;
         assert!(store.state.pending.is_none());
-        assert_eq!(store.volume(active.id)?.cursor, Some(active_start));
+        assert_eq!(store.volume(active.id)?.cursor.unwrap().last_usn, 800);
+        assert_eq!(store.state.deferred.len(), MAX_DEFERRED_FILES);
 
         // watch_changes masks unselected volumes, replays any global intent,
         // then durably transfers their retries before admitting active work.
@@ -4218,23 +4968,6 @@ mod tests {
         assert!(store.volume(source.id)?.catching_up);
         assert_eq!(store.volume(source.id)?.cursor, Some(source_start));
         assert!(store.state.deferred.is_empty());
-        apply_journal_batch(
-            &mut store,
-            &active,
-            &cfg,
-            changes,
-            async |store: &mut StateStore, cfg: &AppConfig| {
-                let batch = store
-                    .state
-                    .pending
-                    .clone()
-                    .context("active intent missing")?;
-                hide_pending(&batch);
-                worker_commit(cfg, &batch, Some((&modified, "activeupdatedtoken")))?;
-                finish(store, cfg, &batch)
-            },
-        )
-        .await?;
         assert_eq!(store.volume(active.id)?.cursor.unwrap().last_usn, 800);
         for mode in [
             SearchMode::NameOnly,
@@ -4242,9 +4975,13 @@ mod tests {
             SearchMode::Hybrid,
         ] {
             let result = search(&handler, "activeretained", mode);
-            assert_eq!(result.total, 1);
-            assert_eq!(result.hits[0].key, original.key);
-            assert_eq!(result.hits[0].size, Some(90));
+            if mode == SearchMode::Content {
+                assert_eq!(result.total, 0);
+            } else {
+                assert_eq!(result.total, 1);
+                assert_eq!(result.hits[0].key, original.key);
+                assert_eq!(result.hits[0].size, Some(90));
+            }
             assert_eq!(search(&handler, "activedeleted", mode).total, 0);
             assert_eq!(search(&handler, "offlinestale", mode).total, 0);
         }
@@ -4254,7 +4991,7 @@ mod tests {
         );
         assert_eq!(
             search(&handler, "activeupdatedtoken", SearchMode::Content).total,
-            1
+            0
         );
 
         // Returning to selection cannot reveal the historical source cursor.
@@ -4350,8 +5087,8 @@ mod tests {
             },
         )
         .await?;
-        assert!(store.volume(source.id)?.catching_up);
-        assert!(read_visibility().volumes.contains(&source.id));
+        assert!(!store.volume(source.id)?.catching_up);
+        assert!(!read_visibility().volumes.contains(&source.id));
         let verification_cursor = store.volume(source.id)?.cursor.unwrap();
         apply_journal_batch(
             &mut store,
@@ -4372,13 +5109,23 @@ mod tests {
             SearchMode::Hybrid,
         ] {
             let result = search(&handler, "offlinerecovered", mode);
-            assert_eq!(result.total, 1);
-            assert_eq!(result.hits[0].key, recovered.key);
-            assert_eq!(result.hits[0].size, Some(80));
-            assert_eq!(search(&handler, "offlinerenamed", mode).total, 1);
+            if mode == SearchMode::Content {
+                assert_eq!(result.total, 0);
+            } else {
+                assert_eq!(result.total, 1);
+                assert_eq!(result.hits[0].key, recovered.key);
+                assert_eq!(result.hits[0].size, Some(80));
+            }
+            assert_eq!(
+                search(&handler, "offlinerenamed", mode).total,
+                u64::from(mode != SearchMode::Content)
+            );
             assert_eq!(search(&handler, "offlinestale", mode).total, 0);
             assert_eq!(search(&handler, "offlinegone", mode).total, 0);
-            assert_eq!(search(&handler, "activeretained", mode).total, 1);
+            assert_eq!(
+                search(&handler, "activeretained", mode).total,
+                u64::from(mode != SearchMode::Content)
+            );
         }
         for token in [
             "offlinestaletoken",
@@ -4389,7 +5136,7 @@ mod tests {
         }
         assert_eq!(
             search(&handler, "offlinecurrenttoken", SearchMode::Content).total,
-            1
+            0
         );
         drop(store);
         let store = StateStore::open(&cfg)?;

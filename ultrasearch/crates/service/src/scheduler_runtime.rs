@@ -92,6 +92,31 @@ fn content_allowed(
         && allow_content_jobs(idle, load, effective)
 }
 
+fn content_admission_description(
+    allowed: bool,
+    idle: scheduler::IdleState,
+    load: SystemLoad,
+    effective: &SchedulerConfig,
+) -> &'static str {
+    if allowed {
+        "ready"
+    } else if effective.power_save_mode && load.on_battery {
+        "waiting for AC power (power_save_mode=true)"
+    } else if effective.power_save_mode && load.game_mode {
+        "paused by Game Mode (power_save_mode=true)"
+    } else if idle != scheduler::IdleState::DeepIdle {
+        "waiting for deep idle (or idle observation unavailable)"
+    } else if !load.cpu_percent.is_finite() {
+        "waiting for a valid CPU load observation"
+    } else if load.cpu_percent >= effective.cpu_content_max {
+        "waiting for CPU load to fall below the configured limit"
+    } else if load.disk_busy {
+        "waiting for disk activity to subside"
+    } else {
+        "paused by adaptive resource policy"
+    }
+}
+
 /// Poll one dispatch to completion without suspending observation for its whole
 /// lifetime. Keep the same pinned future: a timer tick must never resubmit work
 /// or release a mutation lease. Dropping this wrapper drops that future; it
@@ -146,8 +171,9 @@ async fn await_dispatch<F: std::future::Future>(
         let allowed = force_allow_content
             || content_allowed(idle_sample.state, load_sample, &effective, adaptive.as_ref());
         allow_content.store(allowed, Ordering::Relaxed);
+        let admission = content_admission_description(allowed, idle_sample.state, load_sample, &effective);
         update_status_scheduler_state(format!(
-            "idle={:?} cpu={:.1}% mem={:.1}% dispatch=pending content_admission={allowed} adaptive={} cpu_cap={:.1}% batch={}",
+            "idle={:?} cpu={:.1}% mem={:.1}% dispatch=pending content_admission={admission} adaptive={} cpu_cap={:.1}% batch={}",
             idle_sample.state, load_sample.cpu_percent, load_sample.mem_used_percent,
             adaptive.is_some(), effective.cpu_content_max, effective.content_batch_size,
         ));
@@ -169,8 +195,27 @@ enum Submission {
 struct PendingIndexBatch {
     batch: IndexBatch,
     mutation_lease: Option<Arc<std::fs::File>>,
-    acknowledgement: oneshot::Sender<Result<(), String>>,
+    content_optional: bool,
+    acknowledgement: oneshot::Sender<Result<DispatchOutcome, String>>,
 }
+
+#[derive(Debug)]
+enum DispatchOutcome {
+    Committed,
+    ContentDeferred,
+}
+
+/// A scheduling decision, explicitly distinct from a physical commit ACK or
+/// worker failure. The coordinator must retain/replace its durable intent.
+#[derive(Debug)]
+pub(crate) struct ContentAdmissionDeferred;
+
+impl std::fmt::Display for ContentAdmissionDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("optional extraction was not dispatched; metadata-only commit required")
+    }
+}
+impl std::error::Error for ContentAdmissionDeferred {}
 
 fn submission_sender() -> Option<mpsc::Sender<Submission>> {
     JOB_SENDER
@@ -450,10 +495,22 @@ impl SchedulerRuntime {
         let workers = self.live.active_workers.load(Ordering::Relaxed);
         let dropped = self.live.dropped_content.load(Ordering::Relaxed);
         let enqueued = self.live.enqueued_content.load(Ordering::Relaxed);
+        let allow_content = self.force_allow_content
+            || content_allowed(idle_sample.state, load, &effective, self.adaptive.as_ref());
+        self.allow_content.store(allow_content, Ordering::Relaxed);
+        let admission =
+            content_admission_description(allow_content, idle_sample.state, load, &effective);
         update_status_scheduler_state(format!(
-            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={} enqueued={} adaptive={} cpu_cap={:.1}% batch={}",
-            idle_sample.state, load.cpu_percent, load.mem_used_percent, ct, dropped, enqueued,
-            self.adaptive.is_some(), effective.cpu_content_max, effective.content_batch_size,
+            "idle={:?} cpu={:.1}% mem={:.1}% queue(content)={} dropped={} enqueued={} content_admission={admission} adaptive={} cpu_cap={:.1}% batch={}",
+            idle_sample.state,
+            load.cpu_percent,
+            load.mem_used_percent,
+            ct,
+            dropped,
+            enqueued,
+            self.adaptive.is_some(),
+            effective.cpu_content_max,
+            effective.content_batch_size,
         ));
         update_status_queue_state(
             Some(ct as u64),
@@ -467,9 +524,22 @@ impl SchedulerRuntime {
         // Extraction follows idle/load policy. Bounded deletion, reset, and
         // metadata-only batches do not extract content and must remain usable
         // while the user is active. Preserve older legacy work as a FIFO barrier.
-        let allow_content = self.force_allow_content
-            || content_allowed(idle_sample.state, load, &effective, self.adaptive.as_ref());
-        self.allow_content.store(allow_content, Ordering::Relaxed);
+        if !allow_content
+            && self
+                .pending_index
+                .as_ref()
+                .is_some_and(|pending| pending.content_optional && requires_content(&pending.batch))
+        {
+            // Admission can close after the producer's hint, including after a
+            // restart. No worker has started: return an explicit non-commit so
+            // the coordinator can persist and run metadata-only cleanup.
+            if let Some(pending) = self.pending_index.take() {
+                let _ = pending
+                    .acknowledgement
+                    .send(Ok(DispatchOutcome::ContentDeferred));
+            }
+            self.update_live_counts();
+        }
         if !allow_content
             && (self.legacy_retry.is_some()
                 || !self.content_jobs.is_empty()
@@ -537,9 +607,11 @@ impl SchedulerRuntime {
             }
             // The caller persists journal progress only after this successful
             // worker exit, which occurs after the worker's index commit.
-            let _ = pending
-                .acknowledgement
-                .send(result.map_err(|error| error.to_string()));
+            let _ = pending.acknowledgement.send(
+                result
+                    .map(|()| DispatchOutcome::Committed)
+                    .map_err(|error| error.to_string()),
+            );
             self.update_live_counts();
         }
     }
@@ -588,6 +660,21 @@ pub async fn submit_index_batch(
     batch: IndexBatch,
     mutation_lease: Option<Arc<std::fs::File>>,
 ) -> anyhow::Result<()> {
+    submit_batch(batch, mutation_lease, false).await
+}
+
+pub(crate) async fn submit_optional_index_batch(
+    batch: IndexBatch,
+    mutation_lease: Option<Arc<std::fs::File>>,
+) -> anyhow::Result<()> {
+    submit_batch(batch, mutation_lease, true).await
+}
+
+async fn submit_batch(
+    batch: IndexBatch,
+    mutation_lease: Option<Arc<std::fs::File>>,
+    content_optional: bool,
+) -> anyhow::Result<()> {
     // An admitted durable transaction is indivisible. Reject an envelope the
     // worker cannot receipt BEFORE queueing; never truncate it to fit a budget.
     check_index_batch_bounds(&batch)?;
@@ -598,14 +685,19 @@ pub async fn submit_index_batch(
         .send(Submission::IndexBatch(PendingIndexBatch {
             batch,
             mutation_lease,
+            content_optional,
             acknowledgement,
         }))
         .await
         .map_err(|_| anyhow::anyhow!("scheduler stopped before admitting the index batch"))?;
-    response
+    match response
         .await
         .map_err(|_| anyhow::anyhow!("scheduler stopped before acknowledging the index commit"))?
-        .map_err(anyhow::Error::msg)
+        .map_err(anyhow::Error::msg)?
+    {
+        DispatchOutcome::Committed => Ok(()),
+        DispatchOutcome::ContentDeferred => Err(ContentAdmissionDeferred.into()),
+    }
 }
 
 /// Utility to let other components set active worker count directly (e.g., worker manager updates).
@@ -855,7 +947,11 @@ mod tests {
         assert_eq!(effective.content_batch_size, 400);
         assert_eq!(effective.cpu_content_max, 35.0);
         let load = observed_load(37.0, 50.0);
-        assert!(allow_content_jobs(scheduler::IdleState::DeepIdle, load, &base));
+        assert!(allow_content_jobs(
+            scheduler::IdleState::DeepIdle,
+            load,
+            &base
+        ));
         assert!(!content_allowed(
             scheduler::IdleState::DeepIdle,
             load,
@@ -873,7 +969,10 @@ mod tests {
         assert_eq!(effective.content_batch_size, 500);
         assert_eq!(effective.cpu_content_max, 40.0);
         assert!(content_allowed(
-            scheduler::IdleState::DeepIdle, load, &effective, None,
+            scheduler::IdleState::DeepIdle,
+            load,
+            &effective,
+            None,
         ));
         effective = adaptive_config_at(
             &mut adaptive,
@@ -910,7 +1009,11 @@ mod tests {
         let mut first = take_legacy_batch(&mut queue, usize::MAX);
         assert_eq!(first.len(), content_index::MAX_DEFERRED_KEYS + 1);
         assert_eq!(queue.front().unwrap().operation, JobOperation::Reconcile);
-        assert_eq!(queue.len(), 2, "later deletion must not overtake the blocked head");
+        assert_eq!(
+            queue.len(),
+            2,
+            "later deletion must not overtake the blocked head"
+        );
         first.extend(take_legacy_batch(&mut queue, usize::MAX));
         assert!(queue.is_empty());
         assert_eq!(serde_json::to_value(first).unwrap(), original);
@@ -919,7 +1022,10 @@ mod tests {
             let mut cfg = AppConfig::default();
             cfg.scheduler.content_batch_size = setting;
             let limit = scheduler_config(&cfg).content_batch_size;
-            assert_eq!(limit, setting.clamp(1, MAX_INDEX_BATCH_JOBS as u64) as usize);
+            assert_eq!(
+                limit,
+                setting.clamp(1, MAX_INDEX_BATCH_JOBS as u64) as usize
+            );
             let mut queue = VecDeque::from(vec![dummy_job(); MAX_INDEX_BATCH_JOBS + 1]);
             let selected = take_legacy_batch(&mut queue, limit);
             assert_eq!(selected.len(), limit);
@@ -960,8 +1066,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_pause_preserves_durable_work_and_does_not_block_cleanup()
-    -> anyhow::Result<()> {
+    async fn adaptive_pause_preserves_durable_work_and_does_not_block_cleanup() -> anyhow::Result<()>
+    {
         let _guard = TEST_LOCK.lock().await;
         let (mut cfg, expected_error) = blocked_dispatch_config()?;
         cfg.features.adaptive_scheduler = true;
@@ -988,17 +1094,24 @@ mod tests {
             since_state_change: Duration::from_secs(3600),
         };
         for _ in 0..2 {
-            runtime.tick_with_observation(idle, observed_load(0.0, 95.0)).await;
+            runtime
+                .tick_with_observation(idle, observed_load(0.0, 95.0))
+                .await;
             assert!(!content_admission_available());
             let pending = &runtime.pending_index.as_ref().unwrap().batch;
-            assert_eq!(serde_json::to_value(pending)?, serde_json::to_value(&batch)?);
+            assert_eq!(
+                serde_json::to_value(pending)?,
+                serde_json::to_value(&batch)?
+            );
             assert!(submission.as_mut().poll(&mut context).is_pending());
         }
         // Disabling the optional policy restores baseline behavior on the
         // next tick, without splitting the already-admitted four-job batch.
         cfg.features.adaptive_scheduler = false;
         core_types::config::set_current_config(cfg.clone())?;
-        runtime.tick_with_observation(idle, observed_load(0.0, 95.0)).await;
+        runtime
+            .tick_with_observation(idle, observed_load(0.0, 95.0))
+            .await;
         assert!(runtime.adaptive.is_none());
         assert!(runtime.pending_index.is_none());
         assert_eq!(submission.await.unwrap_err().to_string(), expected_error);
@@ -1012,9 +1125,14 @@ mod tests {
         };
         let mut submission = Box::pin(submit_index_batch(cleanup, None));
         assert!(submission.as_mut().poll(&mut context).is_pending());
-        runtime.tick_with_observation(idle, observed_load(0.0, 95.0)).await;
+        runtime
+            .tick_with_observation(idle, observed_load(0.0, 95.0))
+            .await;
         assert!(!content_admission_available());
-        assert!(runtime.pending_index.is_none(), "cleanup must still reach dispatch");
+        assert!(
+            runtime.pending_index.is_none(),
+            "cleanup must still reach dispatch"
+        );
         assert_eq!(submission.await.unwrap_err().to_string(), expected_error);
         Ok(())
     }
@@ -1043,7 +1161,10 @@ mod tests {
             cfg.features.adaptive_scheduler = true;
             core_types::config::set_current_config(cfg.clone())?;
             first_rx.await?;
-            anyhow::ensure!(!allowed.load(Ordering::Relaxed), "adaptive pressure was ignored");
+            anyhow::ensure!(
+                !allowed.load(Ordering::Relaxed),
+                "adaptive pressure was ignored"
+            );
             cfg.features.adaptive_scheduler = false;
             core_types::config::set_current_config(cfg)?;
             second_rx.await?;
@@ -1122,8 +1243,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_dispatch_refresh_applies_reload_and_revokes_the_old_hint()
-    -> anyhow::Result<()> {
+    async fn running_dispatch_refresh_applies_reload_and_revokes_the_old_hint() -> anyhow::Result<()>
+    {
         let _guard = TEST_LOCK.lock().await;
         let mut cfg = core_types::config::get_current_config();
         cfg.scheduler.idle_warm_seconds = 15;
@@ -1318,6 +1439,7 @@ mod tests {
             .try_send(Submission::IndexBatch(PendingIndexBatch {
                 batch: batch.clone(),
                 mutation_lease: None,
+                content_optional: false,
                 acknowledgement,
             }))
             .ok()
@@ -1435,9 +1557,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_content_admission_returns_a_typed_non_commit_and_metadata_still_dispatches()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        init_basic_status_provider();
+        let (cfg, expected_error) = blocked_dispatch_config()?;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        power_tick(&mut runtime, false).await;
+        assert!(
+            content_admission_available(),
+            "fixture must first expose an open hint"
+        );
+        let mut batch = IndexBatch {
+            id: uuid::Uuid::new_v4(),
+            jobs: vec![JobSpec {
+                operation: JobOperation::Reconcile,
+                ..dummy_job()
+            }],
+            reset_volumes: Vec::new(),
+        };
+        let mut submitted = Box::pin(submit_optional_index_batch(batch.clone(), None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(submitted.as_mut().poll(&mut context).is_pending());
+        power_tick(&mut runtime, true).await;
+        let error = submitted.await.unwrap_err();
+        assert!(
+            error.is::<ContentAdmissionDeferred>(),
+            "admission must survive the ACK channel as a distinct non-commit"
+        );
+        assert!(runtime.pending_index.is_none());
+        assert!(!PathBuf::from(&cfg.paths.content_index).exists());
+        assert!(
+            crate::status_snapshot()
+                .scheduler_state
+                .contains("waiting for AC power")
+        );
+
+        batch.jobs[0].operation = JobOperation::Delete;
+        batch.jobs[0].path = PathBuf::new();
+        let mut cleanup = Box::pin(submit_index_batch(batch, None));
+        assert!(cleanup.as_mut().poll(&mut context).is_pending());
+        power_tick(&mut runtime, true).await;
+        // The real dispatcher now attempts its filesystem prerequisite. It
+        // fails rather than acknowledging metadata that was never committed.
+        assert_eq!(cleanup.await.unwrap_err().to_string(), expected_error);
+        assert!(runtime.pending_index.is_none());
+        assert!(!content_admission_available());
+        Ok(())
+    }
+
+    #[test]
+    fn admission_diagnostics_distinguish_power_idle_and_load_pauses() {
+        let cfg = SchedulerConfig::default();
+        let ready = observed_load(0.0, 10.0);
+        let deep = scheduler::IdleState::DeepIdle;
+        for (idle, load, expected) in [
+            (
+                deep,
+                SystemLoad {
+                    on_battery: true,
+                    ..ready
+                },
+                "waiting for AC power (power_save_mode=true)",
+            ),
+            (
+                deep,
+                SystemLoad {
+                    game_mode: true,
+                    ..ready
+                },
+                "paused by Game Mode (power_save_mode=true)",
+            ),
+            (
+                scheduler::IdleState::Active,
+                ready,
+                "waiting for deep idle (or idle observation unavailable)",
+            ),
+            (
+                deep,
+                SystemLoad {
+                    cpu_percent: cfg.cpu_content_max,
+                    ..ready
+                },
+                "waiting for CPU load to fall below the configured limit",
+            ),
+            (
+                deep,
+                SystemLoad {
+                    disk_busy: true,
+                    ..ready
+                },
+                "waiting for disk activity to subside",
+            ),
+            (deep, ready, "ready"),
+        ] {
+            let allowed = content_allowed(idle, load, &cfg, None);
+            assert_eq!(allowed, expected == "ready");
+            assert_eq!(
+                content_admission_description(allowed, idle, load, &cfg),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn power_save_keeps_reconciliation_pending_until_extraction_is_allowed()
     -> anyhow::Result<()> {
         let _guard = TEST_LOCK.lock().await;
+        init_basic_status_provider();
         let (mut cfg, expected_error) = blocked_dispatch_config()?;
         let _restore = RestoreConfig::install(&cfg)?;
         let reconcile = JobSpec {
@@ -1470,6 +1698,11 @@ mod tests {
                 assert!(!content_admission_available());
                 assert_eq!(runtime.pending_index.as_ref().unwrap().batch.id, batch.id);
                 assert!(submission.as_mut().poll(&mut context).is_pending());
+                assert!(
+                    crate::status_snapshot()
+                        .scheduler_state
+                        .contains("waiting for AC power")
+                );
             }
 
             // Changing the real cached setting must affect the very next tick;
@@ -1478,6 +1711,11 @@ mod tests {
             core_types::config::set_current_config(cfg.clone())?;
             power_tick(&mut runtime, true).await;
             assert!(content_admission_available());
+            assert!(
+                crate::status_snapshot()
+                    .scheduler_state
+                    .contains("content_admission=ready")
+            );
             assert!(runtime.pending_index.is_none());
             let std::task::Poll::Ready(result) = submission.as_mut().poll(&mut context) else {
                 panic!("resumed dispatch did not return its acknowledgement");

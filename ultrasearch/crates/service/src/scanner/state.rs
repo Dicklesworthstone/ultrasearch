@@ -1,6 +1,8 @@
 //! Durable intent and checkpoints for the single journal ingestion lane.
 //!
 //! A checkpoint never describes queued work: it describes both committed indices.
+//! In v5, an eligible metadata document without a content document is durable
+//! enrichment debt. Filename coverage does not depend on optional extraction.
 //! The pending batch is written first and replayed after a crash. Replacements and
 //! deletions are idempotent, so a crash between the two index commits is safe.
 
@@ -20,7 +22,7 @@ use crate::scheduler_runtime::content_job_from_meta;
 
 pub(super) const BATCH_LIMIT: usize = 1024;
 pub(super) const MAX_DEFERRED_FILES: usize = 1024;
-const STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 5;
 const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETRY_DELAY_SECS: i64 = 300;
 
@@ -117,6 +119,11 @@ pub(super) struct PendingBatch {
     /// journal mutation supersedes the older per-file obligation.
     #[serde(default)]
     pub retry: bool,
+    /// Extraction may be replaced by a durable metadata-only transaction when
+    /// admission closes. This is not an acknowledgement: the replacement must
+    /// still run the worker and commit both physical receipts.
+    #[serde(default)]
+    pub content_optional: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,12 +191,18 @@ impl StateStore {
             let mut state: Checkpoints = serde_json::from_reader(file.take(MAX_STATE_BYTES))
                 .context("invalid ingestion state; refusing to guess volume identities")?;
             ensure!(
-                matches!(state.version, 2 | 3 | STATE_VERSION),
+                matches!(state.version, 2 | 3 | 4 | STATE_VERSION),
                 "unsupported ingestion state version"
             );
-            // Upgrade before publishing any deferred outcome. An older service
-            // rejects v4 rather than ignoring directory-repair anchors or retry
-            // obligations. Keep the existing path and stable volume IDs.
+            // Old pending observations can also finish as real content
+            // tombstones + metadata commits. Do not strand an upgrade behind
+            // yesterday's extraction admission policy.
+            if state.version < STATE_VERSION
+                && let Some(pending) = &mut state.pending
+            {
+                pending.content_optional = true;
+            }
+            // Older services must reject metadata-first coverage semantics.
             state.version = STATE_VERSION;
             validate_state(&state)?;
             Some(state)
@@ -556,6 +569,29 @@ impl StateStore {
         // oversized or invalid pending barrier before its durable write.
         atomic_write(&self.path, &bytes)?;
         self.state = admitted;
+        Ok(())
+    }
+
+    /// The scheduler explicitly declined extraction before launching a worker.
+    /// Preserve the transaction identity and observations, but durably replace
+    /// its operations with content tombstones. Replay ALWAYS reruns these jobs;
+    /// a receipt from an earlier extraction attempt is never accepted instead.
+    pub fn defer_pending_content(&mut self, expected: Uuid) -> Result<()> {
+        let mut deferred = self.state.clone();
+        let pending = deferred.pending.as_mut().context("no pending batch")?;
+        ensure!(
+            pending.worker.id == expected && pending.content_optional,
+            "content deferral does not own the optional pending batch"
+        );
+        make_metadata_only(pending);
+        validate_state(&deferred)?;
+        let bytes = serde_json::to_vec(&deferred)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_STATE_BYTES,
+            "metadata-only intent exceeds size limit"
+        );
+        atomic_write(&self.path, &bytes)?;
+        self.state = deferred;
         Ok(())
     }
 
@@ -1005,6 +1041,7 @@ fn largest_single_retry(meta: &FileMeta) -> Result<PendingBatch> {
         metadata: vec![MetadataChange::Upsert(meta.clone())],
         next_cursor: None,
         retry: true,
+        content_optional: true,
     })
 }
 
@@ -1300,6 +1337,7 @@ pub(super) fn make_pending(
         metadata: changes,
         next_cursor,
         retry: false,
+        content_optional: true,
     }
 }
 
@@ -1323,6 +1361,32 @@ pub(super) fn pending_for_volume(
         }
     }
     pending
+}
+
+/// Metadata observations invalidate old text immediately, independently of
+/// extraction admission. The missing content document itself retains the work
+/// for a later bounded enrichment sweep; it consumes no per-file retry slot.
+pub(super) fn pending_for_metadata(
+    volume: &VolumeInfo,
+    changes: Vec<MetadataChange>,
+    next_cursor: Option<JournalCursor>,
+    reset: bool,
+    cfg: &AppConfig,
+) -> PendingBatch {
+    let mut pending = pending_for_volume(volume, changes, next_cursor, reset, cfg);
+    make_metadata_only(&mut pending);
+    pending
+}
+
+fn make_metadata_only(pending: &mut PendingBatch) {
+    for job in &mut pending.worker.jobs {
+        job.operation = JobOperation::Delete;
+        job.path = PathBuf::new();
+        job.max_bytes = None;
+        job.max_chars = None;
+        job.file_size = 0;
+    }
+    pending.content_optional = false;
 }
 
 /// Flush the new file before replacing the old checkpoint. Windows rename does

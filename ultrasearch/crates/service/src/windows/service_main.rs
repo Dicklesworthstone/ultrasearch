@@ -10,6 +10,7 @@
 //! final teardown, as in the existing installed-service lifecycle.
 
 use crate::bootstrap::{BootstrapOptions, StartupStage, run_app_with_startup};
+use crate::logging::{flush_startup_diagnostics, record_startup_diagnostic};
 use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use std::ffi::OsString;
@@ -37,6 +38,7 @@ const START_GRACE: Duration = Duration::from_secs(120);
 const STOP_GRACE: Duration = Duration::from_secs(20);
 const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DIAGNOSTIC_FLUSH_GRACE: Duration = Duration::from_millis(500);
 // ERROR_SERVICE_REQUEST_TIMEOUT. A forced stop is not a clean application exit.
 const TIMEOUT_EXIT_CODE: u32 = 1053;
 
@@ -85,7 +87,10 @@ impl Lifecycle {
     }
 
     fn complete(&mut self, stage: StartupStage, now: Instant) -> Result<Option<ServiceStatus>> {
-        if matches!(self.state, ServiceState::StopPending | ServiceState::Stopped) {
+        if matches!(
+            self.state,
+            ServiceState::StopPending | ServiceState::Stopped
+        ) {
             return Ok(None);
         }
         ensure!(
@@ -118,7 +123,10 @@ impl Lifecycle {
     }
 
     fn stop(&mut self, now: Instant) -> Option<ServiceStatus> {
-        if matches!(self.state, ServiceState::StopPending | ServiceState::Stopped) {
+        if matches!(
+            self.state,
+            ServiceState::StopPending | ServiceState::Stopped
+        ) {
             return None;
         }
         self.state = ServiceState::StopPending;
@@ -144,6 +152,17 @@ impl Lifecycle {
     fn stop_expired(&self, now: Instant) -> bool {
         self.stop_started
             .is_some_and(|at| now.saturating_duration_since(at) >= STOP_GRACE)
+    }
+
+    fn diagnostic_flush_budget(&self, now: Instant) -> Duration {
+        let remaining = if let Some(started) = self.stop_started {
+            STOP_GRACE.saturating_sub(now.saturating_duration_since(started))
+        } else if self.state == ServiceState::StartPending {
+            START_GRACE.saturating_sub(now.saturating_duration_since(self.started))
+        } else {
+            DIAGNOSTIC_FLUSH_GRACE
+        };
+        remaining.min(DIAGNOSTIC_FLUSH_GRACE)
     }
 }
 
@@ -201,6 +220,22 @@ fn exit_code_for(outcome: AppOutcome, stop_requested: bool) -> u32 {
     }
 }
 
+fn outcome_failure(outcome: &AppOutcome, stop_requested: bool) -> Option<String> {
+    match outcome {
+        Ok(Ok(())) if stop_requested => None,
+        Ok(Ok(())) => Some("application returned without a stop request".into()),
+        Ok(Err(error)) => Some(format!("{error:#}")),
+        Err(payload) => Some(format!(
+            "application worker panicked: {}",
+            payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload")
+        )),
+    }
+}
+
 pub fn run_service() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let reporter = Arc::new(Mutex::new(Reporter {
@@ -244,23 +279,38 @@ pub fn run_service() -> Result<()> {
         .name("ultrasearch-app".into())
         .spawn(move || {
             let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-                let cfg = core_types::config::load_or_create_config(None)?;
+                dotenvy::dotenv().ok();
                 let cfg_path = core_types::config::default_config_path();
+                record_startup_diagnostic("configuration", "SCM registered; loading configuration");
+                let cfg = core_types::config::load_or_create_config(Some(&cfg_path)).with_context(
+                    || format!("configuration loading failed: {}", cfg_path.display()),
+                )?;
                 crate::ensure_config_acl_writable(&cfg_path);
-                run_app_with_startup(
-                    &cfg,
-                    shutdown_rx,
-                    BootstrapOptions::default(),
-                    |stage| app_reporter.lock().complete(stage),
-                )
+                run_app_with_startup(&cfg, shutdown_rx, BootstrapOptions::default(), |stage| {
+                    let progress = app_reporter.lock().complete(stage)?;
+                    if progress.is_continue() {
+                        record_startup_diagnostic("readiness", &format!("completed {stage:?}"));
+                    }
+                    Ok(progress)
+                })
             }));
             let _ = done_tx.send(outcome);
         });
     let _worker = match worker {
         Ok(worker) => worker,
         Err(error) => {
+            eprintln!("Cannot start service application thread: {error}");
+            record_startup_diagnostic(
+                "failed",
+                &format!("cannot start application thread: {error}"),
+            );
+            let flush_budget = reporter
+                .lock()
+                .lifecycle
+                .diagnostic_flush_budget(Instant::now());
+            flush_startup_diagnostics(flush_budget);
             reporter.lock().finish(1)?;
-            return Err(error).context("cannot start service application thread");
+            return Ok(());
         }
     };
 
@@ -268,12 +318,18 @@ pub fn run_service() -> Result<()> {
     let exit_code = loop {
         // Check absolute deadlines even when controls arrive repeatedly. Never
         // report fictitious initialization progress from this polling loop.
+        let mut timeout_diagnostic = None;
+        let mut stop_timed_out = false;
         {
             let mut reporter = reporter.lock();
             let now = Instant::now();
             if reporter.lifecycle.start_expired(now) {
                 startup_timed_out = true;
                 eprintln!("UltraSearch initialization exceeded {START_GRACE:?}; stopping");
+                timeout_diagnostic = Some(format!(
+                    "initialization exceeded {START_GRACE:?}; last completed stage: {:?}",
+                    reporter.lifecycle.stage
+                ));
                 if let Err(error) = reporter.stop(now) {
                     eprintln!("Cannot report timed-out initialization: {error:#}");
                 }
@@ -284,16 +340,37 @@ pub fn run_service() -> Result<()> {
             }
             if reporter.lifecycle.stop_expired(now) {
                 eprintln!("UltraSearch application did not stop within {STOP_GRACE:?}");
-                break TIMEOUT_EXIT_CODE;
+                timeout_diagnostic =
+                    Some(format!("application did not stop within {STOP_GRACE:?}"));
+                stop_timed_out = true;
             }
+        }
+        if let Some(message) = timeout_diagnostic {
+            record_startup_diagnostic("timeout", &message);
+        }
+        if stop_timed_out {
+            break TIMEOUT_EXIT_CODE;
         }
         match done_rx.recv_timeout(POLL_INTERVAL) {
             Ok(outcome) => {
-                let reporter = reporter.lock();
-                let code = exit_code_for(outcome, reporter.lifecycle.stop_started.is_some());
+                let (stop_requested, stage, reporting_failed) = {
+                    let reporter = reporter.lock();
+                    (
+                        reporter.lifecycle.stop_started.is_some(),
+                        reporter.lifecycle.stage,
+                        reporter.failed,
+                    )
+                };
+                if let Some(failure) = outcome_failure(&outcome, stop_requested) {
+                    record_startup_diagnostic(
+                        "failed",
+                        &format!("last completed stage: {stage:?}; {failure}"),
+                    );
+                }
+                let code = exit_code_for(outcome, stop_requested);
                 break if startup_timed_out {
                     TIMEOUT_EXIT_CODE
-                } else if reporter.failed {
+                } else if reporting_failed {
                     1
                 } else {
                     code
@@ -301,6 +378,7 @@ pub fn run_service() -> Result<()> {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 eprintln!("UltraSearch application vanished without reporting");
+                record_startup_diagnostic("failed", "application vanished without reporting");
                 break 1;
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -309,7 +387,28 @@ pub fn run_service() -> Result<()> {
 
     // This is the only terminal report. Late startup callbacks and repeated
     // controls see Stopped and cannot publish again on the closed SCM context.
-    reporter.lock().finish(exit_code)?;
+    record_startup_diagnostic("stopped", &format!("SCM exit code {exit_code}"));
+    // Normal failures (especially invalid config before tracing initializes)
+    // should reach disk before STOPPED: Windows may terminate the process as
+    // soon as that status is published. This wait cannot extend the absolute
+    // startup/stop grace, and forced deadline exits do not wait at all.
+    if exit_code != TIMEOUT_EXIT_CODE {
+        let flush_budget = reporter
+            .lock()
+            .lifecycle
+            .diagnostic_flush_budget(Instant::now());
+        flush_startup_diagnostics(flush_budget);
+    }
+    let final_status = reporter.lock().finish(exit_code);
+    if let Err(error) = final_status {
+        // A failed terminal status call must not re-enter the wrapper's normal
+        // failure flush, especially after the absolute stop deadline (1053).
+        // Enqueue evidence only; stderr/file IO belong to the detached writer.
+        record_startup_diagnostic(
+            "terminal status failure",
+            &format!("cannot publish final SCM status (exit {exit_code}): {error:#}"),
+        );
+    }
     Ok(())
 }
 
@@ -318,12 +417,32 @@ define_windows_service!(ffi_service_main, my_service_main);
 fn my_service_main(_arguments: Vec<OsString>) {
     if let Err(error) = run_service() {
         eprintln!("Service failed: {error:#}");
+        record_startup_diagnostic("host failure", &format!("{error:#}"));
+        flush_startup_diagnostics(DIAGNOSTIC_FLUSH_GRACE);
     }
 }
 
 /// Connect promptly to SCM; bootstrap happens only after handler registration.
 pub fn launch() -> Result<()> {
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main).map_err(|error| error.into())
+    service_dispatcher::start(SERVICE_NAME, ffi_service_main).map_err(dispatcher_error)
+}
+
+fn dispatcher_error(error: windows_service::Error) -> anyhow::Error {
+    let manual_launch = matches!(
+        &error,
+        windows_service::Error::Winapi(error) if error.raw_os_error() == Some(1063)
+    );
+    let error = anyhow::Error::new(error);
+    if manual_launch {
+        error.context(
+            "This executable was launched outside the Windows Service Control Manager (error 1063). \
+             Start the installed service with `sc.exe start UltraSearchService` from an elevated terminal. \
+             For interactive diagnostics, first stop the installed service and run this executable with `--console`. \
+             This manual-launch error does not report whether the installed service is healthy.",
+        )
+    } else {
+        error.context("cannot connect UltraSearchService to the Windows Service Control Manager")
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +455,69 @@ mod tests {
         StartupStage::IndexesReady,
         StartupStage::EndpointReady,
     ];
+
+    #[test]
+    fn manual_launch_error_preserves_1063_and_explains_the_two_launch_modes() {
+        let error = dispatcher_error(windows_service::Error::Winapi(
+            std::io::Error::from_raw_os_error(1063),
+        ));
+        let message = format!("{error:#}");
+        assert!(message.contains("sc.exe start UltraSearchService"));
+        assert!(message.contains("--console"));
+        assert!(message.contains("does not report whether the installed service is healthy"));
+        assert!(error.chain().any(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(1063))
+        }));
+        let other = dispatcher_error(windows_service::Error::Winapi(
+            std::io::Error::from_raw_os_error(5),
+        ));
+        assert!(!other.to_string().contains("manual-launch"));
+        assert!(!other.to_string().contains("--console"));
+    }
+
+    #[test]
+    fn diagnostics_retain_configuration_causes_and_unexpected_shutdowns() {
+        let failed = Ok(Err(anyhow::anyhow!("invalid TOML at line 3").context(
+            "configuration loading failed: C:\\ProgramData\\UltraSearch\\config\\config.toml",
+        )));
+        let message = outcome_failure(&failed, false).unwrap();
+        assert!(message.contains("configuration loading failed"));
+        assert!(message.contains("invalid TOML at line 3"));
+        assert!(outcome_failure(&Ok(Ok(())), true).is_none());
+        assert!(outcome_failure(&Ok(Ok(())), false).is_some());
+        assert_eq!(
+            outcome_failure(&Err(Box::new("fixture panic")), false).unwrap(),
+            "application worker panicked: fixture panic"
+        );
+    }
+
+    #[test]
+    fn diagnostic_flush_cannot_extend_startup_or_stop_deadlines() {
+        let start = Instant::now();
+        let mut state = Lifecycle::new(start);
+        assert_eq!(state.diagnostic_flush_budget(start), DIAGNOSTIC_FLUSH_GRACE);
+        assert_eq!(
+            state.diagnostic_flush_budget(start + START_GRACE - Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            state.diagnostic_flush_budget(start + START_GRACE),
+            Duration::ZERO
+        );
+        let stop = start + Duration::from_secs(1);
+        state.stop(stop);
+        assert_eq!(state.diagnostic_flush_budget(stop), DIAGNOSTIC_FLUSH_GRACE);
+        assert_eq!(
+            state.diagnostic_flush_budget(stop + STOP_GRACE - Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            state.diagnostic_flush_budget(stop + STOP_GRACE),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn running_requires_all_completed_stages_and_has_valid_status_fields() {
@@ -354,9 +536,11 @@ mod tests {
                 assert_eq!(status.current_state, ServiceState::Running);
                 assert_eq!(status.checkpoint, 0);
                 assert_eq!(status.wait_hint, Duration::ZERO);
-                assert!(status.controls_accepted.contains(
-                    ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
-                ));
+                assert!(
+                    status
+                        .controls_accepted
+                        .contains(ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN)
+                );
             } else {
                 assert_eq!(status.current_state, ServiceState::StartPending);
                 assert_eq!(status.checkpoint, index as u32 + 2);
@@ -381,10 +565,12 @@ mod tests {
             for second in 1..=20 {
                 let now = stopped_at + Duration::from_secs(second);
                 assert!(state.stop(now).is_none());
-                assert!(state
-                    .complete(StartupStage::EndpointReady, now)
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    state
+                        .complete(StartupStage::EndpointReady, now)
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(state.stop_started, Some(stopped_at));
                 assert_eq!(state.stop_expired(now), second >= 20);
             }
@@ -395,10 +581,12 @@ mod tests {
             assert_eq!(status.wait_hint, Duration::ZERO);
             assert!(state.finish(0).is_none());
             assert!(state.stop(stopped_at).is_none());
-            assert!(state
-                .complete(StartupStage::EndpointReady, stopped_at)
-                .unwrap()
-                .is_none());
+            assert!(
+                state
+                    .complete(StartupStage::EndpointReady, stopped_at)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -415,14 +603,19 @@ mod tests {
         assert!(state.complete(StartupStage::RuntimeReady, start).is_err());
         assert_eq!(state.checkpoint, 2);
         state
-            .complete(StartupStage::ConfigurationBound, start + Duration::from_secs(60))
+            .complete(
+                StartupStage::ConfigurationBound,
+                start + Duration::from_secs(60),
+            )
             .unwrap();
         state
             .complete(StartupStage::IndexesReady, start + Duration::from_secs(119))
             .unwrap();
-        assert!(state
-            .complete(StartupStage::EndpointReady, start + START_GRACE)
-            .is_err());
+        assert!(
+            state
+                .complete(StartupStage::EndpointReady, start + START_GRACE)
+                .is_err()
+        );
         assert_eq!(state.state, ServiceState::StartPending);
         assert!(state.start_expired(start + START_GRACE));
         assert_eq!(state.started, start);
@@ -434,13 +627,13 @@ mod tests {
         assert_eq!(exit_code_for(Ok(Ok(())), true), 0);
         for requested in [false, true] {
             assert_eq!(
-                exit_code_for(Ok(Err(anyhow::anyhow!("fixture startup failure"))), requested),
+                exit_code_for(
+                    Ok(Err(anyhow::anyhow!("fixture startup failure"))),
+                    requested
+                ),
                 1
             );
-            assert_eq!(
-                exit_code_for(Err(Box::new("fixture panic")), requested),
-                1
-            );
+            assert_eq!(exit_code_for(Err(Box::new("fixture panic")), requested), 1);
         }
     }
 }

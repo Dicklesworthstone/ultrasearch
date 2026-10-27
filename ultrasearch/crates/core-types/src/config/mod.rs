@@ -574,7 +574,11 @@ fn ensure_runtime_paths_unchanged(active: &AppConfig, candidate: &AppConfig) -> 
             &active.paths.jobs_dir,
             &candidate.paths.jobs_dir,
         ),
-        ("logging.file", &active.logging.file, &candidate.logging.file),
+        (
+            "logging.file",
+            &active.logging.file,
+            &candidate.logging.file,
+        ),
         (
             "semantic.index_dir",
             &active.semantic.index_dir,
@@ -666,9 +670,7 @@ fn apply_placeholders(cfg: &mut AppConfig) {
         &mut cfg.paths.jobs_dir,
         &mut cfg.semantic.index_dir,
     ] {
-        *path = expand_tokens(path, Some(&data_dir), true, |name| {
-            std::env::var(name).ok()
-        });
+        *path = expand_tokens(path, Some(&data_dir), true, |name| std::env::var(name).ok());
     }
 }
 
@@ -681,6 +683,7 @@ fn expand_env_vars(input: &str) -> String {
 
 /// Testable expansion over an explicit environment. Percent tokens are
 /// case-insensitive. `$HOME_CUSTOM` is one identifier, not a prefix of `$HOME`.
+#[cfg(test)]
 fn expand_env_vars_with<I>(input: &str, vars: I) -> String
 where
     I: IntoIterator<Item = (String, String)>,
@@ -725,17 +728,29 @@ fn expand_tokens(
                 break;
             };
             let name = &remaining[2..end];
-            let valid = name.as_bytes().first().is_some_and(|byte| starts_name(*byte))
+            let valid = name
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| starts_name(*byte))
                 && name.bytes().all(continues_name);
             Some((end + 1, valid.then_some(name.to_string())))
         } else if let Some(suffix) = remaining.strip_prefix('$') {
-            let length = suffix.bytes().take_while(|byte| continues_name(*byte)).count();
-            let valid = suffix.as_bytes().first().is_some_and(|byte| starts_name(*byte));
+            let length = suffix
+                .bytes()
+                .take_while(|byte| continues_name(*byte))
+                .count();
+            let valid = suffix
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| starts_name(*byte));
             Some((length + 1, valid.then(|| suffix[..length].to_string())))
         } else if windows_tokens && remaining.starts_with('%') {
             remaining[1..].find('%').map(|end| {
                 let name = &remaining[1..end + 1];
-                (end + 2, (!name.is_empty()).then(|| name.to_ascii_uppercase()))
+                (
+                    end + 2,
+                    (!name.is_empty()).then(|| name.to_ascii_uppercase()),
+                )
             })
         } else {
             None
@@ -755,7 +770,6 @@ fn expand_tokens(
     }
     out
 }
-
 
 /// Default configuration path for installed binaries: `%PROGRAMDATA%/UltraSearch/config/config.toml`.
 /// Falls back to a relative `config/config.toml` if PROGRAMDATA is missing (developer runs).
@@ -868,7 +882,10 @@ mod tests {
             assert_eq!(state.source.as_deref(), Some(source.as_path()));
             // A rejected alternate source cannot redirect a subsequent IPC
             // reload(None), even though the alternate file remains present.
-            assert_eq!(config_json(&state.reload(None).unwrap()), config_json(&active));
+            assert_eq!(
+                config_json(&state.reload(None).unwrap()),
+                config_json(&active)
+            );
         }
     }
 
@@ -892,10 +909,16 @@ mod tests {
             assert_eq!(state.source.as_deref(), Some(source.as_path()));
         }
         fs::rename(&source, root.join("retained-invalid.toml")).unwrap();
-        assert!(state.reload(None).is_err(), "missing is not successful idle reload");
+        assert!(
+            state.reload(None).is_err(),
+            "missing is not successful idle reload"
+        );
         assert_eq!(config_json(&state.value), config_json(&active));
         save_fixture(&source, &active);
-        assert_eq!(config_json(&state.reload(None).unwrap()), config_json(&active));
+        assert_eq!(
+            config_json(&state.reload(None).unwrap()),
+            config_json(&active)
+        );
     }
 
     #[test]
@@ -1009,8 +1032,16 @@ mod tests {
     #[test]
     fn unknown_and_malformed_expansion_tokens_are_preserved_verbatim() {
         for input in [
-            "$", "$9", "${}", "${MISSING}", "${MISSING", "%", "%%",
-            "%UNFINISHED", "%MISSING%", "λ/${HOME:-fallback}/🥁",
+            "$",
+            "$9",
+            "${}",
+            "${MISSING}",
+            "${MISSING",
+            "%",
+            "%%",
+            "%UNFINISHED",
+            "%MISSING%",
+            "λ/${HOME:-fallback}/🥁",
         ] {
             assert_eq!(expand_tokens(input, None, true, |_| None), input);
         }
@@ -1022,8 +1053,8 @@ mod tests {
 
     #[test]
     fn indexing_alias_loads_real_limits_and_rejects_ambiguous_duplicate_sections() {
-        let cfg = parse_config(&b"[indexing]\nmax_bytes_per_file = 1234\nmax_chars = 45\n"[..])
-            .unwrap();
+        let cfg =
+            parse_config(&b"[indexing]\nmax_bytes_per_file = 1234\nmax_chars = 45\n"[..]).unwrap();
         assert_eq!(cfg.extract.max_bytes_per_file, 1234);
         assert_eq!(cfg.extract.max_chars_per_file, 45);
         assert!(parse_config(&b"[indexing]\n[extract]\n"[..]).is_err());
@@ -1094,8 +1125,16 @@ mod tests {
         let result = worker.join().unwrap();
         assert_eq!(visible, Some(config_json(&original)));
         assert!(rebound.is_some_and(|result| result.is_ok()));
-        assert!(result.unwrap_err().to_string().contains("changed during reload"));
-        assert_eq!(config_json(&state.read().unwrap().value), config_json(&restarted));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("changed during reload")
+        );
+        assert_eq!(
+            config_json(&state.read().unwrap().value),
+            config_json(&restarted)
+        );
     }
 
     #[test]
@@ -1107,7 +1146,13 @@ mod tests {
         let active = state.reload(Some(&source)).unwrap();
         state.revision = u64::MAX;
         let source = state.source.clone();
-        assert!(state.reload(None).unwrap_err().to_string().contains("revision exhausted"));
+        assert!(
+            state
+                .reload(None)
+                .unwrap_err()
+                .to_string()
+                .contains("revision exhausted")
+        );
         assert!(state.bind_runtime(active.clone()).is_err());
         assert_eq!(state.revision, u64::MAX);
         assert_eq!(state.source, source);
@@ -1181,7 +1226,10 @@ mod tests {
             assert!(state.runtime_bound);
             assert_eq!(state.revision, revision);
         }
-        assert_eq!(config_json(&state.reload(None).unwrap()), config_json(&active));
+        assert_eq!(
+            config_json(&state.reload(None).unwrap()),
+            config_json(&active)
+        );
 
         // A corrected file is accepted without restarting or reinitializing
         // the state, and all of its settings are published together.

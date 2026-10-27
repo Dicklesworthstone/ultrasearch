@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use core_types::config::AppConfig;
 use ipc::VolumeStatus;
 use tokio::sync::mpsc;
@@ -69,8 +69,9 @@ pub fn run_app_with_startup(
     opts: BootstrapOptions,
     mut notify: impl FnMut(StartupStage) -> Result<ControlFlow<()>>,
 ) -> Result<()> {
-    cfg.validate()?;
-    let _guard = init_tracing_with_config(&cfg.logging)?;
+    cfg.validate().context("validate service configuration")?;
+    let _guard = init_tracing_with_config(&cfg.logging)
+        .with_context(|| format!("initialize service log {}", cfg.logging.file))?;
     // Opt-in crash reports for the service host. The hook is process-wide and
     // idempotent, so a same-process restart does not stack hooks.
     core_types::install_opt_in_crash_hook("service");
@@ -78,12 +79,13 @@ pub fn run_app_with_startup(
     // The resident service answers interactive queries and advances journals.
     // Only extraction workers enter idle/background scheduling. Apply before
     // spawning runtime threads, and report OS failures instead of hiding them.
-    apply_service_priorities()?;
+    apply_service_priorities().context("initialize service process priorities")?;
 
     // Initialize Tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .context("create service runtime")?;
     let _rt_guard = rt.enter();
     if notify(StartupStage::RuntimeReady)?.is_break() {
         return Ok(());
@@ -111,11 +113,17 @@ pub fn run_app_with_startup(
     // over the unrelated default configuration file.
     let cfg_owned = cfg.clone();
     ensure_data_paths_exist(&cfg_owned)?;
-    core_types::config::set_current_config(cfg_owned.clone())?;
+    core_types::config::set_current_config(cfg_owned.clone())
+        .context("publish active service configuration")?;
     if notify(StartupStage::ConfigurationBound)?.is_break() {
         return Ok(());
     }
-    let ingestion = initialize_indexes(&cfg_owned)?;
+    let ingestion = initialize_indexes(&cfg_owned).with_context(|| {
+        format!(
+            "initialize indexes (metadata={}, content={}, state={})",
+            cfg_owned.paths.meta_index, cfg_owned.paths.content_index, cfg_owned.paths.state_dir,
+        )
+    })?;
     if notify(StartupStage::IndexesReady)?.is_break() {
         return Ok(());
     }
@@ -159,13 +167,21 @@ pub fn run_app_with_startup(
 
     // Schema migration was completed before starting writers. Do not rename an
     // index out from under an active worker based on an error-string heuristic.
-    let handler = crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path)?;
+    let handler = crate::search_handler::UnifiedSearchHandler::try_new(meta_path, content_path)
+        .with_context(|| {
+            format!(
+                "open search readers (metadata={}, content={})",
+                meta_path.display(),
+                content_path.display(),
+            )
+        })?;
     set_search_handler(Box::new(handler));
 
     let mut tasks = ServiceTasks::default();
     #[cfg(target_os = "windows")]
     {
-        tasks.listener = Some(rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref()))?);
+        tasks.listener =
+            Some(rt.block_on(crate::ipc::start_pipe_server(opts.pipe_name.as_deref()))?);
     }
 
     // The endpoint is owned and index readers are installed. Signal this
@@ -224,7 +240,10 @@ impl ServiceTasks {
     ) -> Result<()> {
         // Optional loops stay pending rather than producing a false exit in
         // non-Windows/test bootstrap. The scheduler is never optional.
-        anyhow::ensure!(self.scheduler.is_some(), "service scheduler was not started");
+        anyhow::ensure!(
+            self.scheduler.is_some(),
+            "service scheduler was not started"
+        );
         let mut outcome = tokio::select! {
             // A known failure must not be hidden by a simultaneously queued
             // stop signal. Unexpected success is also a failure for these loops.
@@ -302,7 +321,9 @@ fn unexpected_exit(
     match outcome {
         Ok(Ok(())) => anyhow::anyhow!("essential {name} task returned unexpectedly"),
         Ok(Err(error)) => error.context(format!("essential {name} task failed")),
-        Err(error) => anyhow::Error::new(error).context(format!("essential {name} task terminated")),
+        Err(error) => {
+            anyhow::Error::new(error).context(format!("essential {name} task terminated"))
+        }
     }
 }
 
@@ -337,10 +358,12 @@ fn ensure_data_paths_exist(cfg: &AppConfig) -> Result<()> {
     for p in paths {
         let path = std::path::Path::new(p);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create service data parent {}", parent.display()))?;
         }
         // If path itself is meant to be a directory (indexes/dirs), create it too.
-        fs::create_dir_all(path)?;
+        fs::create_dir_all(path)
+            .with_context(|| format!("create service data directory {}", path.display()))?;
     }
     Ok(())
 }
@@ -415,7 +438,10 @@ mod tests {
         }
     }
 
-    fn guarded_task<T: Send + 'static>(finish: bool, outcome: T) -> (JoinHandle<T>, Arc<AtomicBool>) {
+    fn guarded_task<T: Send + 'static>(
+        finish: bool,
+        outcome: T,
+    ) -> (JoinHandle<T>, Arc<AtomicBool>) {
         let dropped = Arc::new(AtomicBool::new(false));
         // Capture the guard before spawn: cancellation before the first poll
         // must also destroy the owned state rather than detach it.
@@ -568,7 +594,10 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     states,
-                    ["stopping: shutdown requested", "stopped: shutdown requested"]
+                    [
+                        "stopping: shutdown requested",
+                        "stopped: shutdown requested"
+                    ]
                 );
                 assert!(scheduler_dropped.load(Ordering::SeqCst));
                 for dropped in [watcher_dropped, listener_dropped].into_iter().flatten() {
@@ -672,8 +701,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_service_keeps_detached_blocking_writer_lease_until_writer_finishes() -> Result<()>
-    {
+    async fn failed_service_keeps_detached_blocking_writer_lease_until_writer_finishes()
+    -> Result<()> {
         use tokio::sync::oneshot;
 
         let root = tempfile::tempdir()?;
@@ -683,7 +712,9 @@ mod tests {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        lease.try_lock()?;
+        lease
+            .try_lock()
+            .context("acquire blocking writer fixture lease")?;
         let contender = fs::OpenOptions::new().read(true).write(true).open(&path)?;
         let (release, released) = std::sync::mpsc::channel();
         let (started, running) = oneshot::channel();
@@ -735,14 +766,27 @@ mod tests {
             writer_released,
             "fixture writer timed out instead of receiving its release"
         );
-        contender.try_lock()?;
+        // Parallel subprocess tests can briefly inherit this descriptor between
+        // fork and exec. Completion proves the writer dropped its lease; still
+        // require actual OS lock ownership within a bounded deadline.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if contender.try_lock().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("reacquire fixture lease after the blocking writer dropped it")?;
         Ok(())
     }
 
     struct ChildGuard(Child);
 
     #[test]
-    fn startup_readiness_requires_real_readers_and_endpoint_and_allows_cancellation() -> Result<()> {
+    fn startup_readiness_requires_real_readers_and_endpoint_and_allows_cancellation() -> Result<()>
+    {
         const ROOT: &str = "ULTRASEARCH_STARTUP_READY_TEST_ROOT";
         const MODE: &str = "ULTRASEARCH_STARTUP_READY_TEST_MODE";
         const PROOF: &[u8] = b"startup-readiness-assertions-executed";
@@ -751,6 +795,24 @@ mod tests {
             let mode = std::env::var(MODE)?;
             let cfg = core_types::config::load_or_create_config(Some(&root.join("config.toml")))?;
             let pipe_name = format!(r"\\.\pipe\ultrasearch-ready-{}", uuid::Uuid::new_v4());
+            let seeded = mode == "seeded-search";
+            let initial_metas = if seeded {
+                let path = root.join("startupreadiness.txt");
+                fs::write(&path, b"readiness search fixture")?;
+                Some(vec![core_types::FileMeta::new(
+                    core_types::DocKey::from_parts(1, 42),
+                    1,
+                    None,
+                    "startupreadiness.txt".into(),
+                    Some(path.to_str().context("non-UTF-8 fixture path")?.into()),
+                    fs::metadata(&path)?.len(),
+                    0,
+                    0,
+                    core_types::FileFlags::empty(),
+                )])
+            } else {
+                None
+            };
             let (shutdown, receiver) = mpsc::channel(1);
             shutdown.try_send(())?;
             let mut stages = Vec::new();
@@ -758,7 +820,10 @@ mod tests {
                 &cfg,
                 receiver,
                 BootstrapOptions {
-                    skip_initial_ingest: true,
+                    initial_metas,
+                    // Cancel production ingestion at the endpoint before any
+                    // native volume enumeration or writer can start.
+                    skip_initial_ingest: mode != "before-ingest",
                     pipe_name: Some(pipe_name.clone()),
                     ..BootstrapOptions::default()
                 },
@@ -778,29 +843,77 @@ mod tests {
                         // service instance answering on the default endpoint.
                         tantivy::Index::open_in_dir(&cfg.paths.meta_index)?;
                         tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+                        if mode == "before-ingest" {
+                            let state: serde_json::Value = serde_json::from_slice(&fs::read(
+                                Path::new(&cfg.paths.state_dir).join("ingestion-v2.json"),
+                            )?)?;
+                            ensure!(state["volumes"].as_array().is_some_and(Vec::is_empty));
+                            ensure!(state["pending"].is_null());
+                            ensure!(crate::status_snapshot().last_index_commit_ts.is_none());
+                        }
+                        let request = ipc::SearchRequest {
+                            id: uuid::Uuid::new_v4(),
+                            query: ipc::QueryExpr::Term(ipc::TermExpr {
+                                field: Some(ipc::FieldKind::Name),
+                                value: "startupreadiness".into(),
+                                modifier: ipc::TermModifier::Term,
+                            }),
+                            limit: 10,
+                            mode: ipc::SearchMode::NameOnly,
+                            timeout: Some(Duration::from_secs(2)),
+                            offset: 0,
+                        };
+                        let response = crate::search(request.clone());
+                        response.validate_for(request.id)?;
+                        ensure!(response.total == u64::from(seeded));
+                        ensure!(response.hits.len() == usize::from(seeded));
                         #[cfg(windows)]
                         {
-                            use tokio::net::windows::named_pipe::ClientOptions;
-                            let _client = ClientOptions::new().open(&pipe_name)?;
+                            let pipe_name = pipe_name.clone();
+                            std::thread::spawn(move || -> Result<()> {
+                                tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()?
+                                    .block_on(async {
+                                        let client = ipc::client::PipeClient::new(pipe_name)
+                                            .with_request_timeout(Duration::from_secs(5));
+                                        let status = client
+                                            .status(ipc::StatusRequest {
+                                                id: uuid::Uuid::new_v4(),
+                                            })
+                                            .await?;
+                                        ensure!(status.last_index_commit_ts.is_some() == seeded);
+                                        let response = client.search(request).await?;
+                                        ensure!(response.total == u64::from(seeded));
+                                        ensure!(response.hits.len() == usize::from(seeded));
+                                        Ok(())
+                                    })
+                            })
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("readiness client thread panicked"))??;
                         }
                         if mode == "endpoint-error" {
                             anyhow::bail!("fixture endpoint acknowledgement failed");
+                        }
+                        if mode == "before-ingest" || seeded {
+                            return Ok(ControlFlow::Break(()));
                         }
                     }
                     Ok(ControlFlow::Continue(()))
                 },
             );
             match mode.as_str() {
-                "success" | "endpoint-error" => {
+                "success" | "endpoint-error" | "before-ingest" | "seeded-search" => {
                     ensure!(
-                        stages == [
-                            StartupStage::RuntimeReady,
-                            StartupStage::ConfigurationBound,
-                            StartupStage::IndexesReady,
-                            StartupStage::EndpointReady,
-                        ]
+                        stages
+                            == [
+                                StartupStage::RuntimeReady,
+                                StartupStage::ConfigurationBound,
+                                StartupStage::IndexesReady,
+                                StartupStage::EndpointReady,
+                            ]
                     );
-                    if mode == "success" {
+                    if mode != "endpoint-error" {
                         result?;
                     } else {
                         ensure!(
@@ -817,6 +930,10 @@ mod tests {
                         let error = result.expect_err("startup failure must not report success");
                         if mode == "report-error" {
                             ensure!(format!("{error:#}").contains("startup reporter failed"));
+                        } else if mode == "path-error" {
+                            let diagnostic = format!("{error:#}");
+                            ensure!(diagnostic.contains("create service data directory"));
+                            ensure!(diagnostic.contains(&cfg.paths.meta_index));
                         }
                     }
                     if mode != "path-error" {
@@ -833,7 +950,13 @@ mod tests {
         // Each child owns its tracing/configuration/runtime/native-priority
         // state. A proof file prevents an empty --exact selection from passing.
         for mode in [
-            "success", "path-error", "cancel", "report-error", "endpoint-error",
+            "success",
+            "path-error",
+            "cancel",
+            "report-error",
+            "endpoint-error",
+            "before-ingest",
+            "seeded-search",
         ] {
             let root = tempfile::tempdir()?.keep();
             let mut cfg = AppConfig::default();
@@ -848,8 +971,14 @@ mod tests {
                 cfg.paths.meta_index = path.to_str().context("non-UTF-8 fixture")?.into();
             }
             fs::write(root.join("config.toml"), toml::to_string_pretty(&cfg)?)?;
-            let name = concat!(module_path!(), "::startup_readiness_requires_real_readers_and_endpoint_and_allows_cancellation");
-            let name = name.split_once("::").context("test crate prefix missing")?.1;
+            let name = concat!(
+                module_path!(),
+                "::startup_readiness_requires_real_readers_and_endpoint_and_allows_cancellation"
+            );
+            let name = name
+                .split_once("::")
+                .context("test crate prefix missing")?
+                .1;
             let mut child = ChildGuard(
                 Command::new(std::env::current_exe()?)
                     .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -906,15 +1035,30 @@ mod tests {
                 receiver,
                 BootstrapOptions {
                     skip_initial_ingest: true,
-                    pipe_name: Some(format!(r"\\.\pipe\ultrasearch-bootstrap-{}", uuid::Uuid::new_v4())),
+                    pipe_name: Some(format!(
+                        r"\\.\pipe\ultrasearch-bootstrap-{}",
+                        uuid::Uuid::new_v4()
+                    )),
                     ..BootstrapOptions::default()
                 },
             )?;
             let active = core_types::config::get_current_config();
-            ensure!(active.volumes.is_empty(), "startup froze automatic metadata scope");
-            ensure!(active.content_index_volumes.is_empty(), "startup froze automatic content scope");
-            ensure!(fs::read(&source)? == source_before, "startup rewrote its custom source");
-            ensure!(fs::read(&default_path)? == default_before, "startup overwrote the default configuration");
+            ensure!(
+                active.volumes.is_empty(),
+                "startup froze automatic metadata scope"
+            );
+            ensure!(
+                active.content_index_volumes.is_empty(),
+                "startup froze automatic content scope"
+            );
+            ensure!(
+                fs::read(&source)? == source_before,
+                "startup rewrote its custom source"
+            );
+            ensure!(
+                fs::read(&default_path)? == default_before,
+                "startup overwrote the default configuration"
+            );
             // The default file is deliberately invalid. Reload(None) must use
             // the custom source retained by the production configuration API.
             let mut next = cfg.clone();
@@ -932,13 +1076,30 @@ mod tests {
         let root = tempfile::tempdir()?.keep();
         let program_data = root.join("system-data");
         let default_path = program_data.join("UltraSearch/config/config.toml");
-        fs::create_dir_all(default_path.parent().context("default config parent missing")?)?;
-        fs::write(&default_path, b"unrelated configuration: preserve these exact bytes")?;
+        fs::create_dir_all(
+            default_path
+                .parent()
+                .context("default config parent missing")?,
+        )?;
+        fs::write(
+            &default_path,
+            b"unrelated configuration: preserve these exact bytes",
+        )?;
         let mut cfg = AppConfig::default();
-        cfg.app.data_dir = root.join("test-data").to_str().context("fixture path is not UTF-8")?.into();
+        cfg.app.data_dir = root
+            .join("test-data")
+            .to_str()
+            .context("fixture path is not UTF-8")?
+            .into();
         fs::write(root.join("custom.toml"), toml::to_string_pretty(&cfg)?)?;
-        let name = concat!(module_path!(), "::startup_preserves_automatic_scope_and_the_custom_configuration_source");
-        let name = name.split_once("::").context("test crate prefix missing")?.1;
+        let name = concat!(
+            module_path!(),
+            "::startup_preserves_automatic_scope_and_the_custom_configuration_source"
+        );
+        let name = name
+            .split_once("::")
+            .context("test crate prefix missing")?
+            .1;
         let mut child = ChildGuard(
             Command::new(std::env::current_exe()?)
                 .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -949,11 +1110,20 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = child.0.try_wait()? {
-                ensure!(status.success(), "bootstrap regression child failed: {status}");
-                ensure!(fs::read(root.join("proof.txt"))? == PROOF, "bootstrap assertions did not execute");
+                ensure!(
+                    status.success(),
+                    "bootstrap regression child failed: {status}"
+                );
+                ensure!(
+                    fs::read(root.join("proof.txt"))? == PROOF,
+                    "bootstrap assertions did not execute"
+                );
                 return Ok(());
             }
-            ensure!(Instant::now() < deadline, "bootstrap regression child timed out");
+            ensure!(
+                Instant::now() < deadline,
+                "bootstrap regression child timed out"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
