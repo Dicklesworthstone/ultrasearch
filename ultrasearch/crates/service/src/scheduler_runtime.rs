@@ -423,29 +423,70 @@ impl SchedulerRuntime {
         }
         while self.content_jobs.len() < MAX_CONTENT_QUEUE {
             match self.job_rx.try_recv() {
-                Ok(Submission::Content(job)) => {
-                    // Capacity was checked before receiving, so an accepted
-                    // channel submission cannot disappear at a second queue.
-                    let size_hint = job.file_size;
-                    self.content_jobs.push_back(job);
-                    self.live.enqueued_content.fetch_add(1, Ordering::Relaxed);
-                    increment_content_plan(1, size_hint);
-                }
-                Ok(Submission::IndexBatch(pending)) => {
-                    self.pending_index = Some(pending);
-                    break;
+                Ok(submission) => {
+                    self.accept_submission(submission);
+                    if self.pending_index.is_some() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
         }
     }
 
-    pub async fn run_loop(mut self) {
+    fn accept_submission(&mut self, submission: Submission) {
+        match submission {
+            Submission::Content(job) => {
+                // Both receive paths check capacity before accepting a job.
+                // Never consume a later submission across a durable barrier.
+                let size_hint = job.file_size;
+                self.content_jobs.push_back(job);
+                self.live.enqueued_content.fetch_add(1, Ordering::Relaxed);
+                increment_content_plan(1, size_hint);
+            }
+            Submission::IndexBatch(pending) => self.pending_index = Some(pending),
+        }
+    }
+
+    pub async fn run_loop(self) {
         let mut interval = tokio::time::interval(OBSERVATION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        self.run_loop_with_interval(interval).await;
+    }
+
+    async fn run_loop_with_interval(mut self, mut interval: tokio::time::Interval) {
         loop {
-            interval.tick().await;
-            self.tick().await;
+            let can_receive =
+                self.pending_index.is_none() && self.content_jobs.len() < MAX_CONTENT_QUEUE;
+            tokio::select! {
+                // Resource observations retain their cadence even with a
+                // continuous stream of work. Rapid metadata batches must not
+                // re-prime native rate counters or reuse an old idle decision
+                // to launch extraction between observation ticks.
+                biased;
+                _ = interval.tick() => self.tick().await,
+                Some(submission) = self.job_rx.recv(), if can_receive => {
+                    self.accept_submission(submission);
+                    self.receive_submissions();
+                    self.update_live_counts();
+                    // The scanner commits bounded 128-record pages. Waiting
+                    // for the resource timer between every page caps an entire
+                    // baseline at 128 records/sec before any actual I/O. Wake
+                    // immediately for metadata-only transactions, preserving
+                    // older legacy work and every durable ordering barrier.
+                    // Extraction and failed legacy retries still wait for the
+                    // next fresh policy observation instead of busy-looping.
+                    if self.content_jobs.is_empty()
+                        && self.legacy_retry.is_none()
+                        && self.pending_index.as_ref().is_some_and(|pending| {
+                            !requires_content(&pending.batch)
+                        })
+                    {
+                        self.dispatch_pending_index(&mut |idle, load| (idle.sample(), load.sample()))
+                            .await;
+                    }
+                }
+            }
         }
     }
 
@@ -586,6 +627,13 @@ impl SchedulerRuntime {
             return;
         }
 
+        self.dispatch_pending_index(&mut sample).await;
+    }
+
+    async fn dispatch_pending_index(
+        &mut self,
+        sample: &mut impl FnMut(&mut IdleTracker, &mut SystemLoadSampler) -> (IdleSample, SystemLoad),
+    ) {
         if let Some(pending) = self.pending_index.take() {
             self.live.active_workers.fetch_add(1, Ordering::Relaxed);
             self.publish_active_workers();
@@ -596,7 +644,7 @@ impl SchedulerRuntime {
                 &mut self.load,
                 &self.allow_content,
                 self.force_allow_content,
-                &mut sample,
+                sample,
                 &mut self.adaptive,
             )
             .await;
@@ -841,6 +889,237 @@ mod tests {
                 },
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn metadata_arrival_wakes_dispatch_without_waiting_for_resource_poll()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let (cfg, expected_error) = blocked_dispatch_config()?;
+        let _restore = RestoreConfig::install(&cfg)?;
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        power_tick(&mut runtime, true).await;
+        assert!(!content_admission_available());
+
+        // Keep the next observation outside the watchdog. Completion must
+        // come from a channel wake, not a lucky position in a one-second tick.
+        let interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let runner = runtime.run_loop_with_interval(interval);
+        tokio::pin!(runner);
+        let submissions = async {
+            for (jobs, reset_volumes) in [
+                (
+                    vec![JobSpec {
+                        operation: JobOperation::Delete,
+                        path: PathBuf::new(),
+                        ..dummy_job()
+                    }],
+                    Vec::new(),
+                ),
+                (Vec::new(), vec![1]),
+                (Vec::new(), Vec::new()),
+            ] {
+                let error = submit_index_batch(
+                    IndexBatch {
+                        id: uuid::Uuid::new_v4(),
+                        jobs,
+                        reset_volumes,
+                    },
+                    None,
+                )
+                .await
+                .expect_err("real dispatch prerequisite must fail, never acknowledge a commit");
+                assert_eq!(error.to_string(), expected_error);
+                assert!(!content_admission_available());
+            }
+        };
+        tokio::select! {
+            _ = &mut runner => panic!("scheduler unexpectedly returned"),
+            result = tokio::time::timeout(Duration::from_secs(5), submissions) => {
+                result.expect("metadata dispatch waited for the observation timer");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arrival_wake_preserves_extraction_policy_and_durable_fifo_barriers()
+    -> anyhow::Result<()> {
+        let _guard = TEST_LOCK.lock().await;
+        let (cfg, _) = blocked_dispatch_config()?;
+        let _restore = RestoreConfig::install(&cfg)?;
+        for earlier_legacy in [false, true] {
+            let mut runtime = SchedulerRuntime::new(&cfg);
+            power_tick(&mut runtime, true).await;
+            // Even an old open hint cannot authorize extraction between fresh
+            // observations. Metadata cannot overtake previously queued work.
+            runtime.allow_content.store(true, Ordering::Relaxed);
+            let sender = submission_sender().expect("runtime publishes sender");
+            if earlier_legacy {
+                assert!(enqueue_content_job(dummy_job()));
+            }
+            let (acknowledgement, mut response) = oneshot::channel();
+            let batch = IndexBatch {
+                id: uuid::Uuid::new_v4(),
+                jobs: vec![JobSpec {
+                    operation: if earlier_legacy {
+                        JobOperation::Delete
+                    } else {
+                        JobOperation::Reconcile
+                    },
+                    file_id: 20,
+                    ..dummy_job()
+                }],
+                reset_volumes: Vec::new(),
+            };
+            assert!(
+                sender
+                    .try_send(Submission::IndexBatch(PendingIndexBatch {
+                        batch,
+                        mutation_lease: None,
+                        content_optional: false,
+                        acknowledgement,
+                    }))
+                    .is_ok(),
+                "available channel capacity"
+            );
+            assert!(enqueue_content_job(JobSpec {
+                file_id: 30,
+                ..dummy_job()
+            }));
+            let interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let mut runner = Box::pin(runtime.run_loop_with_interval(interval));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(runner.as_mut().poll(&mut context).is_pending());
+            assert_eq!(sender.capacity(), MAX_PENDING_SUBMISSIONS - 1);
+            assert!(matches!(
+                response.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                LIVE_STATE.get().unwrap().content.load(Ordering::Relaxed),
+                1 + usize::from(earlier_legacy),
+            );
+            // Repeated polling cannot retry, consume the newer job, or admit
+            // extraction. Cancellation drops the ownership without a fake ACK.
+            assert!(runner.as_mut().poll(&mut context).is_pending());
+            assert_eq!(sender.capacity(), MAX_PENDING_SUBMISSIONS - 1);
+            drop(runner);
+            assert!(matches!(
+                response.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ULTRASEARCH_WORKER_PATH pointing to a real built index-worker binary"]
+    async fn real_worker_commits_metadata_batches_between_observation_ticks() -> anyhow::Result<()>
+    {
+        let _guard = TEST_LOCK.lock().await;
+        dotenvy::dotenv().ok();
+        let worker = PathBuf::from(std::env::var("ULTRASEARCH_WORKER_PATH")?);
+        anyhow::ensure!(
+            worker.is_file(),
+            "build index-worker before this regression"
+        );
+        let root = tempfile::tempdir()?.keep();
+        eprintln!(
+            "retaining real scheduler/worker artifacts at {}",
+            root.display()
+        );
+        let mut cfg = AppConfig::default();
+        cfg.paths.jobs_dir = root.join("jobs").to_string_lossy().into_owned();
+        cfg.paths.content_index = root.join("content").to_string_lossy().into_owned();
+        let _restore = RestoreConfig::install(&cfg)?;
+        let index = content_index::open_or_create(std::path::Path::new(&cfg.paths.content_index))?;
+        let mut writer = content_index::create_writer(
+            &index,
+            &content_index::WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        for file_id in [1, 2] {
+            content_index::add_content_doc(
+                &mut writer,
+                &index.fields,
+                &content_index::ContentDoc {
+                    key: DocKey::from_parts(1, file_id),
+                    volume: 1,
+                    name: Some(format!("obsolete-{file_id}.txt")),
+                    path: Some(format!("C:\\obsolete-{file_id}.txt")),
+                    ext: Some("txt".into()),
+                    size: 4,
+                    created: 1,
+                    modified: 1,
+                    flags: 0,
+                    content_lang: None,
+                    content: "stale content to remove".into(),
+                },
+            )?;
+        }
+        content_index::commit_batch(&mut writer, uuid::Uuid::new_v4())?;
+        drop(writer);
+        assert_eq!(content_index::open_reader(&index)?.searcher().num_docs(), 2);
+        let mut previous = content_index::batch_receipt(&index.index)?.unwrap();
+        let mut runtime = SchedulerRuntime::new(&cfg);
+        power_tick(&mut runtime, true).await;
+        assert!(!content_admission_available());
+        let interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+        let runner = runtime.run_loop_with_interval(interval);
+        tokio::pin!(runner);
+        let submissions = async {
+            for (jobs, reset_volumes, remaining) in [
+                (
+                    vec![JobSpec {
+                        operation: JobOperation::Delete,
+                        path: PathBuf::new(),
+                        ..dummy_job()
+                    }],
+                    Vec::new(),
+                    1,
+                ),
+                (Vec::new(), vec![1], 0),
+                (Vec::new(), Vec::new(), 0),
+            ] {
+                let batch = IndexBatch {
+                    id: uuid::Uuid::new_v4(),
+                    jobs,
+                    reset_volumes,
+                };
+                submit_index_batch(batch.clone(), None).await?;
+                let outcome = content_index::batch_outcome(&index.index)?
+                    .ok_or_else(|| anyhow::anyhow!("real worker did not leave a receipt"))?;
+                assert_eq!(outcome.receipt.batch_id, batch.id);
+                assert!(outcome.receipt.complete);
+                assert_ne!(outcome.receipt.commit_id, previous.commit_id);
+                assert!(outcome.deferred.is_empty());
+                assert_eq!(
+                    content_index::open_reader(&index)?.searcher().num_docs(),
+                    remaining,
+                );
+                previous = outcome.receipt;
+            }
+            anyhow::Ok(())
+        };
+        tokio::select! {
+            _ = &mut runner => panic!("scheduler unexpectedly returned"),
+            result = tokio::time::timeout(Duration::from_secs(30), submissions) => {
+                result.expect("real commits waited for the five-minute observation timer")?;
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

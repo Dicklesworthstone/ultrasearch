@@ -358,6 +358,9 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
             .map(|mount| format!("configured volume {mount} is unavailable or not NTFS"))
             .collect();
         let mut retry_volumes = Vec::new();
+        // Capacity recovery may retry old obligations after a failed read;
+        // fresh enrichment requires a successful journal turn for its source.
+        let mut enrichment_volumes = Vec::new();
         for volume in &volumes {
             let before = store.state.completed_batch;
             match process_volume(store, volume, &cfg, &mut scans, &mut repairs).await {
@@ -374,6 +377,7 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
                     }
                     if progress.journal_read {
                         retry_volumes.push(volume.clone());
+                        enrichment_volumes.push(volume.clone());
                     }
                 }
                 Err(error) => {
@@ -417,60 +421,20 @@ pub async fn watch_changes(mut cfg: AppConfig, mut session: IngestionSession) ->
         }
         // Finish filename baselines and journal backlogs before optional text.
         // Each volume receives at most one bounded enrichment page per turn.
-        if failures.is_empty()
-            && !work_remaining
-            && store.state.pending.is_none()
-            && content_admission_available()
-        {
-            for volume in &retry_volumes {
-                let checkpoint = store.volume(volume.id)?;
-                if checkpoint.needs_scan
-                    || checkpoint.catching_up
-                    || !ContentPolicy::for_volume(volume, &cfg).enabled
-                {
-                    continue;
-                }
-                if store
-                    .state
-                    .deferred
-                    .len()
-                    .saturating_add(MUTATION_BATCH_LIMIT)
-                    > MAX_DEFERRED_FILES
-                {
-                    break;
-                }
-                let progress = enrichment.entry(volume.id).or_default();
-                let result = match reader_config(&cfg, &store.state.retired_indices) {
-                    Ok(reader) => {
-                        enrich_content_turn(
-                            store,
-                            volume,
-                            &cfg,
-                            &reader.exclude_paths,
-                            progress,
-                            commit_pending,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                };
-                match result {
-                    Ok(more) => work_remaining |= more,
-                    Err(error) => {
-                        failures.push(format!(
-                            "optional content enrichment for volume {}: {error:#}",
-                            volume.id
-                        ));
-                        // Pending keys remain masked until a real commit. A
-                        // content problem does not invalidate unrelated names.
-                        break;
-                    }
-                }
-                if !content_admission_available() {
-                    break;
-                }
-            }
-        }
+        work_remaining |= enrich_ready_volumes(
+            store,
+            &cfg,
+            &enrichment_volumes,
+            EnrichmentTurn {
+                filename_work_remaining: work_remaining,
+                enrichment: &mut enrichment,
+                failures: &mut failures,
+            },
+            content_admission_available,
+            reader_config,
+            commit_pending,
+        )
+        .await?;
         let deferred = store
             .state
             .deferred
@@ -1699,6 +1663,91 @@ where
     progress.page = None;
     commit(store, cfg).await?;
     Ok(true)
+}
+
+/// Mutable progress and diagnostics shared by one bounded enrichment turn.
+struct EnrichmentTurn<'a> {
+    filename_work_remaining: bool,
+    enrichment: &'a mut EnrichmentScans,
+    failures: &'a mut Vec<String>,
+}
+
+/// Give every journal-validated eligible volume one bounded content turn.
+/// Unrelated discovery/read failures remain visible in diagnostics, while only
+/// an admitted transaction, capacity, or scheduler policy can stop this lane.
+async fn enrich_ready_volumes<A, R, C>(
+    store: &mut StateStore,
+    cfg: &AppConfig,
+    volumes: &[VolumeInfo],
+    turn: EnrichmentTurn<'_>,
+    mut admitted: A,
+    resolve_reader: R,
+    commit: C,
+) -> Result<bool>
+where
+    A: FnMut() -> bool,
+    R: FnOnce(&AppConfig, &[String]) -> Result<ReaderConfig>,
+    C: AsyncFnMut(&mut StateStore, &AppConfig) -> Result<()> + Copy,
+{
+    let EnrichmentTurn {
+        filename_work_remaining,
+        enrichment,
+        failures,
+    } = turn;
+    if filename_work_remaining || store.state.pending.is_some() || !admitted() {
+        return Ok(false);
+    }
+    // Diagnostics describe all selected sources. An unplugged drive must not
+    // prevent journal-validated mounted volumes from gaining content after a
+    // metadata-first baseline. Fail only this turn on shared config errors.
+    let reader = match resolve_reader(cfg, &store.state.retired_indices) {
+        Ok(reader) => reader,
+        Err(error) => {
+            failures.push(format!("content enrichment configuration: {error:#}"));
+            return Ok(false);
+        }
+    };
+    let mut work_remaining = false;
+    for volume in volumes {
+        // A failure after begin() belongs to durable replay. Never admit a
+        // second volume until both real index receipts retire that barrier.
+        if store.state.pending.is_some() || !admitted() {
+            break;
+        }
+        let checkpoint = store.volume(volume.id)?;
+        // A failed admission/read may hide a formerly healthy volume before
+        // its persisted phase changes. It cannot authorize fresh extraction.
+        if checkpoint.needs_scan
+            || checkpoint.catching_up
+            || read_visibility().volumes.contains(&volume.id)
+            || !ContentPolicy::for_volume(volume, cfg).enabled
+        {
+            continue;
+        }
+        if store
+            .state
+            .deferred
+            .len()
+            .saturating_add(MUTATION_BATCH_LIMIT)
+            > MAX_DEFERRED_FILES
+        {
+            break;
+        }
+        let progress = enrichment.entry(volume.id).or_default();
+        match enrich_content_turn(store, volume, cfg, &reader.exclude_paths, progress, commit).await
+        {
+            Ok(more) => work_remaining |= more,
+            Err(error) => {
+                failures.push(format!(
+                    "optional content enrichment for volume {}: {error:#}",
+                    volume.id
+                ));
+                // A failed volatile reader has no durable ownership and cannot
+                // block later volumes. Pending keys remain masked until replay.
+            }
+        }
+    }
+    Ok(work_remaining)
 }
 
 async fn dispatch_pending_batch(
@@ -3884,6 +3933,281 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_and_failed_sources_do_not_starve_healthy_volume_enrichment() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volumes, cursor) =
+            enrichment_volumes_fixture(root.path(), 60_506).await?;
+        let mut enrichment = EnrichmentScans::new();
+        // Retain an unavailable configured drive in the overall diagnostics.
+        // The first mounted drive also has a failed frozen metadata snapshot;
+        // neither owns a pending transaction or invalidates the second drive.
+        let unavailable = "configured volume Z:\\ is unavailable or not NTFS".to_string();
+        let mut failures = vec![unavailable.clone()];
+        let broken = meta_index::open_or_create_index(&root.path().join("broken-reader"))?;
+        let mut writer = meta_index::create_writer(
+            &broken,
+            &meta_index::WriterConfig {
+                heap_size_bytes: 20_000_000,
+                num_threads: 1,
+            },
+        )?;
+        writer.add_document(tantivy::doc!(
+            broken.fields.volume => u64::from(volumes[0].id),
+            broken.fields.path => "X:\\broken.txt"
+        ))?;
+        content_index::commit_batch(&mut writer, Uuid::new_v4())?;
+        drop(writer);
+        enrichment.insert(
+            volumes[0].id,
+            EnrichmentProgress {
+                scan: Some(meta_index::PathScan::new(
+                    &broken,
+                    volumes[0].id,
+                    std::slice::from_ref(&volumes[0].guid_path),
+                )?),
+                ..EnrichmentProgress::default()
+            },
+        );
+        assert!(
+            enrich_ready_volumes(
+                &mut store,
+                &cfg,
+                &volumes,
+                EnrichmentTurn {
+                    filename_work_remaining: false,
+                    enrichment: &mut enrichment,
+                    failures: &mut failures,
+                },
+                || true,
+                |_, _| Ok(ReaderConfig::default()),
+                commit_enrichment_fixture,
+            )
+            .await?
+        );
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0], unavailable);
+        assert!(failures[1].contains("metadata identity missing"));
+        assert!(store.state.pending.is_none());
+        let failed = enrichment.get_mut(&volumes[0].id).unwrap();
+        assert!(failed.scan.is_none() && failed.next_scan > Instant::now());
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        let result = search(&handler, "enrichmentproof", SearchMode::Content);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.hits[0].key.volume(), volumes[1].id);
+        for volume in &volumes {
+            assert_eq!(store.volume(volume.id)?.cursor, Some(cursor));
+            assert_eq!(
+                search(
+                    &handler,
+                    &format!("optionalvolume{}", volume.id),
+                    SearchMode::NameOnly,
+                )
+                .total,
+                1
+            );
+        }
+        // Recovery reopens the first drive's real current index. The unavailable
+        // drive remains reported while its mounted peers both become searchable.
+        failed.next_scan = Instant::now();
+        enrich_ready_volumes(
+            &mut store,
+            &cfg,
+            &volumes,
+            EnrichmentTurn {
+                filename_work_remaining: false,
+                enrichment: &mut enrichment,
+                failures: &mut failures,
+            },
+            || true,
+            |_, _| Ok(ReaderConfig::default()),
+            commit_enrichment_fixture,
+        )
+        .await?;
+        assert_eq!(
+            search(&handler, "enrichmentproof", SearchMode::Content).total,
+            2
+        );
+        assert_eq!(failures.len(), 2);
+        assert!(store.state.pending.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_failed_source_cannot_enrich_from_its_previous_healthy_checkpoint() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volumes, _) = enrichment_volumes_fixture(root.path(), 60_510).await?;
+        // A read/admission failure may precede the durable phase transition.
+        // Keep its old healthy flags but use the exact visibility invalidation
+        // performed by watch_changes on failure. The other drive stays valid.
+        hide_volume(volumes[0].id);
+        assert!(!store.volume(volumes[0].id)?.needs_scan);
+        assert!(!store.volume(volumes[0].id)?.catching_up);
+        let mut enrichment = EnrichmentScans::new();
+        let mut failures = vec!["volume X: journal admission failed".to_string()];
+        assert!(
+            enrich_ready_volumes(
+                &mut store,
+                &cfg,
+                &volumes,
+                EnrichmentTurn {
+                    filename_work_remaining: false,
+                    enrichment: &mut enrichment,
+                    failures: &mut failures,
+                },
+                || true,
+                |_, _| Ok(ReaderConfig::default()),
+                commit_enrichment_fixture,
+            )
+            .await?
+        );
+        assert!(!enrichment.contains_key(&volumes[0].id));
+        assert_eq!(failures.len(), 1);
+        let content = tantivy::Index::open_in_dir(&cfg.paths.content_index)?;
+        assert_eq!(content.reader()?.searcher().num_docs(), 1);
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        let found = search(&handler, "enrichmentproof", SearchMode::Content);
+        assert_eq!(found.total, 1);
+        assert_eq!(found.hits[0].key.volume(), volumes[1].id);
+        assert!(read_visibility().volumes.contains(&volumes[0].id));
+        assert!(store.state.pending.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_admitted_enrichment_still_blocks_later_volume_until_replay() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (cfg, mut store, volumes, cursor) =
+            enrichment_volumes_fixture(root.path(), 60_508).await?;
+        let mut enrichment = EnrichmentScans::new();
+        let mut failures = Vec::new();
+        let before = store.state.completed_batch;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        assert!(
+            !enrich_ready_volumes(
+                &mut store,
+                &cfg,
+                &volumes,
+                EnrichmentTurn {
+                    filename_work_remaining: false,
+                    enrichment: &mut enrichment,
+                    failures: &mut failures,
+                },
+                || true,
+                |_, _| Ok(ReaderConfig::default()),
+                async |store, _| {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(store.state.pending.as_ref().unwrap().volume, volumes[0].id);
+                    anyhow::bail!("worker unavailable before content commit")
+                },
+            )
+            .await?
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(store.state.completed_batch, before);
+        assert_eq!(store.state.pending.as_ref().unwrap().volume, volumes[0].id);
+        assert!(!enrichment.contains_key(&volumes[1].id));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("worker unavailable"));
+
+        // Retire the exact pending transaction with real paired commits, then
+        // permit the second volume. No forged ACK clears the global barrier.
+        commit_enrichment_fixture(&mut store, &cfg).await?;
+        apply_journal_batch(
+            &mut store,
+            &volumes[0],
+            &cfg,
+            JournalBatch {
+                events: Vec::new(),
+                cursor,
+                caught_up: true,
+            },
+            commit_metadata_batch,
+        )
+        .await?;
+        assert!(
+            enrich_ready_volumes(
+                &mut store,
+                &cfg,
+                &volumes[1..],
+                EnrichmentTurn {
+                    filename_work_remaining: false,
+                    enrichment: &mut enrichment,
+                    failures: &mut failures,
+                },
+                || true,
+                |_, _| Ok(ReaderConfig::default()),
+                commit_enrichment_fixture,
+            )
+            .await?
+        );
+        let handler = UnifiedSearchHandler::try_new(
+            Path::new(&cfg.paths.meta_index),
+            Path::new(&cfg.paths.content_index),
+        )?;
+        assert_eq!(
+            search(&handler, "enrichmentproof", SearchMode::Content).total,
+            2
+        );
+        assert!(store.state.pending.is_none());
+        Ok(())
+    }
+
+    async fn enrichment_volumes_fixture(
+        root: &Path,
+        first_id: VolumeId,
+    ) -> Result<(AppConfig, StateStore, [VolumeInfo; 2], JournalCursor)> {
+        let (mut cfg, mut store, mut first, cursor) = baseline_store(root, first_id)?;
+        cfg.volumes = vec!["X:\\".into(), "Y:\\".into(), "Z:\\".into()];
+        cfg.content_index_volumes = vec!["X:\\".into(), "Y:\\".into()];
+        first.guid_path = "X:\\".into();
+        store.volume_mut(first.id)?.guid = first.guid_path.clone();
+        let mut second = VolumeInfo {
+            id: 0,
+            guid_path: "Y:\\".into(),
+            drive_letters: vec!['Y'],
+        };
+        store.bind_volume(&mut second)?;
+        let volumes = [first, second];
+        for volume in &volumes {
+            let mut file = meta(
+                DocKey::from_parts(volume.id, 10),
+                &format!("optionalvolume{}.txt", volume.id),
+                10,
+            );
+            file.path = Some(format!("{}{}", volume.guid_path, file.name));
+            store.begin(pending_for_metadata(
+                volume,
+                vec![MetadataChange::Upsert(file)],
+                None,
+                false,
+                &cfg,
+            ))?;
+            commit_metadata_batch(&mut store, &cfg).await?;
+            store.complete_scan(volume.id, cursor)?;
+            apply_journal_batch(
+                &mut store,
+                volume,
+                &cfg,
+                JournalBatch {
+                    events: Vec::new(),
+                    cursor,
+                    caught_up: true,
+                },
+                commit_metadata_batch,
+            )
+            .await?;
+        }
+        Ok((cfg, store, volumes, cursor))
     }
 
     async fn commit_enrichment_fixture(store: &mut StateStore, cfg: &AppConfig) -> Result<()> {

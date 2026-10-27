@@ -7,7 +7,9 @@ UltraSearch installation, service, or data directory. Pass -DisposableHost to
 acknowledge that this script installs a service and creates a temporary local user.
 It creates its own NTFS VHD, limits indexing to that fixture, tests installed
 clients both elevated and as a standard user, and exercises service recovery.
-Filename checks run with extraction blocked by a year-long idle threshold.
+Filename checks run with extraction blocked by a year-long idle threshold and
+an additional selected drive that is unavailable. The healthy volume must still
+gain searchable filenames and, after admission opens, searchable body text.
 A subsequent config reload enables extraction and must make real body text
 searchable. This controls idle policy; it does not emulate battery hardware.
 The GUI check proves process liveness only; it does not inspect rendered results.
@@ -214,6 +216,7 @@ $installedService = Join-Path $installDir 'service.exe'
 $installedCli = Join-Path $installDir 'cli.exe'
 $startedUtc = [DateTime]::UtcNow
 $driveLetter = $null
+$unavailableMountRoot = $null
 
 try {
     $usedDrives = [IO.Directory]::GetLogicalDrives()
@@ -225,6 +228,14 @@ try {
         }
     }
     if ($null -eq $driveLetter) { throw 'No unused drive letter is available for the fixture.' }
+    foreach ($code in (90..69)) {
+        $candidate = [string][char]$code
+        if ($candidate -ne $driveLetter -and ($candidate + ':\') -notin $usedDrives) {
+            $unavailableMountRoot = $candidate + ':\'
+            break
+        }
+    }
+    if ($null -eq $unavailableMountRoot) { throw 'No second unused drive letter is available for the unavailable-volume regression.' }
     if ($vhdPath.Contains('"') -or $vhdPath.Contains([char]10) -or $vhdPath.Contains([char]13)) {
         throw 'EvidenceDir cannot contain characters that would alter a diskpart command.'
     }
@@ -259,12 +270,16 @@ exit
     $fixture = $mount + '\' + $token + '.txt'
     $canonicalFixture = $volumeRoot + $token + '.txt'
     Save-Text $fixture "UltraSearch installed-service filename regression fixture. $contentToken"
+    $punctuatedName = 'Surface-' + $token + ' [draft].txt'
+    $canonicalPunctuated = $volumeRoot + $punctuatedName
+    Save-Text ($mountRoot + $punctuatedName) 'Filename punctuation and partial matching fixture.'
     New-Item -ItemType Directory -Path (Split-Path $configPath) -Force | Out-Null
-    # Only this VHD is selected. A fresh runner cannot have one year of idle
-    # time. Filename indexing must progress while optional extraction is denied.
+    # The only mounted selected volume is this VHD. An unavailable second
+    # selection must remain diagnostic rather than starving the healthy drive.
+    # A fresh runner cannot have one year of idle time; filenames must progress.
     $validConfig = @"
-volumes = ['$mountRoot']
-content_index_volumes = ['$mountRoot']
+volumes = ['$mountRoot', '$unavailableMountRoot']
+content_index_volumes = ['$mountRoot', '$unavailableMountRoot']
 
 [scheduler]
 idle_warm_seconds = 31536000
@@ -305,6 +320,19 @@ power_save_mode = true
     if ($schedulerState -notmatch 'content_admission=' -or $schedulerState -match 'content_admission=ready(\s|;|$)') {
         throw "The filename regression did not run with closed extraction admission: $schedulerState"
     }
+    # Publishing completed filename visibility and publishing end-of-turn
+    # health are separate operations. Wait for the latter without requiring
+    # their observations to happen in the same process scheduling slice.
+    $healthDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not $schedulerState.Contains("configured volume $unavailableMountRoot is unavailable or not NTFS") -and
+        [DateTime]::UtcNow -lt $healthDeadline) {
+        Start-Sleep -Milliseconds 200
+        $health = Invoke-Native -FilePath $installedCli -Arguments @('status', '--json') -Label 'unavailable-volume-health'
+        $schedulerState = ($health.Stdout | ConvertFrom-Json).scheduler_state
+    }
+    if (-not $schedulerState.Contains("configured volume $unavailableMountRoot is unavailable or not NTFS")) {
+        throw 'The selected unavailable volume was not reported in ingestion health.'
+    }
     $blockedContent = Invoke-Native -FilePath $installedCli -Arguments @('search', $contentToken, '--mode', 'content', '--json') -Label 'content-before-admission'
     if (($blockedContent.Stdout | ConvertFrom-Json).total -ne 0) {
         throw 'Content extraction bypassed the deliberately closed idle gate.'
@@ -332,6 +360,12 @@ power_save_mode = true
     $null = $standardStatus.Stdout | ConvertFrom-Json
     Wait-Search -Query $token -ExpectedPath $canonicalFixture -Label 'standard-user-search' -Credential $credential
     Passed 'A standard local user can read service status and search the installed pipe'
+    Wait-Search -Query ('name:' + $token.Substring(6, 6)) -ExpectedPath $canonicalFixture -Label 'partial-filename-search' -Credential $credential
+    Wait-Search -Query ('name:Surface-' + $token.Substring(0, 10)) -ExpectedPath $canonicalPunctuated -Label 'punctuated-filename-search' -Credential $credential
+    Wait-Search -Query ('path:"' + $canonicalPunctuated + '"') -ExpectedPath $canonicalPunctuated -Label 'quoted-windows-path-search' -Credential $credential
+    Wait-Search -Query ('path:"' + $mountRoot + $punctuatedName + '"') -ExpectedPath $canonicalPunctuated -Label 'drive-letter-path-search' -Credential $credential
+    Wait-Search -Query ('"' + $mountRoot + $punctuatedName + '"') -ExpectedPath $canonicalPunctuated -Label 'pasted-explorer-path-search' -Credential $credential
+    Passed 'Partial filenames, punctuation, and pasted drive-letter paths return the real canonical indexed result'
 
     $laterToken = 'ulate' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
     Save-Text ($mount + '\' + $laterToken + '.txt') 'File created after the service became ready.'
@@ -343,8 +377,8 @@ power_save_mode = true
     # Reopen admission using the supported config path. Keep this valid version
     # for later restart/configuration-failure recovery checks.
     $validConfig = @"
-volumes = ['$mountRoot']
-content_index_volumes = ['$mountRoot']
+volumes = ['$mountRoot', '$unavailableMountRoot']
+content_index_volumes = ['$mountRoot', '$unavailableMountRoot']
 
 [scheduler]
 idle_warm_seconds = 0
@@ -362,7 +396,7 @@ power_save_mode = false
     }
     Wait-Search -Query $contentToken -ExpectedPath $canonicalFixture -Mode content -Label 'content-after-admission' -Credential $credential
     Wait-Search -Query $token -ExpectedPath $canonicalFixture -Label 'filename-after-enrichment' -Credential $credential
-    Passed 'Opening idle admission enriches body text without losing filename search'
+    Passed 'Opening idle admission enriches the healthy drive despite another unavailable selection, without losing filename search'
     $uiParameters = @{
         FilePath = (Join-Path $installDir 'ui.exe')
         WorkingDirectory = $installDir

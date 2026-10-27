@@ -80,11 +80,22 @@ and both physical receipts are checked before advancing the journal cursor.
 Initial filenames still require MFT completion and valid journal catch-up;
 battery or idle policy does not postpone that coverage.
 
+The scheduler receives filename batches immediately instead of making every
+bounded MFT page wait for the next one-second resource observation. Extraction
+still requires a fresh admission decision, and previously accepted work retains
+its ordering barrier. This removes an artificial per-page delay; actual first
+indexing time still depends on the filesystem, index commits, and worker startup.
+
 Eligible metadata with no corresponding content document represents durable
 work still to extract. A bounded scan finds that work when content admission
 opens. It checks snapshot candidates against current metadata before dispatch,
 so an old pathname cannot replace a newer journal observation. Content retries
 retain their existing backoff.
+
+An unavailable selected drive or a failed volatile reader is reported as
+degraded ingestion without stopping enrichment on healthy, journal-validated
+volumes. A transaction that has already been admitted remains a global ordering
+barrier until its exact paired commits are replayed successfully.
 
 If admission closes before an optional worker starts, the scheduler reports a
 distinct deferred outcome. It is not a commit acknowledgment. The coordinator
@@ -96,6 +107,30 @@ valid filename metadata while removing stale body text and recording retry debt.
 The durable checkpoint format is version 5. Upgrade handling checks existing
 physical receipts and migrates older pending work. Older binaries reject the
 new semantics; a downgrade is not a substitute for diagnosing a startup failure.
+
+## Filename queries and Windows paths
+
+The UI and CLI share ordinary query parsing. Plain terms match literal,
+case-insensitive filename or path substrings, so `doc` can match
+`my-document_v2.final.pdf`. `name:doc` restricts the substring to the basename;
+`path:Projects` includes directory components. Quoted Windows paths preserve
+their backslashes, including UNC prefixes and a trailing separator. Use the
+canonical path returned in a search result when targeting a complete path.
+For a drive-qualified query, the service also resolves the Windows volume mount
+to the GUID namespace used by NTFS results, without opening the target file.
+This includes incomplete filename fragments and directory-mounted volumes.
+Resolution failure keeps the original predicate. A junction whose reported
+target root cannot safely be substituted is left unresolved rather than mapped
+to an unrelated indexed location.
+
+File-body text retains analyzed whole-word matching. Explicit phrase, prefix,
+fuzzy, and field filters remain available. For advanced Tantivy query syntax,
+use the CLI's `--raw` flag. Query punctuation in ordinary filename input is not
+passed through as raw Tantivy syntax.
+
+The explicit literal-query mode requires IPC protocol version 3. Upgrade the
+service, UI, and CLI together; incompatible peers are rejected with an update
+diagnostic rather than silently decoding a different query representation.
 
 ## Start the installed service correctly
 
@@ -170,7 +205,11 @@ installer, directory, and evidence state. It creates an isolated NTFS VHD and
 USN journal, installs the real MSI, verifies service identity and installed
 binary hashes, and searches for files created before and after service startup.
 It also exercises an ordinary local user's IPC access, service restart, invalid
-configuration, and the expected bare-executable 1063 case.
+configuration, partial and punctuated filenames, and quoted Windows paths. It
+queries both the drive-letter form and canonical form while requiring the same
+canonical indexed result. It also checks the expected bare-executable 1063 case.
+A second selected drive is deliberately
+unavailable, so healthy-volume progress must coexist with degraded diagnostics.
 
 The installed test initially sets a closed deep-idle policy and requires both
 baseline and journal filename hits while body search remains empty. It then
@@ -178,6 +217,9 @@ reloads an open policy and requires the unique body token to become searchable
 without losing filename results. This is an actual idle-policy test when run
 on Windows; it does not emulate physical battery hardware. Portable scheduler
 regressions separately exercise battery observations and revoked admission.
+The scheduler's separate real-worker regression commits deletions and a volume
+reset between observation ticks and checks complete physical Tantivy receipts;
+the Windows job runs it with the newly built `index-worker.exe`.
 
 Cleanup is limited to the test's own MSI, local-user SID, and attached VHD. It
 preserves diagnostic evidence and reports cleanup failures. The GUI check covers
@@ -205,6 +247,12 @@ result JSON, command outputs, MSI logs, and ProgramData logs.
   unavailable even after a pipe was ready. Filename transactions and deferred
   content enrichment now have separate admission behavior, while retaining
   paired commit receipts and journal coverage checks.
+- The scheduler also waited for its one-second observation tick before each
+  bounded filename batch. Immediate metadata dispatch now removes that delay
+  without opening content admission.
+- Global source diagnostics incorrectly stopped healthy-volume enrichment,
+  and ordinary filename terms lacked partial matching. Per-volume eligibility
+  and explicit literal-query semantics now address those separate failure paths.
 - MSI service names, SCM host identity, and worker placement agree. No service
   registration mismatch was demonstrated by these reports.
 - Direct interactive error 1063 is expected. It must not be treated as a

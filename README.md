@@ -85,10 +85,17 @@ Once installation completes:
    * Type to search filenames and, once indexing is ready, content.
 3. Hit **Enter** to open the selected file/folder, or use context actions from the result row.
 
+Ordinary UI and CLI queries match partial filenames: `doc` can find
+`my-document_v2.final.pdf`. Use `name:doc` to restrict the match to a filename,
+or `path:"Projects\quarterly report"` for a literal path fragment. File-body
+terms keep whole-word matching. The CLI's `--raw` option explicitly selects
+advanced Tantivy syntax; install the UI, service, and CLI from the same build.
+
 ### 4. Background indexing (what to expect)
 
 * **Initial filename indexing** enumerates the NTFS MFT and validates journal catch-up before exposing a volume's results. The UI can connect before this work finishes and reports its progress separately.
 * **Filename updates do not wait for content extraction.** Battery and idle policies can defer file-body indexing while filename coverage continues to advance.
+* **Filename batches dispatch as soon as they arrive.** Resource sampling does not impose a one-second pause on each baseline page. An unavailable selected drive remains visible in diagnostics without blocking content enrichment on healthy drives.
 * **Content indexing** runs **only when the system is idle and not busy**:
 
   * Short‑lived worker processes extract and index content.

@@ -52,6 +52,9 @@ jobs:
         run: |
           cargo test --locked -p ipc -p ui -p service --lib
           if ($LASTEXITCODE -ne 0) { throw 'Startup integration regressions failed' }
+          $env:ULTRASEARCH_WORKER_PATH = (Resolve-Path target/debug/index-worker.exe).Path
+          cargo test --locked -p service --lib scheduler_runtime::tests::real_worker_commits_metadata_batches_between_observation_ticks -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { throw 'Real worker metadata-dispatch regression failed' }
       - name: Package the release MSI definition with the tested binaries
         run: |
           $wixBin = Join-Path ${env:ProgramFiles(x86)} 'WiX Toolset v3.14/bin'
