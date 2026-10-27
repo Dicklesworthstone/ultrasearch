@@ -70,6 +70,9 @@ impl ContextMenu {
     }
 }
 
+/// Opens `path` with its default app. On Windows this goes through Explorer,
+/// not `cmd /C start`: cmd parsed the file name (an `&` in it split the
+/// command line) and, ui.exe having no console, opened a window of its own.
 pub fn open_path_in_os(path: &str) {
     #[cfg(target_os = "windows")]
     {

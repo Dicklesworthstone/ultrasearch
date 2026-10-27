@@ -1,5 +1,6 @@
 use crate::model::state::SearchAppModel;
 use crate::theme;
+use crate::views::context_menu::open_path_in_os;
 use gpui::prelude::*;
 use gpui::{InteractiveElement, UniformListScrollHandle, *};
 use std::io::Read;
@@ -101,21 +102,7 @@ impl PreviewView {
     }
 
     fn open_file(&mut self, path: &str) {
-        #[cfg(target_os = "windows")]
-        {
-            Command::new("cmd")
-                .args(["/C", "start", "", path])
-                .spawn()
-                .ok();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Command::new("open").arg(path).spawn().ok();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            Command::new("xdg-open").arg(path).spawn().ok();
-        }
+        open_path_in_os(path);
     }
 
     fn format_file_size(bytes: u64) -> String {

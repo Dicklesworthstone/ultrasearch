@@ -117,11 +117,15 @@ impl UltraSearchWindow {
     fn on_toggle_shortcuts(
         &mut self,
         _: &ToggleShortcuts,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.model.read(cx).show_shortcuts {
+            self.hide_shortcuts(window, cx);
+            return;
+        }
         self.model.update(cx, |model, cx| {
-            model.show_shortcuts = !model.show_shortcuts;
+            model.show_shortcuts = true;
             cx.notify();
         });
     }
@@ -129,12 +133,22 @@ impl UltraSearchWindow {
     fn on_close_shortcuts(
         &mut self,
         _: &CloseShortcuts,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.hide_shortcuts(window, cx);
+    }
+
+    /// Hides the help overlay and hands the keyboard back to the search box.
+    /// Focus otherwise stays on the overlay's handle, which is no longer
+    /// drawn, and every shortcut is dead until the next click.
+    fn hide_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model.update(cx, |model, cx| {
             model.show_shortcuts = false;
             cx.notify();
+        });
+        self.search_view.update(cx, |view, _cx| {
+            window.focus(&view.focus_handle());
         });
     }
 
@@ -158,13 +172,10 @@ impl UltraSearchWindow {
         });
     }
 
-    fn on_clear_search(&mut self, _: &ClearSearch, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_clear_search(&mut self, _: &ClearSearch, window: &mut Window, cx: &mut Context<Self>) {
         // Escape dismisses the help overlay first, as its own text promises (#8).
         if self.model.read(cx).show_shortcuts {
-            self.model.update(cx, |model, cx| {
-                model.show_shortcuts = false;
-                cx.notify();
-            });
+            self.hide_shortcuts(window, cx);
             return;
         }
         self.model.update(cx, |model, cx| {

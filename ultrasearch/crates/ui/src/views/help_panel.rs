@@ -93,6 +93,10 @@ impl HelpPanel {
 
         Some(
             div()
+                // The columns share the panel's width and wrap their labels;
+                // sized to their unwrapped text they ran past its right edge.
+                .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -111,8 +115,8 @@ impl HelpPanel {
                         .gap_2()
                         .text_size(px(12.))
                         .text_color(colors.text_secondary)
-                        .child(div().child(*v))
-                        .child(Self::key_badge(k, cx))
+                        .child(div().flex_1().min_w(px(0.)).child(*v))
+                        .child(Self::key_badge(k, cx).flex_none())
                 })),
         )
     }
@@ -349,9 +353,6 @@ impl Render for HelpPanel {
                         this.filter.pop();
                         cx.notify();
                     }
-                    "escape" if this.filter.is_empty() => {
-                        window.dispatch_action(Box::new(CloseShortcuts), cx);
-                    }
                     "escape" => {
                         this.filter.clear();
                         cx.notify();
@@ -383,11 +384,15 @@ impl Render for HelpPanel {
             .occlude()
             .child(
                 div()
+                    .id("help-panel")
                     .on_mouse_down_out(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(CloseShortcuts), cx);
                     }))
                     .w(px(840.))
                     .max_h(px(620.))
+                    // The content is taller than the panel: scroll it rather
+                    // than spill below, where a click counts as outside (#8).
+                    .overflow_y_scroll()
                     .bg(colors.panel_bg)
                     .rounded_xl()
                     .shadow_2xl()

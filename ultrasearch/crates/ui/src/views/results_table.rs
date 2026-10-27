@@ -2,11 +2,12 @@ use crate::globals::GlobalAppState;
 use crate::icon_cache::IconCache;
 use crate::model::state::SearchAppModel;
 use crate::theme;
-use crate::views::context_menu::{ContextMenu, ContextMenuCommand, ContextMenuItem};
+use crate::views::context_menu::{
+    open_path_in_os, ContextMenu, ContextMenuCommand, ContextMenuItem,
+};
 use gpui::prelude::*;
 use gpui::{InteractiveElement, *};
 use ipc::SearchHit;
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn row_height() -> Pixels {
@@ -231,21 +232,7 @@ impl ResultsView {
     }
 
     fn open_file(&self, path: &str) {
-        #[cfg(target_os = "windows")]
-        {
-            Command::new("cmd")
-                .args(["/C", "start", "", path])
-                .spawn()
-                .ok();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Command::new("open").arg(path).spawn().ok();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            Command::new("xdg-open").arg(path).spawn().ok();
-        }
+        open_path_in_os(path);
     }
 
     fn format_file_size(bytes: u64) -> String {
