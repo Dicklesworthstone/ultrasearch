@@ -346,10 +346,10 @@ jobs:
             2. Follow the installation wizard
 
             **Option 2: Manual Installation**
-            1. Download the individual `.exe` files
-            2. Place them in your desired location
-            3. Run `ultrasearch-service.exe` to start the background service
-            4. Run `ultrasearch-ui.exe` to launch the desktop application
+            1. Download `launcher.exe`, `ui.exe`, `service.exe`, `index-worker.exe` and `cli.exe`
+            2. Place them in one directory
+            3. Run `launcher.exe`: it starts the service in console mode and opens the desktop application
+               (`service.exe` started on its own expects the Windows service manager and fails with error 1063)
 
             ### Requirements
 

@@ -19,6 +19,13 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of UltraSearch is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- Icon. Advertised shortcuts point at the product, not at ui.exe, so
+         without an Icon they showed a blank page (#9). Windows Installer
+         caches it under its Id as the file name, and Explorer reads that
+         extension, so the Id ends in ".ico". -->
+    <Icon Id="ProductIcon.ico" SourceFile="$(sys.SOURCEFILEDIR)..\..\..\assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon.ico" />
+
     <!-- Application directories -->
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
@@ -39,12 +46,14 @@
                   Name="UltraSearch"
                   WorkingDirectory="INSTALLFOLDER"
                   Advertise="yes"
+                  Icon="ProductIcon.ico"
                   Description="UltraSearch desktop search" />
         <Shortcut Id="sc_desktop"
                   Directory="DesktopFolder"
                   Name="UltraSearch"
                   WorkingDirectory="INSTALLFOLDER"
                   Advertise="yes"
+                  Icon="ProductIcon.ico"
                   Description="UltraSearch desktop search" />
       </Component>
 
