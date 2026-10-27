@@ -87,11 +87,19 @@ Once installation completes:
 
 ### 4. Background indexing (what to expect)
 
-* **Initial metadata build** runs quickly using direct MFT enumeration.
+* **Initial filename indexing** enumerates the NTFS MFT and validates journal catch-up before exposing a volume's results. The UI can connect before this work finishes and reports its progress separately.
+* **Filename updates do not wait for content extraction.** Battery and idle policies can defer file-body indexing while filename coverage continues to advance.
 * **Content indexing** runs **only when the system is idle and not busy**:
 
   * Short‑lived worker processes extract and index content.
   * The always‑on service remains small and responsive.
+
+If the UI cannot connect or known filenames are missing, follow the
+[Windows startup and search troubleshooting guide](docs/WINDOWS_STARTUP_TROUBLESHOOTING.md).
+It distinguishes Windows service state, named-pipe connectivity, configuration
+errors, and indexing progress. Running `service.exe` or an older
+`ultrasearch-service.exe` directly without `--console` normally produces Windows
+error **1063**: installed services are started by the Service Control Manager.
 
 ### 5. Uninstall
 
