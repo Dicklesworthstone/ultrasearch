@@ -5,7 +5,8 @@ pub const MAX_FRAME: usize = 256 * 1024;
 
 /// Version 1 sent unversioned bincode with a lossy, packed 64-bit DocKey.
 /// Version 2 requires lossless volume + full FRN identities at both peers.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Version 3 distinguishes literal filename search from advanced query syntax.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 // The leading zero u64 is deliberately an invalid UUID byte-string length for
 // legacy bincode requests, so an old service cannot mistake this envelope for
@@ -221,7 +222,7 @@ mod tests {
             // An old service sees an invalid UUID length, not a valid control
             // request or an unbounded allocation derived from the magic.
             assert!(bincode::deserialize::<crate::StatusRequest>(&encoded).is_err());
-            for version in [1u16, PROTOCOL_VERSION + 1] {
+            for version in [1u16, 2, PROTOCOL_VERSION + 1] {
                 let mut incompatible = encoded.clone();
                 incompatible[MESSAGE_MAGIC.len()..MESSAGE_MAGIC.len() + 2]
                     .copy_from_slice(&version.to_le_bytes());

@@ -22,6 +22,9 @@ pub mod fst;
 pub mod state;
 pub mod tiers;
 
+/// Bound literal query compilation independently of the number of indexed files.
+pub const MAX_LITERAL_SEARCH_BYTES: usize = 4096;
+
 /// Fields used in the metadata index.
 #[derive(Debug, Clone)]
 pub struct MetaFields {
@@ -242,6 +245,50 @@ pub fn path_prefix_query(field: Field, paths: &[String]) -> Result<Box<dyn Query
         ));
     }
     Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
+/// Search a literal substring in the normalized path dictionary. Filename
+/// searches constrain the match to the last component, so a matching parent
+/// directory cannot make every child a filename hit. Patterns never include
+/// user-supplied regex syntax or an expanded list of dictionary terms.
+pub fn literal_path_query(
+    field: Field,
+    value: &str,
+    filename_only: bool,
+) -> Result<Box<dyn Query>> {
+    // Bound compilation even when an IPC peer constructs its own AST. Tantivy
+    // also caps its regex compiler; the literal pattern has only fixed stars.
+    ensure!(
+        value.len() <= MAX_LITERAL_SEARCH_BYTES,
+        "literal search text exceeds {MAX_LITERAL_SEARCH_BYTES} UTF-8 bytes"
+    );
+    let normalized = value.replace('/', "\\").to_lowercase();
+    if normalized.is_empty() || (filename_only && normalized.contains('\\')) {
+        return Ok(Box::new(EmptyQuery));
+    }
+    let escaped = regex::escape(&normalized);
+    let pattern = if filename_only {
+        format!(r"([^\\]*\\)*[^\\]*{escaped}[^\\]*")
+    } else {
+        format!(r"(.|\n)*{escaped}(.|\n)*")
+    };
+    Ok(Box::new(RegexQuery::from_pattern(&pattern, field)?))
+}
+
+/// Match a basename literally, retaining partial token matches for metadata
+/// without a resolved path. The path dictionary supplies punctuation, long
+/// filenames, and fragments crossing the normal analyzer's token boundaries.
+pub fn literal_name_query(name: Field, path_exact: Field, value: &str) -> Result<Box<dyn Query>> {
+    let path = literal_path_query(path_exact, value, true)?;
+    if value.is_empty() || value.contains(['\\', '/']) {
+        return Ok(path);
+    }
+    let escaped = regex::escape(&value.to_lowercase());
+    let token = RegexQuery::from_pattern(&format!(r"(.|\n)*{escaped}(.|\n)*"), name)?;
+    Ok(Box::new(BooleanQuery::new(vec![
+        (Occur::Should, path),
+        (Occur::Should, Box::new(token)),
+    ])))
 }
 
 /// A frozen metadata snapshot with bounded document paging. Each turn examines

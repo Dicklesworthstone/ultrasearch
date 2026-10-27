@@ -354,17 +354,26 @@ impl UnifiedSearchHandler {
         for field in target_fields {
             match field {
                 FieldKind::Ext => {
-                    let query = if term.modifier == TermModifier::Term {
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.ext, value),
-                            IndexRecordOption::WithFreqs,
-                        )) as Box<dyn Query>
-                    } else {
-                        modified_text_query(index, fields.ext, value, term.modifier)?
-                    };
+                    let query =
+                        if matches!(term.modifier, TermModifier::Term | TermModifier::Literal) {
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(fields.ext, value),
+                                IndexRecordOption::WithFreqs,
+                            )) as Box<dyn Query>
+                        } else {
+                            modified_text_query(index, fields.ext, value, term.modifier)?
+                        };
                     clauses.push((Occur::Should, query));
                 }
                 FieldKind::Name | FieldKind::Path => match term.modifier {
+                    TermModifier::Literal => {
+                        let query = if field == FieldKind::Name {
+                            meta_index::literal_name_query(fields.name, fields.path_exact, value)?
+                        } else {
+                            meta_index::literal_path_query(fields.path_exact, value, false)?
+                        };
+                        clauses.push((Occur::Should, query));
+                    }
                     TermModifier::Prefix | TermModifier::Phrase | TermModifier::Fuzzy(_) => {
                         let pf = if matches!(field, FieldKind::Name) {
                             fields.name
@@ -536,14 +545,16 @@ impl UnifiedSearchHandler {
 
         let target_fields: Vec<FieldKind> = match term.field {
             Some(f) => vec![f],
-            None if negated => vec![FieldKind::Name, FieldKind::Path, FieldKind::Content],
+            None if negated || term.modifier == TermModifier::Literal => {
+                vec![FieldKind::Name, FieldKind::Path, FieldKind::Content]
+            }
             None => vec![FieldKind::Name, FieldKind::Content],
         };
 
         let mut clauses = Vec::new();
         for field in target_fields {
             if matches!(field, FieldKind::Ext) {
-                let query = if term.modifier == TermModifier::Term {
+                let query = if matches!(term.modifier, TermModifier::Term | TermModifier::Literal) {
                     Box::new(TermQuery::new(
                         Term::from_field_text(fields.ext, value),
                         IndexRecordOption::WithFreqs,
@@ -564,6 +575,20 @@ impl UnifiedSearchHandler {
 
             if let Some(tf) = t_field {
                 match term.modifier {
+                    TermModifier::Literal => {
+                        let query = match field {
+                            FieldKind::Name => meta_index::literal_name_query(
+                                fields.name,
+                                fields.path_exact,
+                                value,
+                            )?,
+                            FieldKind::Path => {
+                                meta_index::literal_path_query(fields.path_exact, value, false)?
+                            }
+                            _ => modified_text_query(index, tf, value, TermModifier::Literal)?,
+                        };
+                        clauses.push((Occur::Should, query));
+                    }
                     TermModifier::Prefix | TermModifier::Phrase | TermModifier::Fuzzy(_) => {
                         clauses.push((
                             Occur::Should,
@@ -601,9 +626,22 @@ impl UnifiedSearchHandler {
         req: &SearchRequest,
         visibility: &Visibility,
     ) -> Result<SearchResponse> {
+        self.search_visible_with_resolver(req, visibility, ntfs_watcher::canonical_search_path)
+    }
+
+    fn search_visible_with_resolver(
+        &self,
+        req: &SearchRequest,
+        visibility: &Visibility,
+        resolver: impl FnMut(&str) -> Option<String>,
+    ) -> Result<SearchResponse> {
         let start = Instant::now();
         let window = SearchWindow::for_request(req);
-        let optimized_expr = QueryPlanner::optimize(req.query.clone());
+        validate_literal_query_size(&req.query)?;
+        // Resolve each distinct input once, before either index builds its
+        // predicate. Their cloned metadata predicate must use the same alias.
+        let optimized_expr =
+            QueryPlanner::optimize(resolve_literal_paths(req.query.clone(), resolver));
         // Freeze each reader once for ranking, counting, and stored-field reads.
         // The caller holds the visibility guard through this whole operation.
         let meta_searcher = self.meta_reader.searcher();
@@ -968,7 +1006,7 @@ fn kind_query(
     let exts = kind_extensions(value)?;
     let mut clauses = Vec::with_capacity(exts.len());
     for &ext in exts {
-        let q = if modifier == TermModifier::Term {
+        let q = if matches!(modifier, TermModifier::Term | TermModifier::Literal) {
             Box::new(TermQuery::new(
                 Term::from_field_text(ext_field, ext),
                 IndexRecordOption::WithFreqs,
@@ -1048,6 +1086,74 @@ fn validate_term_modifier(modifier: TermModifier) -> Result<()> {
     Ok(())
 }
 
+fn validate_literal_query_size(query: &QueryExpr) -> Result<()> {
+    let mut remaining = meta_index::MAX_LITERAL_SEARCH_BYTES;
+    let mut pending = vec![query];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            QueryExpr::Term(term) if term.modifier == TermModifier::Literal => {
+                remaining = remaining
+                    .checked_sub(term.value.len())
+                    .context("literal query exceeds 4096 UTF-8 bytes in total")?;
+            }
+            QueryExpr::And(items) | QueryExpr::Or(items) => pending.extend(items),
+            QueryExpr::Not(inner) => pending.push(inner),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn resolve_literal_paths(
+    query: QueryExpr,
+    mut resolver: impl FnMut(&str) -> Option<String>,
+) -> QueryExpr {
+    fn visit(
+        query: QueryExpr,
+        resolver: &mut impl FnMut(&str) -> Option<String>,
+        aliases: &mut HashMap<String, Option<String>>,
+    ) -> QueryExpr {
+        match query {
+            QueryExpr::Term(term)
+                if term.modifier == TermModifier::Literal
+                    && matches!(term.field, None | Some(FieldKind::Path)) =>
+            {
+                let alias = aliases
+                    .entry(term.value.clone())
+                    .or_insert_with(|| resolver(&term.value))
+                    .clone();
+                if let Some(value) = alias.filter(|value| value != &term.value) {
+                    QueryExpr::Or(vec![
+                        QueryExpr::Term(term),
+                        QueryExpr::Term(TermExpr {
+                            field: Some(FieldKind::Path),
+                            value,
+                            modifier: TermModifier::Literal,
+                        }),
+                    ])
+                } else {
+                    QueryExpr::Term(term)
+                }
+            }
+            QueryExpr::And(items) => QueryExpr::And(
+                items
+                    .into_iter()
+                    .map(|item| visit(item, resolver, aliases))
+                    .collect(),
+            ),
+            QueryExpr::Or(items) => QueryExpr::Or(
+                items
+                    .into_iter()
+                    .map(|item| visit(item, resolver, aliases))
+                    .collect(),
+            ),
+            QueryExpr::Not(inner) => QueryExpr::Not(Box::new(visit(*inner, resolver, aliases))),
+            other => other,
+        }
+    }
+    visit(query, &mut resolver, &mut HashMap::new())
+}
+
 fn modified_text_query(
     index: &tantivy::Index,
     field: Field,
@@ -1081,14 +1187,15 @@ fn modified_text_query(
     // terms. Fuzzy uses the supported edit bound, counting transpositions once.
     let mut clauses = Vec::with_capacity(terms.len());
     for (_, term) in terms {
-        let query = match modifier {
-            TermModifier::Prefix => FuzzyTermQuery::new_prefix(term, 0, false),
-            TermModifier::Fuzzy(distance) => FuzzyTermQuery::new(term, distance, true),
+        let query: Box<dyn Query> = match modifier {
+            TermModifier::Literal => Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+            TermModifier::Prefix => Box::new(FuzzyTermQuery::new_prefix(term, 0, false)),
+            TermModifier::Fuzzy(distance) => Box::new(FuzzyTermQuery::new(term, distance, true)),
             TermModifier::Term | TermModifier::Phrase => {
                 bail!("literal text query requires Prefix, Phrase, or Fuzzy")
             }
         };
-        clauses.push((Occur::Must, Box::new(query) as Box<dyn Query>));
+        clauses.push((Occur::Must, query));
     }
     Ok(Box::new(BooleanQuery::new(clauses)))
 }
@@ -1686,6 +1793,281 @@ mod tests {
                 assert!(response.truncated);
                 assert_eq!(response.served_by.as_deref(), Some("service-unavailable"));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn human_filename_search_matches_partial_names_without_requiring_content() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let baseline = file(
+            2,
+            1,
+            "my-document_v2.final.pdf",
+            r"C:\Users\Splaxi\my-document_v2.final.pdf",
+        );
+        let enriched = file(2, 2, "documentary.txt", r"C:\Users\Splaxi\documentary.txt");
+        let directory = file(2, 3, "notes.txt", r"C:\Documents\notes.txt");
+        let body = file(2, 4, "body.txt", r"C:\other\body.txt");
+        let body_word = file(2, 5, "other.txt", r"C:\other\other.txt");
+        let punctuation = file(2, 6, "C++[guide].txt", r"C:\guides\C++[guide].txt");
+        let unicode = file(
+            2,
+            7,
+            "Étude-résumé.txt",
+            r"C:\Users\Splaxi\Étude-résumé.txt",
+        );
+        let mut unresolved = file(2, 8, "offline-document.txt", "");
+        unresolved.path = None;
+        for (meta, content) in [
+            (&baseline, None),
+            (&enriched, Some("ordinary body")),
+            (&directory, Some("ordinary body")),
+            (&body, Some("doc")),
+            (&body_word, Some("document")),
+            (&punctuation, Some("a guide")),
+            (&unicode, None),
+            (&unresolved, None),
+        ] {
+            fixture.put(meta, content)?;
+        }
+        fixture.commit()?;
+        let cases: &[(&str, &[DocKey], &[DocKey])] = &[
+            (
+                "doc",
+                &[baseline.key, enriched.key, directory.key, unresolved.key],
+                &[enriched.key, directory.key, body.key],
+            ),
+            (
+                "name:doc",
+                &[baseline.key, enriched.key, unresolved.key],
+                &[enriched.key],
+            ),
+            (
+                "name:ument",
+                &[baseline.key, enriched.key, unresolved.key],
+                &[enriched.key],
+            ),
+            ("name:document_v2.f", &[baseline.key], &[]),
+            ("filename:my-document_v2.final.pdf", &[baseline.key], &[]),
+            ("name:C++[guide]", &[punctuation.key], &[punctuation.key]),
+            ("name:ÉTU", &[unicode.key], &[]),
+            ("name:résu", &[unicode.key], &[]),
+            ("body:doc", &[], &[body.key]),
+            ("body:document", &[], &[body_word.key]),
+            (
+                "name:guide -path:users",
+                &[punctuation.key],
+                &[punctuation.key],
+            ),
+        ];
+        for &(input, metadata, content) in cases {
+            let query = ipc::parse_user_query(input, 0);
+            assert_query_members(&fixture, &query, metadata, content, &Visibility::default())
+                .with_context(|| format!("human query {input:?}"))?;
+        }
+        // The explicitly requested raw parser still means exact analyzed words.
+        let raw = fixture.search(
+            &request("doc", None, SearchMode::NameOnly),
+            &Visibility::default(),
+        )?;
+        assert_eq!(raw.total, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn human_path_search_preserves_drive_unc_spaces_punctuation_and_boundaries() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let local = file(
+            2,
+            1,
+            "Annual Report (final).pdf",
+            r"C:\Users\Splaxi\Annual Report (final).pdf",
+        );
+        let sibling = file(
+            2,
+            2,
+            "Annual Report (final).pdf",
+            r"C:\Users\Splaxi-old\Annual Report (final).pdf",
+        );
+        let unc = file(
+            3,
+            3,
+            "budget[1].xlsx",
+            r"\\server\share\Annual Reports\budget[1].xlsx",
+        );
+        let not_regex = file(
+            3,
+            4,
+            "budget1.xlsx",
+            r"\\server\share\Annual Reports\budget1.xlsx",
+        );
+        for meta in [&local, &sibling, &unc, &not_regex] {
+            fixture.put(meta, Some("indexed body"))?;
+        }
+        fixture.commit()?;
+        for (input, expected) in [
+            (
+                r#""C:\Users\Splaxi\Annual Report (final).pdf""#,
+                vec![local.key],
+            ),
+            (r#"path:"C:\Users\Splaxi\""#, vec![local.key]),
+            (r#"path:"c:/users/splaxi/""#, vec![local.key]),
+            (
+                r#"path:"\\server\share\Annual Reports\budget[1].xlsx""#,
+                vec![unc.key],
+            ),
+            (
+                r#""\\server\share\Annual Reports\budget[1].xlsx""#,
+                vec![unc.key],
+            ),
+            (r"name:budget[1].xlsx", vec![unc.key]),
+            (r"name:Splaxi", Vec::new()),
+        ] {
+            assert_query_members(
+                &fixture,
+                &ipc::parse_user_query(input, 0),
+                &expected,
+                &expected,
+                &Visibility::default(),
+            )
+            .with_context(|| format!("Windows path query {input:?}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn drive_path_alias_resolves_once_and_matches_real_canonical_index_layout() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let canonical = file(
+            2,
+            1,
+            "Annual Report.pdf",
+            r"\\?\Volume{canonical}\Users\Splaxi\Annual Report.pdf",
+        );
+        let other_volume = file(
+            3,
+            2,
+            "Annual Report.pdf",
+            r"\\?\Volume{other}\Users\Splaxi\Annual Report.pdf",
+        );
+        let sibling = file(
+            2,
+            3,
+            "Annual Report.pdf",
+            r"\\?\Volume{canonical}\Users\Splaxi-old\Annual Report.pdf",
+        );
+        for meta in [&canonical, &other_volume, &sibling] {
+            fixture.put(meta, Some("ordinary body"))?;
+        }
+        fixture.commit()?;
+        let input = r"C:\Users\Splaxi\Annual Report";
+        for field in [None, Some(FieldKind::Path)] {
+            let term = QueryExpr::Term(TermExpr {
+                field,
+                value: input.to_string(),
+                modifier: TermModifier::Literal,
+            });
+            // Repeated branches deliberately require the same resolver result;
+            // the metadata/content union must not observe changing mount maps.
+            let query = QueryExpr::Or(vec![term.clone(), term]);
+            for mode in [
+                SearchMode::NameOnly,
+                SearchMode::Content,
+                SearchMode::Auto,
+                SearchMode::Hybrid,
+            ] {
+                let request = SearchRequest::with_query(query.clone()).with_mode(mode);
+                let unresolved = fixture.handler.search_visible_with_resolver(
+                    &request,
+                    &Visibility::default(),
+                    |_| None,
+                )?;
+                assert_eq!(
+                    unresolved.total, 0,
+                    "drive form is not stored in the real index"
+                );
+                let mut calls = 0;
+                let resolved = fixture.handler.search_visible_with_resolver(
+                    &request,
+                    &Visibility::default(),
+                    |value| {
+                        assert_eq!(value, input);
+                        calls += 1;
+                        Some(r"\\?\Volume{canonical}\users\splaxi\annual report".to_string())
+                    },
+                )?;
+                assert_eq!(calls, 1);
+                assert_eq!(resolved.total, 1);
+                assert_eq!(keys(&resolved), [canonical.key]);
+                assert_eq!(resolved.hits[0].path, canonical.path);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_search_keeps_exact_counts_and_pages_across_complete_dictionary() -> Result<()> {
+        let mut fixture = SearchFixture::new()?;
+        let mut expected = Vec::new();
+        for identity in 0..75 {
+            let name = format!("snapshot-longdocument{identity:03}.txt");
+            let meta = file(2, identity, &name, &format!(r"C:\records\{name}"));
+            fixture.put(&meta, (identity % 2 == 0).then_some("ordinary body"))?;
+            expected.push(meta.key);
+        }
+        fixture.put(
+            &file(2, 100, "unrelated.txt", r"C:\longdocument\unrelated.txt"),
+            None,
+        )?;
+        fixture.commit()?;
+        let query = ipc::parse_user_query("name:docum", 0);
+        let mut actual = Vec::new();
+        for offset in (0..75).step_by(11) {
+            let request = SearchRequest::with_query(query.clone())
+                .with_mode(SearchMode::Hybrid)
+                .with_limit(11)
+                .with_offset(offset);
+            let response = fixture.search(&request, &Visibility::default())?;
+            assert_eq!(response.total, 75);
+            actual.extend(keys(&response));
+        }
+        assert_eq!(actual, expected);
+
+        let masked = [expected[0], expected[74]].into_iter().collect();
+        let visibility = Visibility {
+            documents: masked,
+            ..Visibility::default()
+        };
+        let response = fixture.search(
+            &SearchRequest::with_query(query).with_limit(100),
+            &visibility,
+        )?;
+        assert_eq!(response.total, 73);
+        assert_eq!(keys(&response), expected[1..74]);
+        Ok(())
+    }
+
+    #[test]
+    fn literal_query_budget_rejects_whole_request_before_compilation() -> Result<()> {
+        let fixture = SearchFixture::new()?;
+        let query = QueryExpr::Or(vec![
+            literal(FieldKind::Name, &"x".repeat(2049), TermModifier::Literal),
+            literal(FieldKind::Name, &"y".repeat(2048), TermModifier::Literal),
+        ]);
+        for mode in [
+            SearchMode::NameOnly,
+            SearchMode::Content,
+            SearchMode::Auto,
+            SearchMode::Hybrid,
+        ] {
+            let failure = fixture
+                .search(
+                    &SearchRequest::with_query(query.clone()).with_mode(mode),
+                    &Visibility::default(),
+                )
+                .unwrap_err();
+            assert!(failure.to_string().contains("4096 UTF-8 bytes"));
         }
         Ok(())
     }

@@ -84,10 +84,13 @@ pub enum FieldKind {
 /// How a term should be interpreted.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TermModifier {
+    /// Advanced Tantivy syntax. Human search text uses Literal instead.
     Term,
     Phrase,
     Prefix,
     Fuzzy(u8), // max edit distance
+    /// Literal filename/path substring; analyzed whole words in file bodies.
+    Literal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -428,10 +431,9 @@ fn tokenize_user_query(input: &str) -> Vec<RawToken> {
             chars.next();
             let mut buf = String::new();
             while let Some(c) = chars.next() {
-                if c == '\\' {
-                    if let Some(escaped) = chars.next() {
-                        buf.push(escaped);
-                    }
+                if c == '\\' && chars.peek() == Some(&'"') && !is_windows_path(&buf) {
+                    chars.next();
+                    buf.push('"');
                 } else if c == '"' {
                     break;
                 } else {
@@ -454,12 +456,22 @@ fn tokenize_user_query(input: &str) -> Vec<RawToken> {
             }
             if c == '"' {
                 chars.next();
+                let path_field = matches!(
+                    buf.trim_start_matches(['-', '!'])
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "path:" | "folder:" | "dir:" | "directory:"
+                );
                 buf.push('"');
+                let value_start = buf.len();
                 while let Some(qc) = chars.next() {
-                    if qc == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            buf.push(escaped);
-                        }
+                    if qc == '\\'
+                        && chars.peek() == Some(&'"')
+                        && !path_field
+                        && !is_windows_path(&buf[value_start..])
+                    {
+                        chars.next();
+                        buf.push('"');
                     } else if qc == '"' {
                         buf.push('"');
                         break;
@@ -612,11 +624,11 @@ fn parse_unary_expr(tokens: &[RawToken], pos: &mut usize, now: i64) -> Option<Qu
                 && !stripped.is_empty()
             {
                 if stripped.starts_with('"') && stripped.ends_with('"') && stripped.len() >= 2 {
-                    return Some(QueryExpr::Not(Box::new(QueryExpr::Term(TermExpr {
-                        field: None,
-                        value: stripped[1..stripped.len() - 1].to_string(),
-                        modifier: TermModifier::Phrase,
-                    }))));
+                    return Some(QueryExpr::Not(Box::new(parse_atom_token(
+                        &stripped[1..stripped.len() - 1],
+                        true,
+                        now,
+                    ))));
                 }
                 return Some(QueryExpr::Not(Box::new(parse_atom_token(
                     stripped, false, now,
@@ -632,7 +644,11 @@ fn parse_atom_token(text: &str, quoted: bool, now: i64) -> QueryExpr {
         return QueryExpr::Term(TermExpr {
             field: None,
             value: text.to_string(),
-            modifier: TermModifier::Phrase,
+            modifier: if is_windows_path(text) {
+                TermModifier::Literal
+            } else {
+                TermModifier::Phrase
+            },
         });
     }
 
@@ -741,10 +757,17 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 
 fn parse_field_term(field: Option<FieldKind>, raw: &str) -> QueryExpr {
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        let value = &raw[1..raw.len() - 1];
         return QueryExpr::Term(TermExpr {
             field,
-            value: raw[1..raw.len() - 1].to_string(),
-            modifier: TermModifier::Phrase,
+            value: value.to_string(),
+            modifier: if field == Some(FieldKind::Path)
+                || (field.is_none() && is_windows_path(value))
+            {
+                TermModifier::Literal
+            } else {
+                TermModifier::Phrase
+            },
         });
     }
     if let Some(stem) = raw.strip_suffix('*')
@@ -777,8 +800,19 @@ fn parse_field_term(field: Option<FieldKind>, raw: &str) -> QueryExpr {
     QueryExpr::Term(TermExpr {
         field,
         value: raw.to_string(),
-        modifier: TermModifier::Term,
+        modifier: TermModifier::Literal,
     })
+}
+
+fn is_windows_path(value: &str) -> bool {
+    value.starts_with(r"\\")
+        || value.starts_with("//")
+        || (value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && value.as_bytes().get(1) == Some(&b':')
+            && matches!(value.as_bytes().get(2), Some(b'\\' | b'/')))
 }
 
 fn parse_u64_range(field: FieldKind, spec: &str) -> Option<RangeExpr> {
@@ -1468,7 +1502,7 @@ mod tests {
                 QueryExpr::Not(Box::new(QueryExpr::Term(TermExpr {
                     field: Some(FieldKind::Path),
                     value: "target/debug".into(),
-                    modifier: TermModifier::Phrase,
+                    modifier: TermModifier::Literal,
                 }))),
                 QueryExpr::Or(vec![
                     QueryExpr::Term(TermExpr {
@@ -1483,6 +1517,65 @@ mod tests {
                     }),
                 ]),
             ])
+        );
+    }
+
+    #[test]
+    fn human_search_preserves_literal_names_and_windows_paths() {
+        for (input, field, value) in [
+            ("doc", None, "doc"),
+            (
+                "filename:document_v2.final.pdf",
+                Some(FieldKind::Name),
+                "document_v2.final.pdf",
+            ),
+            (
+                r"C:\Users\Splaxi\report.pdf",
+                None,
+                r"C:\Users\Splaxi\report.pdf",
+            ),
+            (
+                r#""C:\Users\Splaxi\Annual Report.pdf""#,
+                None,
+                r"C:\Users\Splaxi\Annual Report.pdf",
+            ),
+            (
+                r#"path:"C:\Users\Splaxi\""#,
+                Some(FieldKind::Path),
+                r"C:\Users\Splaxi\",
+            ),
+            (r#"path:"C:\""#, Some(FieldKind::Path), r"C:\"),
+            (
+                r#"path:"\\server\share\Annual Report.pdf""#,
+                Some(FieldKind::Path),
+                r"\\server\share\Annual Report.pdf",
+            ),
+            (
+                r#"path:"target\debug\""#,
+                Some(FieldKind::Path),
+                r"target\debug\",
+            ),
+        ] {
+            let parsed = parse_user_query(input, 0);
+            assert_eq!(
+                parsed,
+                QueryExpr::Term(TermExpr {
+                    field,
+                    value: value.to_string(),
+                    modifier: TermModifier::Literal,
+                }),
+                "{input}"
+            );
+            let decoded: QueryExpr = de(&ser(&parsed));
+            assert_eq!(decoded, parsed);
+        }
+        assert_eq!(
+            parse_user_query(r#"body:"two \"quoted\" words""#, 0),
+            QueryExpr::Term(TermExpr {
+                field: Some(FieldKind::Content),
+                value: "two \"quoted\" words".to_string(),
+                modifier: TermModifier::Phrase,
+            })
         );
     }
 

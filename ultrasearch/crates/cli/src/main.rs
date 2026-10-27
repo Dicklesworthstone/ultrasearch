@@ -88,7 +88,7 @@ enum Commands {
 
 #[derive(Args, Debug, Default)]
 struct SearchQueryArgs {
-    /// Raw query syntax, or literal text with --prefix, --phrase, or --fuzzy.
+    /// Search text and filters, using the same filename matching as the UI.
     #[arg(
         value_name = "QUERY",
         required_unless_present_any = [
@@ -96,9 +96,12 @@ struct SearchQueryArgs {
         ]
     )]
     query: Option<String>,
-    /// Default field for raw syntax; target field for literal matching.
+    /// Target field for literal matching; default field when used with --raw.
     #[arg(long, value_enum)]
     field: Option<SearchFieldArg>,
+    /// Interpret QUERY as advanced Tantivy syntax instead of human search text.
+    #[arg(long, conflicts_with_all = ["prefix", "phrase", "fuzzy"])]
+    raw: bool,
     /// Match every analyzed query word as a literal prefix.
     #[arg(long, conflicts_with_all = ["phrase", "fuzzy"])]
     prefix: bool,
@@ -132,14 +135,21 @@ impl SearchQueryArgs {
         let text = self.query.as_deref().filter(|text| !text.trim().is_empty());
         ensure!(
             text.is_some()
-                || (self.field.is_none() && !self.prefix && !self.phrase && self.fuzzy.is_none()),
+                || (self.field.is_none()
+                    && !self.raw
+                    && !self.prefix
+                    && !self.phrase
+                    && self.fuzzy.is_none()),
             "--field and literal matching options require nonempty query text"
         );
         let mut clauses = Vec::with_capacity(3);
         if let Some(text) = text {
-            let has_explicit_modifier =
-                self.field.is_some() || self.prefix || self.phrase || self.fuzzy.is_some();
-            if !has_explicit_modifier && ipc::has_human_filter_tokens(text) {
+            let has_explicit_modifier = self.field.is_some()
+                || self.raw
+                || self.prefix
+                || self.phrase
+                || self.fuzzy.is_some();
+            if !has_explicit_modifier {
                 clauses.push(ipc::parse_query_str(text));
             } else {
                 let modifier = if self.prefix {
@@ -148,8 +158,10 @@ impl SearchQueryArgs {
                     TermModifier::Phrase
                 } else if let Some(distance) = self.fuzzy {
                     TermModifier::Fuzzy(distance)
-                } else {
+                } else if self.raw {
                     TermModifier::Term
+                } else {
+                    TermModifier::Literal
                 };
                 clauses.push(QueryExpr::Term(TermExpr {
                     field: self.field.map(|field| match field {
@@ -158,9 +170,8 @@ impl SearchQueryArgs {
                         SearchFieldArg::Ext => FieldKind::Ext,
                         SearchFieldArg::Content => FieldKind::Content,
                     }),
-                    // Preserve the exact raw expression, including whitespace and
-                    // embedded field qualifiers. Literal interpretation is selected
-                    // only by the explicit modifier flags above.
+                    // Explicit --raw retains advanced syntax unchanged. Field and
+                    // modifier flags treat this text literally by default.
                     value: text.to_string(),
                     modifier,
                 }));
@@ -657,6 +668,7 @@ mod tests {
         let raw = "  name:alpha OR content:\"two words\"  ";
         let request = parse_search(&[
             raw,
+            "--raw",
             "--limit",
             "7",
             "--offset",
@@ -686,7 +698,7 @@ mod tests {
 
         // A field remains the raw parser's default, without escaping or
         // rewriting explicit field qualifiers embedded in the expression.
-        let request = parse_search(&[raw, "--field", "path"])?;
+        let request = parse_search(&[raw, "--raw", "--field", "path"])?;
         assert_eq!(
             request.query,
             QueryExpr::Term(TermExpr {
@@ -706,6 +718,7 @@ mod tests {
             (&["--fuzzy", "0"], TermModifier::Fuzzy(0)),
             (&["--fuzzy", "1"], TermModifier::Fuzzy(1)),
             (&["--fuzzy", "2"], TermModifier::Fuzzy(2)),
+            (&[], TermModifier::Literal),
         ];
         for (field, expected_field) in [
             ("name", FieldKind::Name),
@@ -904,6 +917,9 @@ mod tests {
             &["report", "--prefix", "--phrase"],
             &["report", "--prefix", "--fuzzy", "1"],
             &["report", "--phrase", "--fuzzy", "2"],
+            &["report", "--raw", "--prefix"],
+            &["report", "--raw", "--phrase"],
+            &["report", "--raw", "--fuzzy", "1"],
             &["report", "--fuzzy", "3"],
             &["report", "--fuzzy", "255"],
             &["report", "--fuzzy", "-1"],
@@ -914,6 +930,7 @@ mod tests {
             &["--modified-through", "9223372036854775808"],
             &["--field", "name"],
             &["--prefix"],
+            &["--raw"],
             &[],
         ];
         for args in invalid {
@@ -1011,10 +1028,26 @@ mod tests {
                 QueryExpr::Term(TermExpr {
                     field: None,
                     value: "report".into(),
-                    modifier: TermModifier::Term,
+                    modifier: TermModifier::Literal,
                 }),
             ])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn default_cli_and_ui_share_literal_filename_and_path_parsing() -> Result<()> {
+        for input in [
+            "doc",
+            "annual report",
+            "filename:document_v2.final.pdf",
+            r"C:\Users\Splaxi\report.pdf",
+            r#"path:"C:\Users\Splaxi\Annual Report.pdf""#,
+            r#"name:report body:"annual summary""#,
+        ] {
+            let request = parse_search(&[input])?;
+            assert_eq!(request.query, ipc::parse_user_query(input, 0), "{input}");
+        }
         Ok(())
     }
 }

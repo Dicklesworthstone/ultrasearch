@@ -396,6 +396,73 @@ pub fn canonical_path(_path: &std::path::Path) -> Result<String, NtfsError> {
     Err(NtfsError::NotSupported)
 }
 
+/// Translate a drive-qualified search fragment to the volume GUID namespace
+/// used by indexed paths, without opening the target file. Incomplete names
+/// can still be searched. Unavailable volumes and ambiguous junction mappings
+/// return no alias; callers retain the original literal predicate.
+#[cfg(windows)]
+pub fn canonical_search_path(path: &str) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+    use windows::core::PCWSTR;
+
+    let path = search_drive_path(path)?;
+    let wide = path.encode_utf16().chain([0]).collect::<Vec<_>>();
+    let mut mount = vec![0u16; wide.len() + 1];
+    // SAFETY: Input is NUL-terminated and both output buffers remain live for
+    // the calls. Windows receives their actual lengths through the bindings.
+    unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut mount) }.ok()?;
+    let mount_len = mount.iter().position(|unit| *unit == 0)?;
+    let mount_path = String::from_utf16(&mount[..mount_len]).ok()?;
+    let mut guid = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut guid) }.ok()?;
+    let guid_len = guid.iter().position(|unit| *unit == 0)?;
+    let guid = String::from_utf16(&guid[..guid_len]).ok()?;
+    search_path_from_mount(&path, &mount_path, &guid)
+}
+
+#[cfg(not(windows))]
+pub fn canonical_search_path(_path: &str) -> Option<String> {
+    None
+}
+
+#[cfg(any(windows, test))]
+fn search_drive_path(path: &str) -> Option<String> {
+    if path.len() > 4096 || path.contains('\0') {
+        return None;
+    }
+    let path = path.replace('/', "\\");
+    let drive = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))
+        .unwrap_or(&path);
+    let bytes = drive.as_bytes();
+    (bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && bytes.get(2) == Some(&b'\\'))
+    .then(|| drive.to_string())
+}
+
+#[cfg(any(windows, test))]
+fn search_path_from_mount(path: &str, mount: &str, guid: &str) -> Option<String> {
+    let path = search_drive_path(path)?.to_lowercase();
+    let mount = search_drive_path(mount)?.to_lowercase();
+    if !mount.ends_with('\\') || !guid.to_ascii_lowercase().starts_with(r"\\?\volume{") {
+        return None;
+    }
+    let suffix = if let Some(suffix) = path.strip_prefix(&mount) {
+        suffix
+    } else if path == mount.trim_end_matches('\\') {
+        return Some(guid.trim_end_matches('\\').to_string());
+    } else {
+        // A junction can return a target volume whose mount is not an input
+        // prefix. Appending the original suffix would invent a wrong path.
+        return None;
+    };
+    Some(format!("{}\\{suffix}", guid.trim_end_matches('\\')))
+}
+
 /// Resolve one bounded set of full file identities to their current metadata.
 /// Results preserve input order. A missing identity or currently excluded path
 /// produces None; access failures and other unresolved state return an error
@@ -1710,6 +1777,56 @@ mod tests {
     use core_types::FileFlags;
 
     #[test]
+    fn search_drive_aliases_preserve_suffix_and_mount_boundaries() {
+        let guid = r"\\?\Volume{canonical}\";
+        for (path, mount, expected) in [
+            (
+                r"C:\Users\Splaxi\Annual Report.pdf",
+                r"C:\",
+                Some(r"\\?\Volume{canonical}\users\splaxi\annual report.pdf"),
+            ),
+            (
+                r"c:/Users/Splaxi/partial",
+                r"C:\",
+                Some(r"\\?\Volume{canonical}\users\splaxi\partial"),
+            ),
+            (
+                r"\\?\C:\Users\partial",
+                r"C:\",
+                Some(r"\\?\Volume{canonical}\users\partial"),
+            ),
+            (
+                r"C:\Mounted\Data\partial",
+                r"C:\Mounted\Data\",
+                Some(r"\\?\Volume{canonical}\partial"),
+            ),
+            (
+                r"C:\Mounted\Data",
+                r"C:\Mounted\Data\",
+                Some(r"\\?\Volume{canonical}"),
+            ),
+            (
+                r"C:\Mounted\Data\",
+                r"C:\Mounted\Data\",
+                Some(r"\\?\Volume{canonical}\"),
+            ),
+            (r"C:\Mounted\Database\partial", r"C:\Mounted\Data\", None),
+            (r"C:\junction\partial", r"D:\", None),
+            (r"C:relative", r"C:\", None),
+            (r"relative\partial", r"C:\", None),
+            (r"\\server\share\partial", r"C:\", None),
+            ("C:\\valid\0hidden", r"C:\", None),
+        ] {
+            assert_eq!(
+                search_path_from_mount(path, mount, guid).as_deref(),
+                expected,
+                "{path:?}"
+            );
+        }
+        assert!(search_drive_path(&format!("C:\\{}", "x".repeat(4096))).is_none());
+    }
+
+    #[test]
     fn terminal_directory_delete_overrides_accumulated_rename_reasons() {
         for volume in [1, 42, u16::MAX] {
             // The reported $Deleted parent is one fixture, not a production
@@ -1753,8 +1870,8 @@ mod tests {
     #[test]
     fn delete_staging_history_preserves_terminal_records_across_bounded_replay() {
         use journal::{
-            ATTRIBUTE_DIRECTORY, REASON_CLOSE, REASON_CREATE, REASON_DELETE,
-            REASON_RENAME_NEW, REASON_RENAME_OLD,
+            ATTRIBUTE_DIRECTORY, REASON_CLOSE, REASON_CREATE, REASON_DELETE, REASON_RENAME_NEW,
+            REASON_RENAME_OLD,
         };
 
         let root = 0x0063_0000_0000_005d;
