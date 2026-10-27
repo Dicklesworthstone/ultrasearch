@@ -1,3 +1,5 @@
+// A GUI-subsystem exe, so starting ui.exe directly opens no console window (#10).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 //! UltraSearch - World-class desktop search application
 //!
 //! A high-performance Windows desktop search engine combining instant filename
@@ -157,6 +159,14 @@ impl UltraSearchWindow {
     }
 
     fn on_clear_search(&mut self, _: &ClearSearch, _window: &mut Window, cx: &mut Context<Self>) {
+        // Escape dismisses the help overlay first, as its own text promises (#8).
+        if self.model.read(cx).show_shortcuts {
+            self.model.update(cx, |model, cx| {
+                model.show_shortcuts = false;
+                cx.notify();
+            });
+            return;
+        }
         self.model.update(cx, |model, cx| {
             model.set_query(String::new(), cx);
         });

@@ -124,6 +124,11 @@ impl Render for HelpPanel {
 
         let callout = |title: &'static str, body: &'static str| {
             div()
+                // Share the row equally and wrap the text: sized to its
+                // unwrapped text, the first card pushed the others outside the
+                // panel (#8).
+                .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -344,6 +349,9 @@ impl Render for HelpPanel {
                         this.filter.pop();
                         cx.notify();
                     }
+                    "escape" if this.filter.is_empty() => {
+                        window.dispatch_action(Box::new(CloseShortcuts), cx);
+                    }
                     "escape" => {
                         this.filter.clear();
                         cx.notify();
@@ -370,14 +378,14 @@ impl Render for HelpPanel {
             .flex()
             .items_center()
             .justify_center()
-            .on_mouse_down_out(cx.listener(|_, _, window, cx| {
-                window.dispatch_action(Box::new(CloseShortcuts), cx);
-            }))
-            .on_action(cx.listener(|_, _: &CloseShortcuts, window, cx| {
-                window.dispatch_action(Box::new(CloseShortcuts), cx);
-            }))
+            // The backdrop takes the clicks meant for the window behind it; a
+            // click on it, outside the panel, closes the overlay (#8).
+            .occlude()
             .child(
                 div()
+                    .on_mouse_down_out(cx.listener(|_, _, window, cx| {
+                        window.dispatch_action(Box::new(CloseShortcuts), cx);
+                    }))
                     .w(px(840.))
                     .max_h(px(620.))
                     .bg(colors.panel_bg)
@@ -411,6 +419,21 @@ impl Render for HelpPanel {
                                             .text_size(px(11.))
                                             .text_color(colors.text_secondary)
                                             .child("Click a key to copy"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("help-close")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .cursor_pointer()
+                                            .child("Close (Esc)")
+                                            .on_click(cx.listener(|_, _, window, cx| {
+                                                window
+                                                    .dispatch_action(Box::new(CloseShortcuts), cx);
+                                            })),
                                     ),
                             ),
                     )

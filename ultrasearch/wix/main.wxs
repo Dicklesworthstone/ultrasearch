@@ -25,9 +25,11 @@
         MigrateFeatures="yes" />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Icon -->
-    <Icon Id="ProductIcon" SourceFile="ultrasearch/assets/icon.ico" />
-    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
+    <!-- Icon. Windows Installer caches it under its Id as the file name, and
+         Explorer reads that extension: without ".ico" the shortcuts show a
+         blank page (#9). -->
+    <Icon Id="ProductIcon.ico" SourceFile="ultrasearch/assets/icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon.ico" />
 
     <!-- Application directories -->
     <Directory Id="TARGETDIR" Name="SourceDir">
@@ -113,14 +115,14 @@
                   Name="UltraSearch"
                   Target="[INSTALLFOLDER]launcher.exe"
                   WorkingDirectory="INSTALLFOLDER"
-                  Icon="ProductIcon"
+                  Icon="ProductIcon.ico"
                   Description="Launch UltraSearch" />
         <Shortcut Id="sc_desktop"
                   Directory="DesktopFolder"
                   Name="UltraSearch"
                   Target="[INSTALLFOLDER]launcher.exe"
                   WorkingDirectory="INSTALLFOLDER"
-                  Icon="ProductIcon"
+                  Icon="ProductIcon.ico"
                    Description="Launch UltraSearch" />
         <RemoveFile Id="rm_startmenu_shortcut"
                     On="uninstall"
