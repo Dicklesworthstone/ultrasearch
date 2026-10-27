@@ -1,14 +1,17 @@
-#![cfg(target_os = "windows")]
+#![cfg(any(windows, test))]
 
+use crate::framing;
+#[cfg(windows)]
 use crate::{
     ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse, SearchRequest,
-    SearchResponse, StatusRequest, StatusResponse, framing,
+    SearchResponse, StatusRequest, StatusResponse,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 use tracing::warn;
@@ -74,44 +77,61 @@ impl PipeClient {
         self
     }
 
+    #[cfg(windows)]
     pub async fn status(&self, req: StatusRequest) -> Result<StatusResponse> {
         let response: StatusResponse = self.request(framing::MessageKind::Status, &req).await?;
         validate_response_id(req.id, response.id)?;
         Ok(response)
     }
 
+    #[cfg(windows)]
     pub async fn search(&self, req: SearchRequest) -> Result<SearchResponse> {
         let response: SearchResponse = self.request(framing::MessageKind::Search, &req).await?;
         response.validate_for(req.id)?;
         Ok(response)
     }
 
+    #[cfg(windows)]
     pub async fn reload_config(&self, req: ReloadConfigRequest) -> Result<ReloadConfigResponse> {
-        let response: ReloadConfigResponse =
-            self.request(framing::MessageKind::ReloadConfig, &req).await?;
-        validate_control_response(req.id, response.id, response.success, response.message.as_deref())?;
+        let response: ReloadConfigResponse = self
+            .request(framing::MessageKind::ReloadConfig, &req)
+            .await?;
+        validate_control_response(
+            req.id,
+            response.id,
+            response.success,
+            response.message.as_deref(),
+        )?;
         Ok(response)
     }
 
+    #[cfg(windows)]
     pub async fn rescan(&self, req: RescanRequest) -> Result<RescanResponse> {
         let response: RescanResponse = self.request(framing::MessageKind::Rescan, &req).await?;
-        validate_control_response(req.id, response.id, response.success, response.message.as_deref())?;
+        validate_control_response(
+            req.id,
+            response.id,
+            response.success,
+            response.message.as_deref(),
+        )?;
         Ok(response)
     }
 
     /// Measure round-trip IPC liveness. The body is raw `PING` plus 16 UUID
     /// bytes, matching the service fast-path, not a bincode request. Missing
     /// or busy pipes may be retried. A ping that was written is never replayed.
+    #[cfg(windows)]
     pub async fn ping(&self) -> Result<Duration> {
-        ensure!(!self.pipe_name.contains('\0'), "IPC pipe name contains a NUL");
+        ensure!(
+            !self.pipe_name.contains('\0'),
+            "IPC pipe name contains a NUL"
+        );
         let id = Uuid::new_v4();
         let mut body = Vec::with_capacity(20);
         body.extend_from_slice(b"PING");
         body.extend_from_slice(id.as_bytes());
-        let framed = framing::encode_frame(&framing::encode_message(
-            framing::MessageKind::Ping,
-            &body,
-        )?)?;
+        let framed =
+            framing::encode_frame(&framing::encode_message(framing::MessageKind::Ping, &body)?)?;
         let started = Instant::now();
         self.transact_framed(
             &framed,
@@ -121,7 +141,10 @@ impl PipeClient {
                     kind == framing::MessageKind::Ping,
                     "unexpected ping response kind {kind:?}"
                 );
-                ensure!(payload.as_slice() == id.as_bytes(), "mismatched ping echo UUID");
+                ensure!(
+                    payload.as_slice() == id.as_bytes(),
+                    "mismatched ping echo UUID"
+                );
                 Ok(())
             },
         )
@@ -129,12 +152,16 @@ impl PipeClient {
         Ok(started.elapsed())
     }
 
+    #[cfg(windows)]
     async fn request<Req, Resp>(&self, kind: framing::MessageKind, req: &Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        ensure!(!self.pipe_name.contains('\0'), "IPC pipe name contains a NUL");
+        ensure!(
+            !self.pipe_name.contains('\0'),
+            "IPC pipe name contains a NUL"
+        );
         self.request_with(kind, req, || ClientOptions::new().open(&self.pipe_name))
             .await
     }
@@ -189,13 +216,16 @@ impl PipeClient {
             Instant::now() < deadline,
             "IPC deadline expired before connecting; request not sent"
         );
+        let mut last_connect_error = None;
         // u64 accounting also handles with_retries(u32::MAX) without wrapping
         // the attempt counter or the diagnostic count.
         for attempt in 0..=u64::from(self.retries) {
-            ensure!(
-                Instant::now() < deadline,
-                "IPC deadline expired before connecting; request not sent"
-            );
+            if Instant::now() >= deadline {
+                if let Some(error) = last_connect_error {
+                    return Err(self.connection_error(error, attempt, true));
+                }
+                anyhow::bail!("IPC deadline expired before connecting; request not sent");
+            }
             let mut conn = match open() {
                 Ok(conn) => conn,
                 Err(error)
@@ -215,11 +245,15 @@ impl PipeClient {
                         .checked_add(delay.min(remaining))
                         .unwrap_or(deadline)
                         .min(deadline);
+                    // Keep the actual Windows failure across the final backoff.
+                    // Otherwise a missing endpoint and a busy endpoint both
+                    // become an unhelpful, source-less deadline error.
+                    last_connect_error = Some(error);
                     sleep_until(wake).await;
                     continue;
                 }
                 Err(error) => {
-                    return Err(error).context("cannot connect to IPC pipe; request not sent");
+                    return Err(self.connection_error(error, attempt + 1, false));
                 }
             };
             // CreateFile is synchronous. A slow open must not allow a write
@@ -251,6 +285,29 @@ impl PipeClient {
         }
         unreachable!("the last connection attempt returns success or its error")
     }
+
+    fn connection_error(
+        &self,
+        error: std::io::Error,
+        attempts: u64,
+        deadline_expired: bool,
+    ) -> anyhow::Error {
+        let reason = match error.raw_os_error() {
+            Some(2) => "endpoint not found; the service may be stopped or still starting",
+            Some(231) => "all pipe instances are busy; retry when service capacity is available",
+            Some(5) => "access denied; check the installed service and named-pipe permissions",
+            _ => "the named-pipe connection failed",
+        };
+        let outcome = if deadline_expired {
+            "IPC connection deadline expired"
+        } else {
+            "cannot connect to IPC pipe"
+        };
+        anyhow::Error::new(error).context(format!(
+            "{outcome} {} after {attempts} attempt(s): {reason}; request not sent",
+            self.pipe_name
+        ))
+    }
 }
 
 async fn read_response(
@@ -272,7 +329,10 @@ async fn read_response(
 }
 
 fn validate_response_id(expected: Uuid, actual: Uuid) -> Result<()> {
-    ensure!(actual == expected, "IPC response {actual} does not match request {expected}");
+    ensure!(
+        actual == expected,
+        "IPC response {actual} does not match request {expected}"
+    );
     Ok(())
 }
 
@@ -283,13 +343,23 @@ fn validate_control_response(
     message: Option<&str>,
 ) -> Result<()> {
     validate_response_id(expected, actual)?;
-    ensure!(success, "service rejected control request: {}", message.unwrap_or("no reason supplied"));
+    ensure!(
+        success,
+        "service rejected control request: {}",
+        message.unwrap_or("no reason supplied")
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    use crate::{
+        ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse, SearchRequest,
+        SearchResponse, StatusRequest, StatusResponse,
+    };
+    #[cfg(windows)]
     use tokio::net::windows::named_pipe::ServerOptions;
 
     async fn receive_request(stream: &mut tokio::io::DuplexStream) -> Result<()> {
@@ -304,8 +374,15 @@ mod tests {
     }
 
     fn response_frame(kind: framing::MessageKind, id: Uuid) -> Result<Vec<u8>> {
-        let response = ReloadConfigResponse { id, success: true, message: None };
-        framing::encode_frame(&framing::encode_message(kind, &bincode::serialize(&response)?)?)
+        let response = ReloadConfigResponse {
+            id,
+            success: true,
+            message: None,
+        };
+        framing::encode_frame(&framing::encode_message(
+            kind,
+            &bincode::serialize(&response)?,
+        )?)
     }
 
     #[tokio::test]
@@ -319,7 +396,9 @@ mod tests {
         let mut attempts = 0;
         let request = ReloadConfigRequest { id };
         let sending = client.request_with::<_, ReloadConfigResponse, _>(
-            framing::MessageKind::ReloadConfig, &request, || {
+            framing::MessageKind::ReloadConfig,
+            &request,
+            || {
                 attempts += 1;
                 match attempts {
                     1 => Err(std::io::Error::from_raw_os_error(2)),
@@ -330,14 +409,19 @@ mod tests {
         );
         let serving = async {
             receive_request(&mut peer).await?;
-            peer.write_all(&response_frame(framing::MessageKind::ReloadConfig, id)?).await?;
+            peer.write_all(&response_frame(framing::MessageKind::ReloadConfig, id)?)
+                .await?;
             let mut extra = [0];
-            ensure!(peer.read(&mut extra).await? == 0, "duplicate request after success");
+            ensure!(
+                peer.read(&mut extra).await? == 0,
+                "duplicate request after success"
+            );
             Ok::<_, anyhow::Error>(())
         };
         let (response, served) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(sending, serving)
-        }).await?;
+        })
+        .await?;
         served?;
         assert_eq!(response?.id, id);
         assert_eq!(attempts, 3);
@@ -346,7 +430,11 @@ mod tests {
 
     #[tokio::test]
     async fn received_request_is_not_replayed_after_lost_or_malformed_reply() -> Result<()> {
-        for kind in [framing::MessageKind::ReloadConfig, framing::MessageKind::Rescan, framing::MessageKind::Search] {
+        for kind in [
+            framing::MessageKind::ReloadConfig,
+            framing::MessageKind::Rescan,
+            framing::MessageKind::Search,
+        ] {
             for malformed in [false, true] {
                 let client = PipeClient::default()
                     .with_backoff(Duration::ZERO)
@@ -357,21 +445,26 @@ mod tests {
                 // These control requests consist of a UUID; the transport is
                 // independent of the request model and server query execution.
                 let request = ReloadConfigRequest { id: Uuid::new_v4() };
-                let sending = client.request_with::<_, ReloadConfigResponse, _>(kind, &request, || {
-                    attempts += 1;
-                    connection.take().ok_or_else(|| std::io::Error::from_raw_os_error(2))
-                });
+                let sending =
+                    client.request_with::<_, ReloadConfigResponse, _>(kind, &request, || {
+                        attempts += 1;
+                        connection
+                            .take()
+                            .ok_or_else(|| std::io::Error::from_raw_os_error(2))
+                    });
                 let serving = async {
                     receive_request(&mut peer).await?;
                     if malformed {
-                        peer.write_all(&((framing::MAX_FRAME + 1) as u32).to_le_bytes()).await?;
+                        peer.write_all(&((framing::MAX_FRAME + 1) as u32).to_le_bytes())
+                            .await?;
                     }
                     drop(peer);
                     Ok::<_, anyhow::Error>(())
                 };
                 let (result, served) = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::join!(sending, serving)
-                }).await?;
+                })
+                .await?;
                 served?;
                 assert!(result.unwrap_err().to_string().contains("not replayed"));
                 assert_eq!(attempts, 1);
@@ -389,21 +482,31 @@ mod tests {
         let mut connection = Some(connection);
         let mut attempts = 0;
         let request = RescanRequest { id: Uuid::new_v4() };
-        let sending = client.request_with::<_, RescanResponse, _>(framing::MessageKind::Rescan, &request, || {
-            attempts += 1;
-            connection.take().ok_or_else(|| std::io::Error::from_raw_os_error(2))
-        });
+        let sending = client.request_with::<_, RescanResponse, _>(
+            framing::MessageKind::Rescan,
+            &request,
+            || {
+                attempts += 1;
+                connection
+                    .take()
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(2))
+            },
+        );
         let serving = async {
             receive_request(&mut peer).await?;
             // Do not reply. EOF proves the timed-out invocation closed its
             // connection instead of sending another control on it.
             let mut extra = [0];
-            ensure!(peer.read(&mut extra).await? == 0, "duplicate control after timeout");
+            ensure!(
+                peer.read(&mut extra).await? == 0,
+                "duplicate control after timeout"
+            );
             Ok::<_, anyhow::Error>(())
         };
         let (result, served) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(sending, serving)
-        }).await?;
+        })
+        .await?;
         served?;
         assert!(result.unwrap_err().to_string().contains("not replayed"));
         assert_eq!(attempts, 1);
@@ -415,29 +518,124 @@ mod tests {
         let request = StatusRequest { id: Uuid::new_v4() };
         let mut attempts = 0;
         let denied = PipeClient::default().with_retries(u32::MAX);
-        let error = denied.request_with::<_, StatusResponse, tokio::io::DuplexStream>(
-            framing::MessageKind::Status, &request, || {
-                attempts += 1;
-                Err(std::io::Error::from_raw_os_error(5))
-            },
-        ).await.unwrap_err();
+        let error = denied
+            .request_with::<_, StatusResponse, tokio::io::DuplexStream>(
+                framing::MessageKind::Status,
+                &request,
+                || {
+                    attempts += 1;
+                    Err(std::io::Error::from_raw_os_error(5))
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("request not sent"));
         assert_eq!(attempts, 1);
         for budget in [Duration::ZERO, Duration::MAX] {
             let client = PipeClient::default().with_request_timeout(budget);
-            let result = client.request_with::<_, StatusResponse, tokio::io::DuplexStream>(
-                framing::MessageKind::Status, &request, || panic!("invalid deadline must not open"),
-            ).await;
+            let result = client
+                .request_with::<_, StatusResponse, tokio::io::DuplexStream>(
+                    framing::MessageKind::Status,
+                    &request,
+                    || panic!("invalid deadline must not open"),
+                )
+                .await;
             assert!(result.is_err());
         }
         let client = PipeClient::default()
             .with_request_timeout(Duration::from_millis(10))
             .with_backoff(Duration::MAX)
             .with_retries(u32::MAX);
-        let result = tokio::time::timeout(Duration::from_secs(5), client.request_with::<_, StatusResponse, tokio::io::DuplexStream>(
-            framing::MessageKind::Status, &request, || Err(std::io::Error::from_raw_os_error(231)),
-        )).await?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request_with::<_, StatusResponse, tokio::io::DuplexStream>(
+                framing::MessageKind::Status,
+                &request,
+                || Err(std::io::Error::from_raw_os_error(231)),
+            ),
+        )
+        .await?;
         assert!(result.unwrap_err().to_string().contains("request not sent"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_backoff_preserves_missing_and_busy_pipe_errors() {
+        for (code, expected) in [(2, "endpoint not found"), (231, "pipe instances are busy")] {
+            let client = PipeClient::new(r"\\.\pipe\ultrasearch-startup-test")
+                .with_request_timeout(Duration::from_millis(20))
+                .with_backoff(Duration::from_secs(1));
+            let mut attempts = 0;
+            let error = client
+                .request_with::<_, StatusResponse, tokio::io::DuplexStream>(
+                    framing::MessageKind::Status,
+                    &StatusRequest { id: Uuid::new_v4() },
+                    || {
+                        attempts += 1;
+                        Err(std::io::Error::from_raw_os_error(code))
+                    },
+                )
+                .await
+                .unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("deadline expired"), "{diagnostic}");
+            assert!(diagnostic.contains("ultrasearch-startup-test"));
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+            assert!(diagnostic.contains("request not sent"));
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(code)
+            );
+            assert_eq!(attempts, 1, "deadline must bound all retry backoff");
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_search_can_finish_after_the_short_probe_budget_without_replay() -> Result<()> {
+        let client = PipeClient::default().with_request_timeout(Duration::from_secs(2));
+        let request = SearchRequest {
+            id: Uuid::new_v4(),
+            ..SearchRequest::default()
+        };
+        let id = request.id;
+        let (connection, mut peer) = tokio::io::duplex(4096);
+        let mut connection = Some(connection);
+        let mut attempts = 0;
+        let sending = client.request_with::<_, SearchResponse, _>(
+            framing::MessageKind::Search,
+            &request,
+            || {
+                attempts += 1;
+                connection
+                    .take()
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(2))
+            },
+        );
+        let serving = async {
+            receive_request(&mut peer).await?;
+            tokio::time::sleep(Duration::from_millis(DEFAULT_TIMEOUT_MS + 100)).await;
+            let response = SearchResponse {
+                id,
+                hits: Vec::new(),
+                total: 0,
+                truncated: false,
+                took_ms: 850,
+                served_by: Some("cold-index".into()),
+            };
+            peer.write_all(&framing::encode_frame(&framing::encode_message(
+                framing::MessageKind::Search,
+                &bincode::serialize(&response)?,
+            )?)?)
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let (response, served) = tokio::join!(sending, serving);
+        served?;
+        response?.validate_for(id)?;
+        assert_eq!(attempts, 1);
         Ok(())
     }
 
@@ -452,9 +650,13 @@ mod tests {
         assert!(validate_response_id(id, Uuid::new_v4()).is_err());
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn native_control_calls_reject_negative_and_unrelated_acknowledgements() -> Result<()> {
-        for kind in [framing::MessageKind::ReloadConfig, framing::MessageKind::Rescan] {
+        for kind in [
+            framing::MessageKind::ReloadConfig,
+            framing::MessageKind::Rescan,
+        ] {
             for (success, matching) in [(true, true), (false, true), (true, false)] {
                 let id = Uuid::new_v4();
                 let response_id = if matching { id } else { Uuid::new_v4() };
@@ -462,8 +664,7 @@ mod tests {
                 let mut server = ServerOptions::new()
                     .first_pipe_instance(true)
                     .create(&name)?;
-                let client = PipeClient::new(name)
-                    .with_request_timeout(Duration::from_secs(2));
+                let client = PipeClient::new(name).with_request_timeout(Duration::from_secs(2));
                 let serving = async {
                     server.connect().await?;
                     let mut length = [0; 4];
@@ -480,28 +681,35 @@ mod tests {
                             let request: ReloadConfigRequest = bincode::deserialize(payload)?;
                             ensure!(request.id == id, "wrong reload identity");
                             bincode::serialize(&ReloadConfigResponse {
-                                id: response_id, success, message,
+                                id: response_id,
+                                success,
+                                message,
                             })?
                         }
                         framing::MessageKind::Rescan => {
                             let request: RescanRequest = bincode::deserialize(payload)?;
                             ensure!(request.id == id, "wrong rescan identity");
                             bincode::serialize(&RescanResponse {
-                                id: response_id, success, message,
+                                id: response_id,
+                                success,
+                                message,
                             })?
                         }
                         _ => unreachable!(),
                     };
-                    server.write_all(&framing::encode_frame(
-                        &framing::encode_message(kind, &payload)?,
-                    )?).await?;
+                    server
+                        .write_all(&framing::encode_frame(&framing::encode_message(
+                            kind, &payload,
+                        )?)?)
+                        .await?;
                     Ok::<_, anyhow::Error>(())
                 };
                 let requesting = async {
                     match kind {
-                        framing::MessageKind::ReloadConfig => {
-                            client.reload_config(ReloadConfigRequest { id }).await.map(|_| ())
-                        }
+                        framing::MessageKind::ReloadConfig => client
+                            .reload_config(ReloadConfigRequest { id })
+                            .await
+                            .map(|_| ()),
                         framing::MessageKind::Rescan => {
                             client.rescan(RescanRequest { id }).await.map(|_| ())
                         }
@@ -510,7 +718,8 @@ mod tests {
                 };
                 let (served, result) = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::join!(serving, requesting)
-                }).await?;
+                })
+                .await?;
                 served?;
                 if success && matching {
                     result?;
@@ -529,6 +738,7 @@ mod tests {
 
     /// Exercise the real client, versioned framing, and a local native pipe.
     /// The outer deadline also bounds a server waiting after client failure.
+    #[cfg(windows)]
     async fn exchange_search_response(
         request_id: Uuid,
         mut response: SearchResponse,
@@ -570,6 +780,7 @@ mod tests {
         .context("native named-pipe search exchange timed out")?
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn native_pipe_rejects_failed_and_mismatched_search_responses() -> Result<()> {
         let request_id = Uuid::new_v4();
@@ -593,6 +804,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn native_pipe_accepts_empty_and_bounded_search_responses() -> Result<()> {
         let request_id = Uuid::new_v4();

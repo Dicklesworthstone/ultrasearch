@@ -96,7 +96,7 @@ fn main() -> Result<()> {
             );
         }
         None
-    } else {
+    } else if should_start_portable_service(show_console) {
         let service_path = resolve_binary(&exe_dir, "service")?;
         let mut service_cmd = Command::new(&service_path);
         service_cmd.arg("--console").stdin(Stdio::null());
@@ -114,6 +114,11 @@ fn main() -> Result<()> {
         }
         wait_for_ipc_ready(&mut guard)?;
         Some(guard)
+    } else {
+        // Installed service startup belongs to SCM. Launch the UI so it can
+        // show stopped/configuration/pipe errors and retry while SCM starts it.
+        // Never open the same indexes in a competing console process.
+        None
     };
 
     let mut ui_cmd = Command::new(&ui_path);
@@ -196,6 +201,23 @@ fn is_ipc_already_running() -> bool {
         let client = PipeClient::default().with_request_timeout(Duration::from_millis(400));
         rt.block_on(client.status(StatusRequest { id: Uuid::new_v4() }))
             .is_ok()
+    }
+}
+
+fn should_start_portable_service(show_console: bool) -> bool {
+    #[cfg(windows)]
+    {
+        let state = ipc::service_status::query_installed_service();
+        if !state.allows_console_fallback() && show_console {
+            println!("{}", state.summary());
+            println!("Opening the UI for connection diagnostics and automatic retry.");
+        }
+        state.allows_console_fallback()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = show_console;
+        true
     }
 }
 

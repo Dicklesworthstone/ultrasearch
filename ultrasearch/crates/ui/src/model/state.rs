@@ -2,7 +2,10 @@ use crate::background::{set_tray_status, TrayState};
 use crate::ipc::client::IpcClient;
 use core_types::DocKey;
 use gpui::*;
-use ipc::{MetricsSnapshot, SearchHit, SearchMode, SearchRequest, StatusRequest, VolumeStatus};
+use ipc::{
+    MetricsSnapshot, SearchHit, SearchMode, SearchRequest, StatusRequest, StatusResponse,
+    VolumeStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -251,6 +254,12 @@ pub struct SearchStatus {
     pub content_bytes_total: u64,
     pub content_bytes_remaining: u64,
     pub reconnect_attempts: u32,
+    pub connection_checked: bool,
+    pub connection_error: Option<String>,
+    pub search_error: Option<String>,
+    pub config_error: Option<String>,
+    pub last_index_commit_ts: Option<i64>,
+    refresh_pending: bool,
 }
 
 impl Default for SearchStatus {
@@ -262,7 +271,7 @@ impl Default for SearchStatus {
             connected: false,
             in_flight: false,
             backend_mode: BackendMode::Mixed,
-            indexing_state: "Idle".to_string(),
+            indexing_state: "Waiting for service status".to_string(),
             volumes: Vec::new(),
             metrics: None,
             served_by: None,
@@ -271,8 +280,135 @@ impl Default for SearchStatus {
             content_bytes_total: 0,
             content_bytes_remaining: 0,
             reconnect_attempts: 0,
+            connection_checked: false,
+            connection_error: None,
+            search_error: None,
+            config_error: None,
+            last_index_commit_ts: None,
+            refresh_pending: false,
         }
     }
+}
+
+impl SearchStatus {
+    pub fn connection_label(&self) -> &'static str {
+        if self.connected {
+            "Connected"
+        } else if self.connection_checked {
+            "Disconnected"
+        } else {
+            "Connecting…"
+        }
+    }
+
+    pub fn ingestion_state(&self) -> &str {
+        ingestion_state(&self.indexing_state)
+    }
+
+    /// Keep transport health independent of scheduler admission and indexing.
+    /// Visibility can change after the last metadata commit, when the initial
+    /// journal catch-up finishes. Observe ingestion transitions as well as counts.
+    fn apply_service_status(&mut self, response: StatusResponse) {
+        self.refresh_pending |= !self.connected
+            || self.last_index_commit_ts != response.last_index_commit_ts
+            || self.ingestion_state() != ingestion_state(&response.scheduler_state)
+            || self
+                .volumes
+                .iter()
+                .map(|v| (v.volume, v.indexed_files))
+                .ne(response.volumes.iter().map(|v| (v.volume, v.indexed_files)));
+        self.connected = true;
+        self.connection_checked = true;
+        self.connection_error = None;
+        self.reconnect_attempts = 0;
+        self.indexing_state = response.scheduler_state;
+        self.volumes = response.volumes;
+        self.metrics = response.metrics;
+        self.served_by = response.served_by;
+        self.last_index_commit_ts = response.last_index_commit_ts;
+        self.content_jobs_total = response.content_jobs_total.unwrap_or(0);
+        self.content_jobs_remaining = response.content_jobs_remaining.unwrap_or(0);
+        self.content_bytes_total = response.content_bytes_total.unwrap_or(0);
+        self.content_bytes_remaining = response.content_bytes_remaining.unwrap_or(0);
+    }
+
+    fn take_search_refresh(&mut self, has_query: bool) -> bool {
+        if self.refresh_pending && has_query && !self.in_flight {
+            self.refresh_pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn empty_search_message(&self, has_query: bool) -> (String, String) {
+        if !self.connected {
+            let title = if self.connection_checked {
+                "Search service unavailable"
+            } else {
+                "Connecting to the search service…"
+            };
+            let mut detail = self.connection_error.clone().unwrap_or_else(|| {
+                "Waiting for the service's named-pipe endpoint. The UI retries automatically."
+                    .into()
+            });
+            if let Some(error) = &self.config_error {
+                detail.push_str(&format!(" Configuration: {error}"));
+            }
+            return (title.into(), detail);
+        }
+        if let Some(error) = &self.search_error {
+            return ("Search failed".into(), error.clone());
+        }
+        let ingestion = self.ingestion_state();
+        if ingestion.starts_with("unavailable")
+            || ingestion.starts_with("degraded")
+            || ingestion.starts_with("retrying durable batch")
+            || ingestion.starts_with("deferred capacity recovery")
+        {
+            return (
+                "Indexing needs attention".into(),
+                format!(
+                    "{ingestion}. Open Service Health for progress and check the service logs."
+                ),
+            );
+        }
+        if ingestion.starts_with("initializing")
+            || ingestion.starts_with("initial indexing")
+            || ingestion.starts_with("reconciling")
+            || ingestion == "reconciliation requested"
+            || ingestion.starts_with("catching up")
+            || (ingestion.starts_with("volume ")
+                && (ingestion.contains("waiting")
+                    || ingestion.contains("journal gap; reconciling")))
+        {
+            return (
+                "Initial filename index is being built".into(),
+                format!("{ingestion}. Your search will refresh as the index becomes available."),
+            );
+        }
+        if has_query {
+            (
+                "No results found".into(),
+                "Try different search terms or search mode".into(),
+            )
+        } else {
+            ("Start typing to search".into(), String::new())
+        }
+    }
+}
+
+fn ingestion_state(state: &str) -> &str {
+    // Worker failures are historical context, not a new visibility transition.
+    state
+        .split_once("; ingestion=")
+        .map(|(_, ingestion)| {
+            ingestion
+                .split("; last_worker_problem(historical)=")
+                .next()
+                .unwrap_or(ingestion)
+        })
+        .unwrap_or(state)
 }
 
 pub struct SearchAppModel {
@@ -356,13 +492,18 @@ impl SearchAppModel {
             let async_app = cx.clone();
             async move {
                 let mut consecutive_failures = 0u32;
+                let mut first_poll = true;
                 loop {
                     let sleep_secs = if consecutive_failures == 0 {
                         2
                     } else {
                         (1u64 << consecutive_failures.saturating_sub(1).min(3)).min(10)
                     };
-                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                    if first_poll {
+                        first_poll = false;
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                    }
                     let req = StatusRequest { id: Uuid::new_v4() };
                     match client.status(req).await {
                         Ok(resp) => {
@@ -372,28 +513,15 @@ impl SearchAppModel {
                                 this.update(
                                     app,
                                     |model: &mut SearchAppModel, cx: &mut Context<SearchAppModel>| {
-                                        let was_disconnected =
-                                            !model.status.connected || had_failures;
-                                        model.status.connected = true;
-                                        model.status.reconnect_attempts = 0;
-                                        model.status.indexing_state = resp.scheduler_state.clone();
-                                        model.status.volumes = resp.volumes;
-                                        model.status.metrics = resp.metrics;
-                                        model.status.served_by = resp.served_by;
-                                        model.status.content_jobs_total =
-                                            resp.content_jobs_total.unwrap_or(0);
-                                        model.status.content_jobs_remaining =
-                                            resp.content_jobs_remaining.unwrap_or(0);
-                                        model.status.content_bytes_total =
-                                            resp.content_bytes_total.unwrap_or(0);
-                                        model.status.content_bytes_remaining =
-                                            resp.content_bytes_remaining.unwrap_or(0);
+                                        let was_disconnected = had_failures
+                                            || (!model.status.connected && model.status.connection_checked);
+                                        model.status.apply_service_status(resp);
+                                        if model.status.take_search_refresh(!model.query.trim().is_empty()) {
+                                            let query = model.query.clone();
+                                            model.set_query(query, cx);
+                                        }
                                         if was_disconnected {
                                             model.ipc_recent_reconnect = true;
-                                            if !model.query.is_empty() && model.results.is_empty() {
-                                                let q = model.query.clone();
-                                                model.set_query(q, cx);
-                                            }
                                             cx.spawn(
                                                 |weak: WeakEntity<SearchAppModel>,
                                                  cx: &mut AsyncApp| {
@@ -423,17 +551,22 @@ impl SearchAppModel {
                             let next_backoff =
                                 (1u64 << consecutive_failures.saturating_sub(1).min(3)).min(10);
                             tracing::warn!(
-                                "status poll failed (attempt {consecutive_failures}, next retry in {next_backoff}s): {err}"
+                                "status poll failed (attempt {consecutive_failures}, next retry in {next_backoff}s): {err:#}"
                             );
+                            let service_state = tokio::task::spawn_blocking(
+                                ipc::service_status::query_installed_service,
+                            ).await.unwrap_or_else(|error| {
+                                ipc::service_status::InstalledServiceState::Unknown(error.to_string())
+                            });
+                            let diagnostic = service_state.connection_diagnostic(&format!("{err:#}"));
                             let _ = async_app.update(|app| {
                                 this.update(
                                     app,
                                     |model: &mut SearchAppModel, cx: &mut Context<SearchAppModel>| {
                                         model.status.connected = false;
+                                        model.status.connection_checked = true;
+                                        model.status.connection_error = Some(diagnostic);
                                         model.status.reconnect_attempts = consecutive_failures;
-                                        model.status.indexing_state = format!(
-                                            "Reconnecting (attempt {consecutive_failures}, retry in {next_backoff}s)…"
-                                        );
                                         model.update_tray_status();
                                         cx.notify();
                                     },
@@ -445,6 +578,15 @@ impl SearchAppModel {
             }
         });
         self.status_task = Some(task);
+    }
+
+    pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
+        // Retry status immediately, even when the automatic loop is backing off.
+        // Also retry an existing query, including a failed query with old rows.
+        self.start_status_polling(cx);
+        if !self.query.trim().is_empty() {
+            self.set_query(self.query.clone(), cx);
+        }
     }
 
     fn update_tray_status(&self) {
@@ -471,11 +613,25 @@ impl SearchAppModel {
 
     pub fn set_query(&mut self, query: String, cx: &mut Context<SearchAppModel>) {
         self.query = query;
+        self.status.search_error = None;
+        self.status.refresh_pending = false;
 
         // Cancel previous debounce task
         if let Some(task) = self.search_debounce.take() {
             drop(task);
         }
+
+        self.status.in_flight = !self.query.trim().is_empty();
+        if !self.status.in_flight {
+            self.results.clear();
+            self.status.total = 0;
+            self.status.shown = 0;
+            self.page = 0;
+            self.selected_index = None;
+            cx.notify();
+            return;
+        }
+        cx.notify();
 
         let query_clone = self.query.clone();
         let client = self.client.clone();
@@ -486,23 +642,6 @@ impl SearchAppModel {
                 let async_app = cx.clone();
                 async move {
                     tokio::time::sleep(Duration::from_millis(150)).await;
-
-                    if query_clone.is_empty() {
-                        let _ = async_app.update(|app| {
-                            this.update(
-                                app,
-                                |model: &mut SearchAppModel, cx: &mut Context<SearchAppModel>| {
-                                    model.results.clear();
-                                    model.status.total = 0;
-                                    model.status.shown = 0;
-                                    model.page = 0;
-                                    model.selected_index = None;
-                                    cx.notify();
-                                },
-                            )
-                        });
-                        return;
-                    }
 
                     let req = SearchRequest {
                         id: Uuid::new_v4(),
@@ -539,27 +678,38 @@ impl SearchAppModel {
                                         model.status.shown = model.current_page_results().len();
                                         model.status.last_latency_ms = Some(latency);
                                         model.status.connected = true;
+                                        model.status.connection_checked = true;
+                                        model.status.connection_error = None;
+                                        model.status.search_error = None;
                                         model.status.reconnect_attempts = 0;
                                         model.selected_index =
                                             if !model.results.is_empty() { Some(0) } else { None };
                                         model.push_history(&query_clone);
+                                        model.update_tray_status();
                                         cx.notify();
                                     },
                                 )
                             });
                         }
                         Err(err) => {
-                            tracing::warn!("search request failed: {err}");
+                            tracing::warn!("search request failed: {err:#}");
                             let _ = async_app.update(|app| {
                                 this.update(
                                     app,
                                     |model: &mut SearchAppModel,
                                      cx: &mut Context<SearchAppModel>| {
                                         model.status.in_flight = false;
-                                        model.status.connected = false;
-                                        model.status.indexing_state =
-                                            "Disconnected (search)".to_string();
+                                        model.status.search_error = Some(format!("{err:#}"));
                                         model.status.last_latency_ms = None;
+                                        model.results.clear();
+                                        model.status.total = 0;
+                                        model.status.shown = 0;
+                                        model.page = 0;
+                                        model.selected_index = None;
+                                        // A rejected query is not proof of a transport failure.
+                                        // Probe status independently to establish connection health.
+                                        model.start_status_polling(cx);
+                                        model.update_tray_status();
                                         cx.notify();
                                     },
                                 )
@@ -870,7 +1020,194 @@ impl Drop for SearchAppModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_protocol_uri, DocKey, ResultHeatmap, SearchHit};
+    use super::{parse_protocol_uri, DocKey, ResultHeatmap, SearchHit, SearchStatus};
+    use ipc::{StatusResponse, VolumeStatus};
+
+    fn status_response(ingestion: &str, commit: Option<i64>, files: u64) -> StatusResponse {
+        StatusResponse {
+            id: uuid::Uuid::new_v4(),
+            scheduler_state: format!("idle; ingestion={ingestion}"),
+            volumes: vec![VolumeStatus {
+                volume: 1,
+                indexed_files: files,
+                indexed_bytes: 0,
+                pending_files: 0,
+                pending_bytes: 0,
+                last_usn: None,
+                journal_id: None,
+            }],
+            last_index_commit_ts: commit,
+            content_jobs_total: None,
+            content_jobs_remaining: None,
+            content_bytes_total: None,
+            content_bytes_remaining: None,
+            metrics: None,
+            served_by: Some("fixture-service".into()),
+        }
+    }
+
+    #[test]
+    fn empty_results_distinguish_connection_indexing_and_query_failures() {
+        let mut status = SearchStatus::default();
+        assert_eq!(status.connection_label(), "Connecting…");
+        assert!(status
+            .empty_search_message(true)
+            .0
+            .starts_with("Connecting"));
+
+        status.connection_checked = true;
+        status.connection_error = Some("Windows service is stopped (Windows exit 5)".into());
+        assert_eq!(
+            status.empty_search_message(true).0,
+            "Search service unavailable"
+        );
+        assert!(status
+            .empty_search_message(true)
+            .1
+            .contains("Windows exit 5"));
+
+        // A live pipe can answer status while the initial index is still hidden.
+        status.apply_service_status(status_response(
+            "initial indexing: waiting for workers",
+            Some(10),
+            900,
+        ));
+        assert_eq!(status.connection_label(), "Connected");
+        assert!(status.connection_error.is_none());
+        assert_eq!(
+            status.empty_search_message(true).0,
+            "Initial filename index is being built"
+        );
+
+        status.apply_service_status(status_response(
+            "degraded: journal access denied",
+            Some(10),
+            900,
+        ));
+        assert_eq!(
+            status.empty_search_message(true).0,
+            "Indexing needs attention"
+        );
+        assert!(status.connected);
+
+        status.apply_service_status(status_response(
+            "watching; last bounded journal read succeeded",
+            Some(10),
+            900,
+        ));
+        assert_eq!(status.empty_search_message(true).0, "No results found");
+        status.search_error = Some("query was rejected".into());
+        assert_eq!(status.empty_search_message(true).0, "Search failed");
+        assert!(
+            status.connected,
+            "a failed search does not imply a stopped service"
+        );
+    }
+
+    #[test]
+    fn initial_visibility_and_reconnect_refresh_queries_without_another_keystroke() {
+        let mut status = SearchStatus::default();
+        status.apply_service_status(status_response("initializing", None, 0));
+        assert!(status.take_search_refresh(true));
+        assert!(!status.take_search_refresh(true));
+
+        status.apply_service_status(status_response(
+            "initial indexing: waiting for workers",
+            Some(10),
+            900,
+        ));
+        status.in_flight = true;
+        assert!(!status.take_search_refresh(true));
+        status.in_flight = false;
+        assert!(
+            status.take_search_refresh(true),
+            "refresh must survive an in-flight search"
+        );
+
+        // Publishing visibility after catch-up need not create a new commit or
+        // change file counts. The query must still be rerun to reveal its hits.
+        status.apply_service_status(status_response(
+            "watching; last bounded journal read succeeded",
+            Some(10),
+            900,
+        ));
+        assert!(status.take_search_refresh(true));
+        status.apply_service_status(status_response(
+            "watching; last bounded journal read succeeded",
+            Some(10),
+            900,
+        ));
+        assert!(
+            !status.take_search_refresh(true),
+            "unchanged snapshots must not loop searches"
+        );
+
+        status.connected = false;
+        status.apply_service_status(status_response(
+            "watching; last bounded journal read succeeded",
+            Some(10),
+            900,
+        ));
+        assert!(
+            status.take_search_refresh(true),
+            "reconnect must refresh even when old rows existed"
+        );
+    }
+
+    #[test]
+    fn recovery_and_rescan_states_are_not_reported_as_successful_empty_searches() {
+        for (ingestion, expected) in [
+            (
+                "unavailable: no configured NTFS volume is mounted",
+                "Indexing needs attention",
+            ),
+            (
+                "retrying durable batch: access denied",
+                "Indexing needs attention",
+            ),
+            (
+                "deferred capacity recovery: worker unavailable",
+                "Indexing needs attention",
+            ),
+            (
+                "reconciliation requested",
+                "Initial filename index is being built",
+            ),
+            (
+                "volume 1 journal gap; reconciling",
+                "Initial filename index is being built",
+            ),
+        ] {
+            let mut status = SearchStatus::default();
+            status.apply_service_status(status_response(ingestion, Some(10), 900));
+            let (title, detail) = status.empty_search_message(true);
+            assert_eq!(title, expected, "{ingestion}");
+            assert!(detail.contains(ingestion));
+            assert!(
+                status.connected,
+                "index recovery does not imply a lost connection"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_heartbeats_and_historical_worker_errors_do_not_trigger_search_loops() {
+        let mut status = SearchStatus::default();
+        status.apply_service_status(status_response(
+            "watching; last bounded journal read succeeded",
+            Some(10),
+            900,
+        ));
+        assert!(status.take_search_refresh(true));
+        let mut response = status_response(
+            "watching; last bounded journal read succeeded",
+            Some(10),
+            900,
+        );
+        response.scheduler_state = "idle=42 cpu=10%; ingestion=watching; last bounded journal read succeeded; last_worker_problem(historical)=an old failure".into();
+        status.apply_service_status(response);
+        assert!(!status.take_search_refresh(true));
+    }
 
     #[test]
     fn parse_protocol_uri_extracts_and_decodes_queries() {

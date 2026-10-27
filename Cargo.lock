@@ -3727,6 +3727,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows 0.52.0",
 ]
 
 [[package]]
@@ -8001,6 +8002,7 @@ name = "ui"
 version = "1.5.1"
 dependencies = [
  "anyhow",
+ "bincode",
  "chrono",
  "core-types",
  "futures",

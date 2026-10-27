@@ -15,3 +15,6 @@ serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Services"] }

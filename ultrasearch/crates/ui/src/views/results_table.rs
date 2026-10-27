@@ -629,6 +629,7 @@ impl ResultsView {
             return self.render_skeleton_loading(cx);
         }
         let has_query = !model.query.is_empty();
+        let (empty_title, empty_detail) = model.status.empty_search_message(has_query);
         let pinned = model.pinned_searches.clone();
         let recent: Vec<String> = model.history.iter().take(6).cloned().collect();
         let colors = theme::active_colors(cx);
@@ -651,18 +652,15 @@ impl ResultsView {
                     .text_size(px(16.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(colors.text_secondary)
-                    .child(if has_query {
-                        "No results found"
-                    } else {
-                        "Start typing to search"
-                    }),
+                    .child(empty_title),
             )
-            .when(has_query, |this| {
+            .when(!empty_detail.is_empty(), |this| {
                 this.child(
                     div()
                         .text_size(px(13.))
+                        .max_w(px(760.))
                         .text_color(colors.text_secondary)
-                        .child("Try different search terms or search mode"),
+                        .child(empty_detail),
                 )
             })
             .when(!has_query && !pinned.is_empty(), |this| {

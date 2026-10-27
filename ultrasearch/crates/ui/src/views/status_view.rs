@@ -118,7 +118,11 @@ impl Render for StatusView {
                 pending_bytes,
             )
         };
-        let eta_label = if display_remaining == 0 {
+        let eta_label = if !status.connected {
+            "Unknown while disconnected".to_string()
+        } else if !status.ingestion_state().starts_with("watching") {
+            "Waiting for initial filename reconciliation".to_string()
+        } else if display_remaining == 0 {
             "Complete".to_string()
         } else if queue_depth > 0 || active_workers > 0 {
             format!(
@@ -191,7 +195,9 @@ impl Render for StatusView {
                     // Body
                     .child(
                         div()
+                            .id("service-health-body")
                             .flex_1()
+                            .overflow_y_scroll()
                             .p_6()
                             .flex()
                             .flex_col()
@@ -211,11 +217,7 @@ impl Render for StatusView {
                                     )
                                     .child(self.render_kv_row(
                                         "Connection",
-                                        if status.connected {
-                                            "Connected".into()
-                                        } else {
-                                            "Disconnected".into()
-                                        },
+                                        status.connection_label().into(),
                                         cx,
                                     ))
                                     .child(self.render_kv_row(
@@ -223,11 +225,40 @@ impl Render for StatusView {
                                         status.served_by.clone().unwrap_or("-".into()),
                                         cx,
                                     ))
+                                    .child(
+                                        self.render_kv_row(
+                                            "Scheduler State",
+                                            status
+                                                .indexing_state
+                                                .split("; ingestion=")
+                                                .next()
+                                                .unwrap_or(&status.indexing_state)
+                                                .into(),
+                                            cx,
+                                        ),
+                                    )
                                     .child(self.render_kv_row(
-                                        "Scheduler State",
-                                        status.indexing_state.clone(),
+                                        "Filename indexing",
+                                        status.ingestion_state().to_string(),
                                         cx,
-                                    )),
+                                    ))
+                                    .when_some(status.connection_error.as_ref(), |this, error| {
+                                        this.child(div().text_size(px(12.)).child(error.clone()))
+                                    })
+                                    .when_some(status.search_error.as_ref(), |this, error| {
+                                        this.child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .child(format!("Search: {error}")),
+                                        )
+                                    })
+                                    .when_some(status.config_error.as_ref(), |this, error| {
+                                        this.child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .child(format!("Configuration: {error}")),
+                                        )
+                                    }),
                             )
                             // Section: Progress
                             .child(
@@ -311,7 +342,7 @@ impl Render for StatusView {
                                     ),
                             )
                             // Section: Metrics
-                            .when(status.metrics.is_some(), |this: Div| {
+                            .when(status.metrics.is_some(), |this| {
                                 let m = status.metrics.as_ref().unwrap();
                                 this.child(
                                     div()

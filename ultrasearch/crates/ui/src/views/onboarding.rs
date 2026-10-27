@@ -1,6 +1,7 @@
 use crate::actions::FinishOnboarding;
 use crate::model::state::SearchAppModel;
 use crate::theme;
+use anyhow::Context as _;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use ipc;
@@ -20,6 +21,8 @@ pub struct OnboardingView {
     drives: Vec<DriveChoice>,
     telemetry_opt_in: bool,
     update_opt_in: bool,
+    applying: bool,
+    error: Option<String>,
     focus_handle: FocusHandle,
     model: Entity<SearchAppModel>,
 }
@@ -77,12 +80,17 @@ impl OnboardingView {
             drives,
             telemetry_opt_in: false,
             update_opt_in: false,
+            applying: false,
+            error: None,
             focus_handle: cx.focus_handle(),
             model,
         }
     }
 
     fn next_step(&mut self, cx: &mut Context<Self>) {
+        if self.applying {
+            return;
+        }
         if self.step < 2 {
             self.step += 1;
             cx.notify();
@@ -92,6 +100,9 @@ impl OnboardingView {
     }
 
     fn prev_step(&mut self, cx: &mut Context<Self>) {
+        if self.applying {
+            return;
+        }
         if self.step > 0 {
             self.step -= 1;
             cx.notify();
@@ -99,6 +110,9 @@ impl OnboardingView {
     }
 
     fn toggle_drive(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.applying {
+            return;
+        }
         if let Some(drive) = self.drives.get_mut(index) {
             drive.selected = !drive.selected;
             cx.notify();
@@ -106,6 +120,9 @@ impl OnboardingView {
     }
 
     fn toggle_content(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.applying {
+            return;
+        }
         if let Some(drive) = self.drives.get_mut(index) {
             drive.content_indexing = !drive.content_indexing;
             cx.notify();
@@ -113,7 +130,10 @@ impl OnboardingView {
     }
 
     fn finish(&mut self, cx: &mut Context<Self>) {
-        if let Ok(mut config) = core_types::config::load_or_create_config(None) {
+        self.error = None;
+        let target = core_types::config::default_config_path();
+        let save_result = (|| -> anyhow::Result<()> {
+            let mut config = core_types::config::load_or_create_config(None)?;
             let selected: Vec<_> = self
                 .drives
                 .iter()
@@ -130,41 +150,63 @@ impl OnboardingView {
             config.volumes = selected;
             config.content_index_volumes = content_enabled;
             config.features.telemetry_opt_in = self.telemetry_opt_in;
-            let _ = core_types::config::set_current_config(config.clone());
-            let target = core_types::config::default_config_path();
             if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                std::fs::create_dir_all(parent)?;
             }
-            if let Ok(toml) = toml::to_string_pretty(&config) {
-                let _ = std::fs::write(&target, toml);
-            }
+            let toml = toml::to_string_pretty(&config)?;
+            std::fs::write(&target, toml)
+                .with_context(|| format!("cannot save configuration to {}", target.display()))?;
+            core_types::config::set_current_config(config)?;
+            Ok(())
+        })();
+        if let Err(error) = save_result {
+            let message = format!("Configuration was not applied: {error:#}. Updating the installed service configuration may require administrator permission.");
+            self.error = Some(message.clone());
+            self.model.update(cx, |model, cx| {
+                model.status.config_error = Some(message);
+                cx.notify();
+            });
+            cx.notify();
+            return;
         }
 
+        self.applying = true;
+        cx.notify();
         let client = self.model.read(cx).client.clone();
-        cx.spawn(|_, _app: &mut AsyncApp| async move {
-            // Reload configuration first, then trigger a rescan so indexing actually starts.
-            let reload_req = ipc::ReloadConfigRequest {
-                id: uuid::Uuid::new_v4(),
-            };
-            let _ = client.reload_config(reload_req).await;
-
-            let rescan_req = ipc::RescanRequest {
-                id: uuid::Uuid::new_v4(),
-            };
-            let _ = client.rescan(rescan_req).await;
-        })
-        .detach();
-
         let update_opt_in = self.update_opt_in;
-        // Give the user immediate feedback that indexing is starting and close onboarding.
-        self.model.update(cx, |model, cx| {
-            model.status.indexing_state = "Starting indexing…".to_string();
-            model.show_onboarding = false;
-            model.set_update_opt_in(update_opt_in, cx);
-            cx.notify();
-        });
-
-        cx.dispatch_action(&FinishOnboarding);
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let app = cx.clone();
+            async move {
+                // Acknowledge both operations before claiming indexing started.
+                let result = async {
+                    client.reload_config(ipc::ReloadConfigRequest { id: uuid::Uuid::new_v4() })
+                        .await.context("service did not accept the configuration")?;
+                    client.rescan(ipc::RescanRequest { id: uuid::Uuid::new_v4() })
+                        .await.context("service did not accept the rescan")?;
+                    Ok::<_, anyhow::Error>(())
+                }.await;
+                let _ = app.update(|app| this.update(app, |view, cx| {
+                    view.applying = false;
+                    match result {
+                        Ok(()) => {
+                            view.model.update(cx, |model, cx| {
+                                model.status.config_error = None;
+                                model.show_onboarding = false;
+                                model.set_update_opt_in(update_opt_in, cx);
+                                model.retry_connection(cx);
+                                cx.notify();
+                            });
+                            cx.dispatch_action(&FinishOnboarding);
+                        }
+                        Err(error) => {
+                            view.error = Some(format!("Configuration saved, but indexing was not started: {error:#}. Check Service Health and retry."));
+                            view.model.update(cx, |model, cx| model.start_status_polling(cx));
+                        }
+                    }
+                    cx.notify();
+                }));
+            }
+        }).detach();
     }
     fn render_progress(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::active_colors(cx);
@@ -567,19 +609,23 @@ impl Render for OnboardingView {
                 ),
         };
 
-        let primary_label = match self.step {
-            0 | 1 => "Next",
-            _ => {
-                if selected_count == 0 {
-                    "Skip (no drives selected)"
-                } else {
-                    "Start indexing"
+        let primary_label = if self.applying {
+            "Applying configuration…"
+        } else {
+            match self.step {
+                0 | 1 => "Next",
+                _ => {
+                    if selected_count == 0 {
+                        "Skip (no drives selected)"
+                    } else {
+                        "Start indexing"
+                    }
                 }
             }
         };
 
         let can_go_back = self.step > 0;
-        let disable_primary = false;
+        let disable_primary = self.applying;
 
         div()
             .track_focus(&self.focus_handle)
@@ -603,6 +649,9 @@ impl Render for OnboardingView {
                     .gap_5()
                     .child(self.render_progress(cx))
                     .child(body)
+                    .when_some(self.error.as_ref(), |this, error| {
+                        this.child(div().text_size(px(12.)).child(error.clone()))
+                    })
                     .child(
                         div()
                             .flex()

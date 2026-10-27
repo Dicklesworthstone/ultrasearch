@@ -959,11 +959,7 @@ impl Render for SearchView {
                                     } else {
                                         hsla(0.0, 0.903, 0.661, 1.0)
                                     })
-                                    .child(if status.connected {
-                                        "Connected"
-                                    } else {
-                                        "Disconnected"
-                                    }),
+                                    .child(status.connection_label()),
                             ),
                     )
                     .when(ipc_recovered, |this| {
@@ -981,7 +977,7 @@ impl Render for SearchView {
                                 .child("Reconnected to service"),
                         )
                     })
-                    .when(!status.connected, |this| {
+                    .when(!status.connected || status.search_error.is_some(), |this| {
                         this.child(
                             div()
                                 .ml_3()
@@ -1003,12 +999,7 @@ impl Render for SearchView {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         this.model.update(cx, |model, cx| {
-                                            let current = model.query.clone();
-                                            if current.is_empty() {
-                                                model.start_status_polling(cx);
-                                            } else {
-                                                model.set_query(current, cx);
-                                            }
+                                            model.retry_connection(cx);
                                         });
                                     }),
                                 )
@@ -1016,12 +1007,7 @@ impl Render for SearchView {
                                     match event.keystroke.key.as_str() {
                                         "enter" | "space" => {
                                             this.model.update(cx, |model, cx| {
-                                                let current = model.query.clone();
-                                                if current.is_empty() {
-                                                    model.start_status_polling(cx);
-                                                } else {
-                                                    model.set_query(current, cx);
-                                                }
+                                                model.retry_connection(cx);
                                             });
                                             cx.stop_propagation();
                                         }

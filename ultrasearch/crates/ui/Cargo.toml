@@ -28,6 +28,9 @@ pulldown-cmark = "0.10"
 [build-dependencies]
 winres = "0.1"
 
+[dev-dependencies]
+bincode = { workspace = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 tray-icon = "0.19"
 muda = "0.15"

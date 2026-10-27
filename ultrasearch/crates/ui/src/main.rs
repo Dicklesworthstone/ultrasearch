@@ -563,17 +563,23 @@ fn main() {
     let _rt_guard = runtime.enter();
 
     // Load configuration and install opt-in crash hook
-    let config = core_types::config::load_or_create_config(None).ok();
+    let (config, config_error) = match core_types::config::load_or_create_config(None) {
+        Ok(config) => (Some(config), None),
+        Err(error) => {
+            let message = format!(
+                "{}: {error:#}",
+                core_types::config::default_config_path().display()
+            );
+            eprintln!("Failed to load configuration: {message}");
+            (None, Some(message))
+        }
+    };
     core_types::install_opt_in_crash_hook("ui");
     let initial_query = parse_initial_query_from_args();
     let show_onboarding = config
         .as_ref()
         .map(|c| c.volumes.is_empty())
-        .unwrap_or(true);
-
-    if config.is_none() {
-        eprintln!("Failed to load configuration, proceeding with defaults (and onboarding).");
-    }
+        .unwrap_or(false);
 
     // Start Background Tasks (Tray + Hotkeys)
     let bg_rx = match ui::background::spawn() {
@@ -621,6 +627,7 @@ fn main() {
         let app_model = cx.new(SearchAppModel::new);
         app_model.update(cx, |model, cx| {
             model.show_onboarding = show_onboarding;
+            model.status.config_error = config_error.clone();
             if let Some(q) = initial_query.clone() {
                 model.set_query(q, cx);
             }

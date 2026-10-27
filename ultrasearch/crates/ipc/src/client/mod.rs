@@ -1,4 +1,4 @@
-#![cfg(target_os = "windows")]
+#![cfg(any(windows, test))]
 
 mod named_pipe_client;
 

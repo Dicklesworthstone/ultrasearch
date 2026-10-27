@@ -268,17 +268,33 @@ async fn main() -> Result<()> {
             json,
         } => {
             let req = build_search_request(query, limit, offset, timeout_ms, mode)?;
-            let resp = pipe(&cli).search(req).await?;
+            let client = pipe(&cli);
+            #[cfg(windows)]
+            let client = client.with_request_timeout(
+                req.timeout
+                    .unwrap_or(std::time::Duration::from_secs(5))
+                    .saturating_add(std::time::Duration::from_secs(1)),
+            );
+            let resp = client
+                .search(req)
+                .await
+                .map_err(|error| service_command_error(error, &cli, "Search"))?;
             output(resp, json, print_search_response)?;
         }
         Commands::Status { json } => {
             let req = StatusRequest { id: Uuid::new_v4() };
-            let resp = pipe(&cli).status(req).await?;
+            let resp = pipe(&cli)
+                .status(req)
+                .await
+                .map_err(|error| service_command_error(error, &cli, "Status"))?;
             output(resp, json, print_status_response)?;
         }
         Commands::ReloadConfig { json } => {
             let req = ReloadConfigRequest { id: Uuid::new_v4() };
-            let resp = pipe(&cli).reload_config(req).await?;
+            let resp = pipe(&cli)
+                .reload_config(req)
+                .await
+                .map_err(|error| service_command_error(error, &cli, "Configuration reload"))?;
             output(resp, json, |r| {
                 println!(
                     "{} {}",
@@ -293,7 +309,10 @@ async fn main() -> Result<()> {
         }
         Commands::Rescan { json } => {
             let req = RescanRequest { id: Uuid::new_v4() };
-            let resp = pipe(&cli).rescan(req).await?;
+            let resp = pipe(&cli)
+                .rescan(req)
+                .await
+                .map_err(|error| service_command_error(error, &cli, "Rescan"))?;
             output(resp, json, |r| {
                 println!(
                     "{} {}",
@@ -307,7 +326,10 @@ async fn main() -> Result<()> {
             })?;
         }
         Commands::Ping { json } => {
-            let rtt = pipe(&cli).ping().await?;
+            let rtt = pipe(&cli)
+                .ping()
+                .await
+                .map_err(|error| service_command_error(error, &cli, "Ping"))?;
             let rtt_ms = rtt.as_secs_f64() * 1000.0;
             if json {
                 println!(
@@ -383,8 +405,14 @@ async fn main() -> Result<()> {
                     let client = pipe(&cli);
                     let _ = client
                         .reload_config(ReloadConfigRequest { id: Uuid::new_v4() })
-                        .await?;
-                    let _ = client.rescan(RescanRequest { id: Uuid::new_v4() }).await?;
+                        .await
+                        .map_err(|error| {
+                            service_command_error(error, &cli, "Configuration reload")
+                        })?;
+                    let _ = client
+                        .rescan(RescanRequest { id: Uuid::new_v4() })
+                        .await
+                        .map_err(|error| service_command_error(error, &cli, "Rescan"))?;
                 }
                 if json {
                     println!(
@@ -411,6 +439,28 @@ fn pipe(cli: &Cli) -> PipeClient {
         .as_ref()
         .map(|p| PipeClient::new(p.clone()))
         .unwrap_or_default()
+        .with_request_timeout(std::time::Duration::from_secs(2))
+}
+
+fn service_command_error(error: anyhow::Error, cli: &Cli, operation: &str) -> anyhow::Error {
+    #[cfg(windows)]
+    {
+        let transport_failed = error
+            .chain()
+            .any(|cause| cause.is::<std::io::Error>() || cause.is::<tokio::time::error::Elapsed>());
+        if transport_failed && cli.pipe.is_none() {
+            let state = ipc::service_status::query_installed_service();
+            return anyhow::anyhow!(
+                "{operation}: {}",
+                state.connection_diagnostic(&format!("{error:#}"))
+            );
+        }
+    }
+    if let Some(pipe) = &cli.pipe {
+        error.context(format!("{operation} request to {pipe} failed"))
+    } else {
+        error.context(format!("{operation} failed"))
+    }
 }
 
 #[cfg(not(windows))]
@@ -444,6 +494,13 @@ fn build_search_request(
 fn print_status_response(resp: &StatusResponse) -> Result<()> {
     println!("{}", style("Service Status:").green());
     println!("  Scheduler: {}", resp.scheduler_state);
+    if let Some(ts) = resp.last_index_commit_ts {
+        println!("  Last index commit (Unix seconds): {ts}");
+    } else {
+        println!(
+            "  No index commit reported yet; a successful IPC connection does not imply indexing is complete."
+        );
+    }
     println!(
         "  Served By: {}",
         resp.served_by.as_deref().unwrap_or("unknown")
@@ -548,6 +605,32 @@ fn unsupported_service<T>() -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_rejections_keep_operation_context_without_claiming_disconnect() -> Result<()> {
+        let cli = Cli::try_parse_from(["ultrasearch", "reload-config"])?;
+        let error = service_command_error(
+            anyhow::anyhow!("service rejected control request: invalid volumes"),
+            &cli,
+            "Configuration reload",
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("Configuration reload failed"));
+        assert!(message.contains("invalid volumes"));
+        assert!(!message.contains("Windows service"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_pipe_errors_do_not_probe_or_blame_the_default_service() -> Result<()> {
+        let cli = Cli::try_parse_from(["ultrasearch", "--pipe", "custom-fixture", "status"])?;
+        let error =
+            service_command_error(std::io::Error::from_raw_os_error(2).into(), &cli, "Status");
+        let message = format!("{error:#}");
+        assert!(message.contains("custom-fixture"));
+        assert!(!message.contains("UltraSearchService"));
+        Ok(())
+    }
 
     fn parse_search(args: &[&str]) -> Result<SearchRequest> {
         let cli = Cli::try_parse_from(

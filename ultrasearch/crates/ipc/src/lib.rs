@@ -143,9 +143,10 @@ pub enum SearchMode {
     Hybrid,   // meta + content merge
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub mod client;
 pub mod framing;
+pub mod service_status;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
