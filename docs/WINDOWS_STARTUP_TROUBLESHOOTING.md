@@ -3,6 +3,72 @@
 An installed service, a connected UI, and a searchable index are three different
 conditions. Check them separately before changing configuration or reinstalling.
 
+## Upgrading from v1.5.1
+
+The v1.5.1 MSI omitted `index-worker.exe`. Its service also scanned before opening
+the search endpoint, so the UI could remain disconnected throughout a long first
+scan. Copying a worker into that installation does not supply the startup, UI,
+filename-ingestion, and query fixes that followed.
+
+The v1.5.2 source includes installer definitions for all five executables,
+endpoint readiness before background scanning, immediate UI connection checks
+and Retry, filename coverage independent of content admission, partial filename
+matching, and honest status before the first index commit. Upgrade the service,
+worker, UI, launcher, and CLI together: the current IPC protocol and durable
+checkpoint formats have changed since v1.5.1.
+
+Check the [latest published release](https://github.com/Dicklesworthstone/ultrasearch/releases/latest)
+for the available Windows x64 MSI and its qualification results. A version bump
+on `main` does not establish that an installer has been published or passed native
+Windows testing. If the release page still shows v1.5.1, the corrected MSI is not
+available there yet. A successful qualification run also does not establish that
+the original reporter's machine is repaired.
+
+### Verify and install the complete release
+
+Download the MSI and `SHA256SUMS.txt` from the **same release** into a folder
+containing only that MSI. Close the UltraSearch UI and any manually started
+`--console` instance. Open an elevated PowerShell in the download folder, then
+verify the exact installer entry before starting the upgrade:
+
+```powershell
+$installers = @(Get-ChildItem -LiteralPath . -Filter '*.msi' -File)
+if ($installers.Count -ne 1) { throw 'Keep exactly one downloaded MSI in this folder.' }
+$installer = $installers[0]
+$checksumPattern = '^([0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($installer.Name) + '$'
+$checksumEntry = @(Get-Content -LiteralPath .\SHA256SUMS.txt |
+    Select-String -Pattern $checksumPattern)
+if ($checksumEntry.Count -ne 1) { throw 'The release checksums must name this exact MSI once.' }
+$expectedHash = $checksumEntry[0].Matches[0].Groups[1].Value
+$actualHash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash
+if ($actualHash -ine $expectedHash) { throw 'MSI checksum mismatch; do not install this download.' }
+
+$installLog = Join-Path $PWD 'ultrasearch-install.log'
+$installation = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
+    '/i', "`"$($installer.FullName)`"", '/norestart', '/L*V', "`"$installLog`""
+)
+if ($installation.ExitCode -notin @(0, 3010)) {
+    throw "MSI installation failed with exit $($installation.ExitCode). Keep $installLog."
+}
+if ($installation.ExitCode -eq 3010) { Write-Host 'Restart Windows to complete the upgrade.' }
+```
+
+The newer MSI upgrades the existing installation through Windows Installer. Keep
+the installation log if it fails; do not delete the ProgramData index or mix
+executables from different releases to work around an error. After any required
+restart, open the installed UltraSearch shortcut as an ordinary user. The MSI
+starts the registered service; do not start the service executable by hand.
+
+Use the commands in **Collect the first useful evidence** below to verify the
+installed version, service state, pipe response, and an actual filename result.
+Repeat that filename query in the UI. A running service, successful ping, or live
+UI process alone is insufficient: require the known file to appear. Body-text
+search can follow later when content admission permits extraction. If the UI
+remains disconnected, preserve its exact diagnostic, the service exit codes,
+`startup.log`, and the MSI installation log when reporting the result in
+[issue #11](https://github.com/Dicklesworthstone/ultrasearch/issues/11) or
+[issue #13](https://github.com/Dicklesworthstone/ultrasearch/issues/13).
+
 ## Installed startup contract
 
 1. The MSI installs `service.exe`, `index-worker.exe`, `ui.exe`, `cli.exe`, and
